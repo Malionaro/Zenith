@@ -345,7 +345,17 @@ Both scripts:
 - start the server with `--enable-lua-udp 34200`, `auto_pause` off, and bound to 127.0.0.1.
 
 Then start the client and use Play → Connect to address (`127.0.0.1:34200`), or start it with
-`-- --factorio-port=34200`. The status line in the top-left corner shows the connection. (Or let the
+`-- --factorio-port=34200`. On Windows `server\dev.ps1` does all of it in one go: it starts the
+server through `run-server.ps1` (same options), waits for the bridge, starts the client connected
+to it (Godot from `-Godot`, `$env:GODOT` or the PATH) and saves and stops the server when the client
+closes (`-KeepServer` leaves it running). `-Mock` uses `tools/mock_server.py` instead of Factorio
+(`-MockArgs` passes its options), `-NoClient` starts only the server, and `-ClientArgs` adds client
+options:
+
+```
+powershell -ExecutionPolicy Bypass -File server\dev.ps1
+powershell -ExecutionPolicy Bypass -File server\dev.ps1 -Mock -Godot C:\Godot\Godot_v4.7.2-stable_win64.exe
+``` The status line in the top-left corner shows the connection. (Or let the
 menu start the server for you: Play → Load.)
 
 `/f3d-status` shows whether a client is connected, how many chunks are subscribed, and where
