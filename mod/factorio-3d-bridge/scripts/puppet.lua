@@ -863,9 +863,47 @@ local function tick_mining(c, s)
   end
 end
 
+-- Items on belts within reach, like F in Factorio: each one whose spot on its lane is in range goes
+-- into the inventory and comes off its line. A line can only drop items by name (remove_item), so
+-- it takes one of that name and quality off the same line; spoilage comes along with the stack.
+-- Returns how many it picked, and false once the inventory is full.
+local function pickup_from_belts(c, pos, r, picked)
+  local belts = c.surface.find_entities_filtered({
+    area = { { pos.x - r, pos.y - r }, { pos.x + r, pos.y + r } },
+    type = registry.belt_types(),
+  })
+  for _, belt in pairs(belts) do
+    for i = 1, belt.get_max_transport_line_index() do
+      local line = belt.get_transport_line(i)
+      for _, item in pairs(line.get_detailed_contents()) do
+        if picked >= PICKUPS_PER_TICK then
+          return picked, true
+        end
+        if distance(pos, line.get_line_item_position(item.position)) <= r then
+          local st = item.stack
+          local stack = { name = st.name, count = st.count, quality = st.quality.name }
+          if st.spoil_percent > 0 then
+            stack.spoil_percent = st.spoil_percent
+          end
+          local inserted = c.insert(stack)
+          if inserted <= 0 then
+            return picked, false
+          end
+          stack.count = inserted
+          stack.spoil_percent = nil
+          line.remove_item(stack)
+          picked = picked + 1
+        end
+      end
+    end
+  end
+  return picked, true
+end
+
 -- Mining an item-entity puts its stack in the inventory, and mine_entity works without a
--- player, so that is how a player-less character picks up. Once the inventory is full it stops
--- trying (and says so once) until the client lets go.
+-- player, so that is how a player-less character picks up. Items on belts are taken off their
+-- lines (pickup_from_belts). Once the inventory is full it stops trying (and says so once) until
+-- the client lets go.
 local function tick_pickup(c, s)
   local p = s.pickup
   if not p then
@@ -897,6 +935,12 @@ local function tick_pickup(c, s)
       end
       picked = picked + 1
     end
+  end
+  local room
+  picked, room = pickup_from_belts(c, pos, r, picked)
+  if not room then
+    p.full = true
+    message("Inventory full")
   end
 end
 

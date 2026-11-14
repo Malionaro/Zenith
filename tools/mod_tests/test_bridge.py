@@ -1446,6 +1446,41 @@ send({"t": "pickup"})
 tick(9)
 check(not full_e.valid, "pickup works again after letting go")
 take()
+
+# Items on belts within reach are picked up too (issue #18): off their lane, into the inventory.
+tick(40)
+pp = puppet.position
+near_belt = spawn("transport-belt", pp.x + 0.5, pp.y + 0.5, force="player", direction=0)
+far_belt = spawn("transport-belt", pp.x + 6.5, pp.y + 0.5, force="player", direction=0)
+F.put_on_belt(near_belt, 1, "copper-plate", 0.5, 7101)
+F.put_on_belt(near_belt, 2, "iron-gear-wheel", 0.5, 7102)
+F.put_on_belt(far_belt, 1, "copper-plate", 0.5, 7103)
+before = {n: inv.get_item_count(n) for n in ("copper-plate", "iron-gear-wheel")}
+for _ in range(3):
+    send({"t": "pickup"})
+    tick(9)
+check(near_belt.get_transport_line(1).get_item_count() == 0 and near_belt.get_transport_line(2).get_item_count() == 0,
+      "pickup takes the items off a belt within the character's item_pickup_distance")
+check(far_belt.get_transport_line(1).get_item_count() == 1, "but not off a belt further away")
+check([inv.get_item_count(n) - before[n] for n in ("copper-plate", "iron-gear-wheel")] == [1, 1],
+      "items picked up from a belt go to the inventory")
+take()
+tick(40)
+F.put_on_belt(near_belt, 1, "copper-plate", 0.5, 7104)
+F.inventory_space = 0
+for _ in range(4):
+    send({"t": "pickup"})
+    tick(9)
+fulls = [m for m in of_type(take(), "msg") if m["text"] == "Inventory full"]
+check(near_belt.get_transport_line(1).get_item_count() == 1 and len(fulls) == 1,
+      f"a full inventory leaves the belt's item and says so once per press: {len(fulls)} messages")
+F.inventory_space = float("inf")
+tick(40)
+take()
+for e in (near_belt, far_belt):
+    e.destroy()
+for n in ("copper-plate", "iron-gear-wheel"):  # back as it was, for the inventory checks further on
+    inv.remove(lua.table_from({"name": n, "count": 1}))
 g.settings["global"]["f3d-detail-radius"].value = 0
 tick(60)
 check(not of_type(take(), "gi"), "radius 0 turns ground items off")

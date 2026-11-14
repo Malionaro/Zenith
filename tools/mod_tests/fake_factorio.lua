@@ -2805,7 +2805,15 @@ local function make_entity(surface, params)
     data.insert = function(stack)
       local slots = (stack.name == "pistol" and gun_slots) or (stack.name == "firearm-magazine" and ammo_slots) or nil
       if not slots then
-        return inventory.insert(stack)
+        -- A full inventory (F.inventory_space) takes only what still fits.
+        local want = stack.count or 1
+        local n = math.min(want, F.inventory_space)
+        if n <= 0 then
+          return 0
+        end
+        local got = inventory.insert(n == want and stack or { name = stack.name, count = n, quality = stack.quality })
+        F.inventory_space = F.inventory_space - got
+        return got
       end
       for _, slot in ipairs(slots) do
         if not slot.name or slot.name == stack.name then
