@@ -1048,6 +1048,8 @@ func _on_message(msg: Dictionary) -> void:
 				hud.show_message("Research completed: %s" % LocaleNames.technology(str(msg["tech"])))
 			else:
 				hud.show_message(str(msg.get("text", "")))
+		"fly":
+			hud.flying.add(Vector2(int(msg.get("x", 0)), int(msg.get("y", 0))) / 256.0, _array(msg.get("l")))
 		_:
 			if not hud.ui.model.handle(msg):  # UI data (scripts/ui/factorio/ui_model.gd)
 				world.handle(msg)

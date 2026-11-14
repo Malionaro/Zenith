@@ -178,9 +178,8 @@ end
 -- half of that with half = 1, in quality `q`) from the main inventory into the entity wherever
 -- an inserter would put it; without, everything (half of each) out of its output or chest. On a
 -- belt the items go on or come off its lanes.
-function M.fast(cmd)
-  local c = puppet.get()
-  local e = c and target(c, cmd)
+local function fast(c, cmd)
+  local e = target(c, cmd)
   if not e then
     return
   end
@@ -253,6 +252,17 @@ function M.fast(cmd)
   end
   puppet.send_inventory_now()
   screens.refresh()
+end
+
+-- Fast transfer, with Factorio's flying text for what it moved, at the entity clicked.
+function M.fast(cmd)
+  local c = puppet.get()
+  if not c then
+    return
+  end
+  local before = puppet.counts(c)
+  fast(c, cmd)
+  puppet.fly(c, before, position_of(cmd))
 end
 
 ---------------------------------------------------------------------------------------------

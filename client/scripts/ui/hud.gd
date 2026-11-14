@@ -15,6 +15,7 @@ const Settings := preload("res://scripts/menu/settings.gd")
 const DamageOverlay := preload("res://scripts/ui/damage_overlay.gd")
 const Controls := preload("res://scripts/player/controls.gd")
 const ControlsInfo := preload("res://scripts/menu/controls_info.gd")
+const FlyingText := preload("res://scripts/ui/flying_text.gd")
 
 ## Short names for keys in the help (OS.get_keycode_string's are long).
 const KEY_SHORT := {"QuoteLeft": "`", "Comma": ",", "Period": ".", "Slash": "/", "PageUp": "PgUp", "PageDown": "PgDn",
@@ -42,6 +43,8 @@ var selected_gun := 1
 var screen := MachineScreen.new()
 
 var _messages := VBoxContainer.new()
+## "+5 Iron plate (25)" over the world where items came or went (`fly`).
+var flying := FlyingText.new()
 var _health_color := -1.0
 ## The Factorio-style inventory, crafting, machine screens and quickbar (scripts/ui/factorio/).
 var ui := FactorioUi.new()
@@ -56,6 +59,7 @@ func _ready() -> void:
 	add_child(root)
 	# Under everything else: the red of damage and low health over the world.
 	root.add_child(damage)
+	root.add_child(flying)
 
 	status.position = Kit.pxv(12, 8)
 	status.theme_type_variation = "FSmallLabel"
@@ -404,6 +408,7 @@ func reset() -> void:
 	mining_bar.visible = false
 	shield_bar.visible = false
 	damage.reset()
+	flying.clear()
 	screen.close_local()
 
 
