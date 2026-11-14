@@ -17,6 +17,11 @@ const FACTORIO_PITCH := 48.0
 const FACTORIO_PX_PER_TILE := 32.0
 ## Orthographic size per unit of distance (see _process).
 const ORTHO_SCALE := 0.65
+## Zoomed in close, the view aims at the character's middle rather than its feet, or a low angle
+## left its body above the top of the screen (issue #17). The height it aims at, at the closest
+## zoom, fading to the ground by FOCUS_FADE_DISTANCE (the default zoom and further are unchanged).
+const FOCUS_HEIGHT := 0.9
+const FOCUS_FADE_DISTANCE := 30.0
 ## First person: eye height of the 1.7-tile character, field of view, mouse look speed.
 const EYE_HEIGHT := 1.55
 const FIRST_PERSON_FOV := 75.0
@@ -163,7 +168,7 @@ func _process(delta: float) -> void:
 			pitch_degrees = _settle_pitch
 			_settle_pitch = NAN
 	var turn := Basis(Vector3.UP, deg_to_rad(yaw_degrees)) * Basis(Vector3.RIGHT, -deg_to_rad(pitch_degrees))
-	camera.transform = Transform3D(turn, turn * Vector3(0.0, 0.0, distance))
+	camera.transform = Transform3D(turn, Vector3(0.0, focus_lift(distance), 0.0) + turn * Vector3(0.0, 0.0, distance))
 	if (remote_orthographic if in_remote else orthographic):
 		if camera.projection != Camera3D.PROJECTION_ORTHOGONAL:
 			camera.projection = Camera3D.PROJECTION_ORTHOGONAL
@@ -341,7 +346,12 @@ func own_view() -> Transform3D:
 		var look := Basis(Vector3.UP, deg_to_rad(_look_yaw)) * Basis(Vector3.RIGHT, -deg_to_rad(_look_pitch))
 		return Transform3D(look, at + Vector3(0.0, EYE_HEIGHT, 0.0))
 	var turn := Basis(Vector3.UP, deg_to_rad(_yaw_goal)) * Basis(Vector3.RIGHT, -deg_to_rad(pitch_degrees))
-	return Transform3D(turn, at + turn * Vector3(0.0, 0.0, _distance_goal))
+	return Transform3D(turn, at + Vector3(0.0, focus_lift(_distance_goal), 0.0) + turn * Vector3(0.0, 0.0, _distance_goal))
+
+
+## How far above the ground the angled view aims at this zoom distance (FOCUS_HEIGHT).
+static func focus_lift(dist: float) -> float:
+	return FOCUS_HEIGHT * clampf((FOCUS_FADE_DISTANCE - dist) / (FOCUS_FADE_DISTANCE - MIN_DISTANCE), 0.0, 1.0)
 
 
 ## Into the character's eyes, facing the way the camera faced, or back out to the view before.
