@@ -1446,6 +1446,17 @@ send({"t": "pickup"})
 tick(9)
 check(not full_e.valid, "pickup works again after letting go")
 take()
+tick(40)
+take()
+quick_e = spawn("item-on-ground", 0.2, 0.4, stack={"name": "copper-cable", "count": 3})
+send({"t": "pickup"})
+tick(3)
+quick_inv = [dict(map(tuple, m["l"])) for m in of_type(take(), "inv")]
+check(not quick_e.valid and quick_inv and quick_inv[-1].get("copper-cable") == inv.get_item_count("copper-cable"),
+      f"while picking up, the inventory reaches the client within a few ticks, not half a second later: {quick_inv[-1:]}")
+tick(17)  # (20 ticks in all, as the 40 above: 60, so the checks after keep their phase)
+take()
+inv.remove(lua.table_from({"name": "copper-cable", "count": 3}))
 g.settings["global"]["f3d-detail-radius"].value = 0
 tick(60)
 check(not of_type(take(), "gi"), "radius 0 turns ground items off")
