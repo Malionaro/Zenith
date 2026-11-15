@@ -1230,6 +1230,11 @@ function M.resend(cmd)
   belt_sim.resend(cmd)
 end
 
+-- Lanes the character took items off (puppet.lua, through control.lua): see belt_sim.taken.
+function M.taken(keys)
+  belt_sim.taken(keys)
+end
+
 function M.set_far(cmd)
   local s = storage.f3d
   s.far_r = math.max(0, math.min(1024, math.floor(tonumber(cmd.r) or 0)))

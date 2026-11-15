@@ -46,7 +46,7 @@ local zenith_button = require("scripts.zenith_button")
 
 -- Lanes the character took items off (picking up with F) are sent again to a client that
 -- simulates belts. Wired here: puppet.lua requiring belt_sim nests requires too deep for Lua.
-puppet.lanes_taken = function(keys) belt_items.resend({ l = keys }) end
+puppet.lanes_taken = function(keys) belt_items.taken(keys) end
 
 script.on_init(function()
   session.init_storage()
