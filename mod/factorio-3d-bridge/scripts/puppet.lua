@@ -1000,9 +1000,35 @@ local function take_off(c, line, item, st, stack, inserted)
   return false
 end
 
--- Lane keys (unit number * 8 + line) the character took items off: control.lua points this at
--- belt_items.resend, so a client that simulates belts gets those lanes again at once.
-M.lanes_taken = function(keys) end
+-- Lane keys (unit number * 8 + line) the character took items off, and the unique ids of the items
+-- that left them: control.lua points this at belt_items.taken, so a client that simulates belts
+-- gets those lanes again at once and drops those very items (`bt`).
+M.lanes_taken = function(keys, uids) end
+
+-- The unique ids of a belt line's items, as a set.
+function M.line_uids(line)
+  local out = {}
+  for _, it in pairs(line.get_detailed_contents()) do
+    out[it.unique_id] = true
+  end
+  return out
+end
+
+-- Says that items left a line: its key and the ids in `before` (M.line_uids) no longer on it.
+function M.line_taken(belt, i, line, before)
+  if not belt.unit_number then
+    return
+  end
+  local now = M.line_uids(line)
+  local gone = {}
+  for uid in pairs(before) do
+    if not now[uid] then
+      gone[#gone + 1] = uid
+    end
+  end
+  table.sort(gone)
+  M.lanes_taken({ belt.unit_number * 8 + i }, gone)
+end
 
 -- Items on belts within reach, like F in Factorio: each one whose spot on its lane is in range goes
 -- into the inventory and comes off its line. A line can only drop items by name (remove_item), so
@@ -1020,6 +1046,7 @@ local function pickup_from_belts(c, pos, r, picked)
       end
       local line = belt.get_transport_line(i)
       local took = false
+      local before
       while picked < PICKUPS_PER_TICK do
         -- The first item in reach, read again for each one: taking one off the line leaves the
         -- stacks get_detailed_contents() gave before invalid ("LuaItemStack API call when
@@ -1034,6 +1061,7 @@ local function pickup_from_belts(c, pos, r, picked)
         if not item then
           break
         end
+        before = before or M.line_uids(line)
         local st = item.stack
         local stack = { name = st.name, count = st.count, quality = st.quality.name }
         if st.spoil_percent > 0 then
@@ -1041,8 +1069,8 @@ local function pickup_from_belts(c, pos, r, picked)
         end
         local inserted = c.insert(stack)
         if inserted <= 0 then
-          if took and belt.unit_number then
-            M.lanes_taken({ belt.unit_number * 8 + i })
+          if took then
+            M.line_taken(belt, i, line, before)
           end
           return picked, false
         end
@@ -1052,10 +1080,10 @@ local function pickup_from_belts(c, pos, r, picked)
         picked = picked + 1
         took = true
       end
-      -- A client that simulates belts (`bs`) would only see the items gone at the lane's next drift
-      -- check, seconds later: the lane is read and sent again on the next update, as a `bre` asks.
-      if took and belt.unit_number then
-        M.lanes_taken({ belt.unit_number * 8 + i })
+      -- A client that simulates belts (`bs`) keeps items a read of their lane no longer has, taking
+      -- them for moved on: those taken are named to it (`bt`), and the lane is read again at once.
+      if took then
+        M.line_taken(belt, i, line, before)
       end
     end
   end

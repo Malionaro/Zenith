@@ -1231,8 +1231,8 @@ function M.resend(cmd)
 end
 
 -- Lanes the character took items off (puppet.lua, through control.lua): see belt_sim.taken.
-function M.taken(keys)
-  belt_sim.taken(keys)
+function M.taken(keys, uids)
+  belt_sim.taken(keys, uids)
 end
 
 function M.set_far(cmd)

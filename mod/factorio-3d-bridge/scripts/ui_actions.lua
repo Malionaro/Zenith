@@ -159,6 +159,10 @@ local function belt_transfer(c, e, main, item, n, quality)
   local moved = 0
   for i = 1, lines do
     local line = e.get_transport_line(i)
+    -- (The items that leave are named to a client that simulates belts, which would otherwise keep
+    -- drawing them: puppet.line_taken.)
+    local before = puppet.line_uids(line)
+    local took = false
     for _, entry in pairs(line.get_contents()) do
       local stack = { name = entry.name, count = n > 0 and math.ceil(entry.count / 2) or entry.count, quality = entry.quality }
       local inserted = c.insert(stack)
@@ -166,7 +170,11 @@ local function belt_transfer(c, e, main, item, n, quality)
         stack.count = inserted
         line.remove_item(stack)
         moved = moved + inserted
+        took = true
       end
+    end
+    if took then
+      puppet.line_taken(e, i, line, before)
     end
   end
   if moved == 0 then

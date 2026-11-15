@@ -990,7 +990,7 @@ func _on_message(msg: Dictionary) -> void:
 				_early_bs.append(msg)
 		# (A bridge mod from before `bs` (0.1.4) answers our hello with `bi`, which nothing draws now:
 		# belt_items.gd says so once, old_bridge, and the player is told.)
-		"bi":
+		"bi", "bt":
 			if Bridge.world_ready:
 				belt_items.handle(msg)
 		"bfar":

@@ -233,6 +233,9 @@ class State:
 	var held_chunks := {}
 	var asked := {}  # lane key -> msec it was last asked for
 	var last_read := {}  # lane key -> its last read's items (`sl`; for `sh`)
+	## [[game tick, unique ids], ...]: items taken off belts (`bt`), dropped again once the simulation
+	## reaches that tick: a read made before they were taken, still waiting, puts them back.
+	var taken: Array = []
 	var debug_msec := 0
 	var skipped_at := -1000000000
 	var capped_square := Vector3(0.0, 0.0, -2.0)
@@ -473,6 +476,16 @@ class Job:
 			elif to > int(sim.tick):
 				sim.step_to(to)
 		ticks = int(sim.tick) - t_start
+		# Items taken off belts, once more where the simulation has reached their tick (`bt`).
+		if not state.taken.is_empty():
+			var still: Array = []
+			for e: Array in state.taken:
+				if int(sim.tick) >= int(e[0]):
+					for u in e[1]:
+						sim.take_item(int(u))
+				else:
+					still.append(e)
+			state.taken = still
 		var ch: Dictionary = sim.take_changes()
 		sim_usec = Time.get_ticks_usec() - ts
 		if state.draw != null:
@@ -705,6 +718,19 @@ class Job:
 
 	## One part of an update (`bs`): lanes' meta first, then their items, checks, drops, switches.
 	func _handle(msg: Dictionary) -> void:
+		if msg.get("t") == "bt":
+			# Taken off its belt: gone now. The simulation keeps an item a read of its lane no longer
+			# has, taking it for moved on (read_conserve), so a taken one would stay drawn.
+			var uids := PackedInt64Array()
+			if msg.get("l") is Array:
+				for u in msg.get("l"):
+					if (u is int or u is float) and int(u) > 0:
+						uids.append(int(u))
+			for u in uids:
+				state.sim.take_item(u)
+			var at = msg.get("k", 0)
+			state.taken.append([int(at) if (at is int or at is float) else 0, uids])
+			return
 		if msg.get("t") != "bs":
 			return
 		var sim := state.sim
@@ -1894,6 +1920,11 @@ func covered() -> Vector3:
 
 
 func handle(msg: Dictionary) -> void:
+	# `bt`: items the character took off belts, dropped by the next job (in order with the updates).
+	if msg.get("t") == "bt":
+		_flush_parts()
+		_inbox.append(msg)
+		return
 	if msg.get("t") != "bs":
 		# `bi`, from a bridge older than `bs` (main's 0.1.4 mod, which doesn't know our hello's `bs`):
 		# not drawn. Said once a connection (main.gd tells the player), else the belts stand empty in silence.

@@ -1473,10 +1473,11 @@ before = {n: inv.get_item_count(n) for n in ("copper-plate", "iron-gear-wheel")}
 # The lanes a client that simulates belts is sent again (belt_sim.taken).
 lua.execute("""
   local bs = package.loaded["scripts.belt_sim"]
-  F_resent, F_taken = {}, F_taken or bs.taken
-  bs.taken = function(keys)
+  F_resent, F_taken_uids, F_taken = {}, {}, F_taken or bs.taken
+  bs.taken = function(keys, uids)
     for _, k in ipairs(keys) do F_resent[#F_resent + 1] = k end
-    return F_taken(keys)
+    for _, u in ipairs(uids or {}) do F_taken_uids[#F_taken_uids + 1] = u end
+    return F_taken(keys, uids)
   end
 """)
 for _ in range(3):
@@ -1518,6 +1519,9 @@ inv.remove(lua.table_from({"name": "iron-ore", "count": 2}))
 resent = sorted(set(lua.eval("F_resent").values()))
 nu = int(near_belt.unit_number)
 check(resent == [nu * 8 + 1, nu * 8 + 2], f"the lanes it took from are sent again to a client that simulates belts: {resent}")
+taken_uids = sorted(int(u) for u in lua.eval("F_taken_uids").values())
+check(taken_uids == [7101, 7102, 7105],
+      f"and the items that left them are named (bt), not those left on the belts: {taken_uids}")
 take()
 tick(40)
 F.put_on_belt(near_belt, 1, "copper-plate", 0.5, 7104)
@@ -6738,7 +6742,9 @@ flowed = bs_of(take())
 check(u1 * 8 + 1 not in flowed["sl"], f"bs: a watched lane that only flowed on isn't sent: {sorted(flowed['sl'])}")
 # Lanes the character took items off (belt_sim.taken, issue #18): sent again at once, with every lane
 # of the belt they feed (the client may have carried a taken item on to it), even unwatched ones.
-bs_mod.taken(lua.table_from([u2 * 8 + 1]))
+bs_mod.taken(lua.table_from([u2 * 8 + 1]), lua.table_from([8103]))
+bts = of_type(take(), "bt")
+check([m["l"] for m in bts] == [[8103]], f"bs: the items taken are named to the client at once (bt): {bts}")
 tick(12)
 taken = bs_of(take())
 check(u2 * 8 + 1 in taken["sl"] and {u3 * 8 + 1, u3 * 8 + 2} <= set(taken["sl"]),
