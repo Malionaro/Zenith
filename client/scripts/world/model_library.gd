@@ -383,6 +383,9 @@ static func custom_models_dir() -> String:
 
 static func _count_models(dir: String) -> int:
 	var n := 0
+	# (No folder, no models: get_files_at would print an engine error for it.)
+	if not DirAccess.dir_exists_absolute(dir):
+		return 0
 	for f in DirAccess.get_files_at(dir):
 		if f.get_extension().to_lower() in ["glb", "gltf"]:
 			n += 1
