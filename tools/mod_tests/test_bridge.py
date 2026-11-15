@@ -1362,9 +1362,17 @@ for a, want in ((55, (0, 2)), (125, (2,)), (980, (14, 0)), (600, (8, 10)), (250,
     check(set(dirs) <= set(want) and off < 1.5, f"walking at {a / 1000} turns steps {sorted(set(dirs))}, path {got:.2f} degrees ({off:.2f} off)")
 mes = of_type(take(), "me")
 check(mes and mes[-1].get("a") == 250 and mes[-1]["w"] == 1, f"me carries the walk's angle: {mes[-1:]}")
+walk_ks = [m["k"] for m in mes[-20:]]
+check(len(walk_ks) == 20 and all(b - a == 1 for a, b in zip(walk_ks, walk_ks[1:])),
+      f"while walking, me comes every tick (the client corrects its prediction by it): {walk_ks}")
+check(mes[-1].get("rs") == 150, f"me carries the running speed in thousandths of a tile a tick: {mes[-1].get('rs')}")
 send({"t": "walk", "d": -1})
 tick(1)
 check(not puppet.walking_state.walking, "walk -1 stops an angled walk at once")
+take()
+tick(10)
+idle_ks = [m["k"] for m in of_type(take(), "me")]
+check(idle_ks and all(b - a == 2 for a, b in zip(idle_ks, idle_ks[1:])), f"and standing, every 2 ticks again: {idle_ks}")
 # A wall across the way north: the angle's north steps go nowhere, so the bridge takes the other
 # direction each time and the character slides east along the wall instead of standing still
 # (the drift is counted from the steps chosen, which a wall can stop).
@@ -1507,7 +1515,7 @@ g.settings["global"]["f3d-detail-radius"].value = 24
 for e in (wood_e, far_item):
     e.destroy()
 tick(30)
-check([m["l"] for m in of_type(take(), "gi")] == [[]], "an empty update means no items on the ground")
+_gis = [(m.get("k"), m["l"]) for m in of_type(take(), "gi")]; check(_gis and all(l == [] for _, l in _gis), f"an empty update means no items on the ground: {_gis}")
 
 # --- combat -------------------------------------------------------------------------------------
 send({"t": "hello", "v": 1, "sid": "s1", "w": 1})  # keep-alive: the client times out after 600 ticks

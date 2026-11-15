@@ -613,6 +613,10 @@ local function pod_fields(c, s, msg)
 end
 
 -- In a vehicle the position is the vehicle's, which the camera follows.
+local function is_walking(c)
+  return c.walking_state.walking
+end
+
 local function send_state(c, s)
   local v = M.vehicle(c)
   local p = (v or c).position
@@ -630,6 +634,15 @@ local function send_state(c, s)
   -- An angled walk's angle: the client draws the character along it, not along the zig-zag.
   if s.walk and s.walk.angle and msg.w == 1 and not v then
     msg.a = s.walk.angle
+  end
+  -- How fast the character runs now (exoskeletons, tiles, stickers), in thousandths of a tile a
+  -- tick: the client moves its own character ahead of the messages at this speed while a move key
+  -- is held, so walking answers at once (avatar.gd).
+  if not v then
+    local okr, speed = pcall(function() return c.character_running_speed end)
+    if okr and speed then
+      msg.rs = math.floor(speed * 1000 + 0.5)
+    end
   end
   -- Flying in mech armour (Space Age): the client lifts the body and draws take-off, hover and
   -- landing. Read under pcall: a game without these keys (older 2.x) throws on reading them.
@@ -1034,7 +1047,9 @@ function M.tick()
   tick_walk(c, s)
   tick_mining(c, s)
   tick_pickup(c, s)
-  if game.tick % STATE_INTERVAL == 0 then
+  -- Every tick while walking: the client corrects its own character's predicted position by these,
+  -- and each tick sooner is a little less to correct.
+  if game.tick % STATE_INTERVAL == 0 or (s.walk and is_walking(c)) then
     send_state(c, s)
   end
   if game.tick % INVENTORY_INTERVAL == 0 then
