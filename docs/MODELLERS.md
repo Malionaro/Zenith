@@ -105,6 +105,42 @@ to the maintainer before starting one.
 With the source code, `python3 tools/models/check.py <name>` checks the name, footprint, origin,
 facing and triangle budget, and `tools/models/review.py <name>` takes screenshots in the game.
 
+## Sharing models: model packs
+
+To give your models to other players, make a **model pack**: a folder (or a `.zip` of one) with a
+`pack.json` beside the models. Players drop it, as it is, into Zenith's `model-packs` folder
+(Settings > Graphics > Model packs opens it; it is in Zenith's user folder, on Windows
+`%APPDATA%\Godot\app_userdata\Zenith\model-packs`, or beside `Zenith.exe`). Zenith loads it at its
+next start.
+
+```json
+{
+  "id": "my-mod-models",
+  "name": "My mod's models",
+  "version": "1.0.0",
+  "author": "you",
+  "description": "3D models for My mod's machines",
+  "mod": "my-mod",
+  "mod_version": ">=1.2.0",
+  "replace": false,
+  "models": "models"
+}
+```
+
+- `id` (lower case letters, digits, `-` and `_`) and `version` are needed; the rest is optional.
+- `models`: the folder in the pack with the `.glb` / `.gltf` files, named as above; the pack's own
+  folder when left out.
+- `replace`: `false` fills in entities that have no model (a mod's); `true` replaces Zenith's own
+  models of the same names (a pack of better base-game models).
+- `mod`, `mod_version`: the Factorio mod the pack is for, and which of its versions (`1.2.3`, or
+  `>=`, `>`, `<=`, `<`, `=` and a version). When a game doesn't run that mod, or runs another
+  version, Zenith's log says so.
+- A zip may hold `pack.json` at its root or one folder down, as Factorio's mod zips do. Of two
+  packs with one id the newer version is used; of two packs with a model of one name, the first
+  found. A pack is switched off in the settings file's `[model_packs]` section (`my-mod-models=false`).
+- While working on one, start Zenith with `-- --model-packs=<the pack's folder>`: it is then always
+  on. `--no-model-packs` leaves every pack out.
+
 ## Improving the models over time
 
 Zenith's models are a starting point, not the final word. Most were built quickly to cover every

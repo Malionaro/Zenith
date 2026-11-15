@@ -13,7 +13,7 @@ extends Node3D
 ## (--factorio-port, --port, --open, --ui..., --camera..., --fx-demo, --no-menu) skip the menu and
 ## connect to 127.0.0.1:<--factorio-port, 34200> straight away, as before the menu existed.
 ##
-## Command-line options (after `--`): --factorio-port=34200 --port=34201 --models=<dir> --addons=<dir>
+## Command-line options (after `--`): --factorio-port=34200 --port=34201 --models=<dir> --model-packs=<dir> --no-model-packs --addons=<dir>
 ## (scripts/addons/addon_loader.gd)
 ## --factorio-data=<Factorio's data folder, for item icons> --open=<unit> (player_input.gd)
 ## --review-shots=<dir>[@seconds] saves model review shots and quits (scripts/debug/review_shots.gd).

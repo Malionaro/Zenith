@@ -377,6 +377,20 @@ func _graphics() -> void:
 	var in_use := ("%d in use" % ModelLibrary.external_count) if ModelLibrary.external_count > 0 else "none"
 	_row(grid, "Your models", open_models,
 		"%s|A .glb in Zenith's models folder replaces Zenith's own model of the same name (transport-belt.glb, inserter-east.glb...), at the next start. Empty, Zenith uses its own. The guide for modellers (MODELLERS.md) has every name." % in_use)
+	var open_packs := MenuKit.button("Open folder")
+	open_packs.name = "graphics-open-model-packs"
+	var on_open_packs := func() -> void:
+		Sfx.play_ui("gui-click")
+		var dir := ProjectSettings.globalize_path("user://model-packs")
+		DirAccess.make_dir_recursive_absolute(dir)
+		OS.shell_open(dir)
+	open_packs.pressed.connect(on_open_packs)
+	var pack_names: Array = ModelLibrary.packs.map(func(m: Dictionary) -> String:
+		return "%s %s (%d models%s)" % [str(m["name"]), str(m["version"]), int(m["count"]), ", replaces Zenith's" if bool(m["replace"]) else ""])
+	var packs_in_use := ("%d in use" % pack_names.size()) if not pack_names.is_empty() else "none"
+	_row(grid, "Model packs", open_packs,
+		"%s|Folders or zips of models for a mod's entities (or better ones for the base game), each with a pack.json, dropped into Zenith's model-packs folder; loaded at the next start. MODELLERS.md says how to make one.%s" % [packs_in_use,
+			("\nIn use: " + ", ".join(pack_names)) if not pack_names.is_empty() else ""])
 
 	_heading("Advanced")
 	grid = _grid()

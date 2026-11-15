@@ -49,10 +49,21 @@ static var _loaded_mutex := Mutex.new()
 static var _ready_list = null  # [fp, merged] whole, waiting for mod_files.gd to find the mods
 
 
+## Says in the log which model packs are for a mod this game doesn't run, or another version of it.
+static func _check_model_packs(mods: Dictionary) -> void:
+	if mods.is_empty():
+		return
+	# Loaded here: model_library.gd and model_packs.gd preload settings.gd, which reaches back here.
+	var library = load("res://scripts/world/model_library.gd")
+	for line in load("res://scripts/world/model_packs.gd").check_mods(library.packs, mods):
+		print("[models] " + str(line))
+
+
 ## The welcome: the game's mods, and the list to use. `send` sends a command to the bridge.
 static func on_welcome(msg: Dictionary, send: Callable) -> void:
 	var mods = msg.get("mods")
 	ModFiles.set_mods(mods if mods is Dictionary else {})
+	_check_model_packs(mods if mods is Dictionary else {})
 	_send = send
 	var fp := str(msg.get("gf", ""))
 	var n := int(msg.get("gn", 0))

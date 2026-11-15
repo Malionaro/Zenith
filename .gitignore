@@ -11,6 +11,8 @@ docs/tracker/github.json
 
 # The modellers' folder (models/ beside Zenith): models being tried, not the project's own
 /models/
+# Model packs dropped beside Zenith (model-packs/): players' own, not the project's
+/model-packs/
 
 # The native belt simulation's build: godot-cpp (downloaded, docs/RUNNING.md) and SCons' leftovers
 client/native/godot-cpp/

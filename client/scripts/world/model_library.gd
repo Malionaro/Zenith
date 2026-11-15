@@ -4,6 +4,7 @@ extends RefCounted
 ##
 ##   res://assets/models/<name>.glb or .gltf   (imported by the Godot editor)
 ##   <dir>/<name>.glb or .gltf                 (loaded at runtime, with --models=<dir>; first with --models-first)
+##   <pack>/<name>.glb or .gltf                (model packs, model_packs.gd: filling in, or first with "replace")
 ##
 ## Models follow docs/PLAN.md §4: 1 unit = 1 tile, origin at the footprint centre on the
 ## ground, facing north (-Z). Anything without a model is drawn as a placeholder.
@@ -347,15 +348,75 @@ static var merge_materials := false
 static var external_first := false
 
 
-## The model file of `file` in external_dir, or "".
-static func _external_path(file: String) -> String:
-	if external_dir == "":
+## Model packs' folders (model_packs.gd), in the order they are looked in: those that replace
+## Zenith's own models, and those that fill in entities without one. `packs`: the packs loaded, for
+## Settings and the log.
+static var pack_dirs_first: Array[String] = []
+static var pack_dirs_fill: Array[String] = []
+static var packs: Array = []
+
+
+## The model file of `file` in `dir`, or "".
+static func _model_in(dir: String, file: String) -> String:
+	if dir == "":
 		return ""
 	for ext in ["glb", "gltf"]:
-		var path := external_dir.path_join("%s.%s" % [file, ext])
+		var path := dir.path_join("%s.%s" % [file, ext])
 		if FileAccess.file_exists(path):
 			return path
 	return ""
+
+
+## The model file of `file` that comes before Zenith's own (--models-first, then packs that
+## replace), or "".
+static func _first_path(file: String) -> String:
+	if external_first:
+		var path := _model_in(external_dir, file)
+		if path != "":
+			return path
+	for dir in pack_dirs_first:
+		var path := _model_in(dir, file)
+		if path != "":
+			return path
+	return ""
+
+
+## The model file of `file` for an entity Zenith has no model of (--models, then packs that fill
+## in), or "".
+static func _fill_path(file: String) -> String:
+	if not external_first:
+		var path := _model_in(external_dir, file)
+		if path != "":
+			return path
+	for dir in pack_dirs_fill:
+		var path := _model_in(dir, file)
+		if path != "":
+			return path
+	return ""
+
+
+## A model from a modeller's folder (--models, models/, a pack) rather than Zenith's own.
+static func _is_external(path: String) -> bool:
+	if external_dir != "" and path.begins_with(external_dir):
+		return true
+	for dir in pack_dirs_first + pack_dirs_fill:
+		if path.begins_with(dir):
+			return true
+	return false
+
+
+## Loads the model packs that are on (model_packs.gd).
+static func load_packs(where: Array = []) -> void:
+	# Loaded here, not preloaded: model_packs.gd preloads settings.gd, which preloads this script.
+	var ModelPacks = load("res://scripts/world/model_packs.gd")
+	packs = ModelPacks.active(where)
+	pack_dirs_first.clear()
+	pack_dirs_fill.clear()
+	for m in packs:
+		(pack_dirs_first if bool(m["replace"]) else pack_dirs_fill).append(str(m["path"]))
+		print("[models] pack %s %s: %d model(s) from %s %s" % [str(m["id"]), str(m["version"]), int(m["count"]), str(m["path"]),
+			"replace Zenith's own of the same name" if bool(m["replace"]) else "fill in entities without a model"])
+	_sources.clear()
 ## The models' look: "colours" (part colours, always in a game) or "palette" (the models' own
 ## palette, --model-look=palette for comparing). Set before the first model is built.
 const LOOKS := ["colours", "palette"]
@@ -413,6 +474,8 @@ static func configure_from_command_line() -> void:
 		external_count = _count_models(external_dir)
 		print("[models] %d model(s) from %s %s" % [external_count, external_dir,
 			"replace Zenith's own of the same name" if external_first else "fill in entities without a model"])
+	if not OS.get_cmdline_user_args().has("--no-model-packs"):
+		load_packs()
 	warm_up()
 
 
@@ -691,7 +754,7 @@ static func single_model(proto_name: String) -> bool:
 		return false
 	var name: String = MODEL_ALIASES.get(proto_name, proto_name)
 	var base := _source(name)
-	if base == "" or not (base.contains("/fue5/") or (external_dir != "" and base.contains(external_dir))):
+	if base == "" or not (base.contains("/fue5/") or _is_external(base.trim_prefix(GLTF_SOURCE))):
 		return false
 	var east := ""
 	for sfx: String in FACING_MODELS[proto_name]:
@@ -1529,9 +1592,9 @@ static func _source(name: String) -> String:
 	if family != "":
 		file = family
 	var found := ""
-	var external := _external_path(file)
-	if external_first and external != "":
-		found = GLTF_SOURCE + external
+	var first := _first_path(file)
+	if first != "":
+		found = GLTF_SOURCE + first
 	for sub in MODEL_SUBDIRS:
 		if found == "" and FileAccess.file_exists("res://assets/models/%s%s.glb" % [sub, file]):
 			found = GLTF_SOURCE + "res://assets/models/%s%s.glb" % [sub, file]
@@ -1546,8 +1609,10 @@ static func _source(name: String) -> String:
 		if ResourceLoader.exists(res_path):
 			found = SCENE_SOURCE + res_path
 			break
-	if found == "" and external != "":
-		found = GLTF_SOURCE + external
+	if found == "":
+		var fill := _fill_path(file)
+		if fill != "":
+			found = GLTF_SOURCE + fill
 	_sources[name] = found
 	return found
 
@@ -1564,7 +1629,7 @@ static func ready(name: String) -> bool:
 			var load := Load.new()
 			load.path = source.substr(GLTF_SOURCE.length())
 			load.combine = merge_materials
-			load.modeller = external_dir != "" and load.path.begins_with(external_dir)
+			load.modeller = _is_external(load.path)
 			load.rig_wanted = rig_name(name)
 			_jobs[name] = [-1, load]
 			_job_order.append(name)
@@ -1659,7 +1724,7 @@ static func _built(name: String) -> Load:
 		load = Load.new()
 		load.path = _source(name).substr(GLTF_SOURCE.length())
 		load.combine = merge_materials
-		load.modeller = external_dir != "" and load.path.begins_with(external_dir)
+		load.modeller = _is_external(load.path)
 		load.rig_wanted = rig_name(name)
 		_parsed_here = true
 		load.run()
@@ -1727,8 +1792,8 @@ static func _load_scene(name: String) -> Node:
 	var family := CreatureModels.base_model(name)
 	if family != "":
 		name = family
-	var external := _external_path(name)
-	if not (external_first and external != ""):
+	var external := _first_path(name)
+	if external == "":
 		for sub in MODEL_SUBDIRS:
 			if ResourceLoader.exists("res://assets/models/%s%s.glb" % [sub, name]):
 				var sub_packed := load("res://assets/models/%s%s.glb" % [sub, name]) as PackedScene
@@ -1740,6 +1805,7 @@ static func _load_scene(name: String) -> Node:
 				var packed := load(res_path) as PackedScene
 				if packed != null:
 					return packed.instantiate()
+		external = _fill_path(name)
 	if external != "":
 		var doc := GLTFDocument.new()
 		var state := GLTFState.new()

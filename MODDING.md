@@ -45,6 +45,9 @@ Put the model in either place:
   `client/assets/models/` with the same name wins. To try a replacement for a built-in model,
   add `--models-first`: then the folder's model wins (this also works with the downloaded
   game: `Zenith.exe -- --models=C:/my-models --models-first`).
+- A **model pack**, to share them: a folder or zip with a `pack.json` (its id, version, the mod
+  it's for and which of its versions, whether it fills in or replaces), dropped into Zenith's
+  `model-packs` folder. [docs/MODELLERS.md](docs/MODELLERS.md#sharing-models-model-packs) has the format.
 
 ### The rules a model has to follow
 
@@ -145,9 +148,10 @@ world read-only, events, frames, lighter updates and data); more hooks come as a
 
 Planned, roughly in order:
 
-1. **Model packs.** A folder (or zip) of models, loaded alongside the built-in ones, with a small
-   manifest saying which mod they're for and which version. A Factorio mod could carry its own
-   pack.
+1. **Model packs.** Working: a folder (or zip) of models, loaded alongside the built-in ones,
+   with a `pack.json` saying which mod they're for and which version
+   ([docs/MODELLERS.md](docs/MODELLERS.md#sharing-models-model-packs)). Next: a Factorio mod
+   carrying its own pack, read from the mod's files.
 2. **Icons from any mod.** Reading every mod's icons from the game's prototype data, so modded
    items show their real icons.
 3. **Animations.** More `anim_*` kinds, and parts driven by what the machine is doing (its
