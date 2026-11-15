@@ -144,7 +144,8 @@ sequenceDiagram
 - **Drawing a big base.** The sun's shadow map is fitted to the ground in view (`sun_shadows.gd`),
   instead of four splits out to 150 tiles. Models have levels of detail and simple shadow stand-ins
   (`model_lods.gd`); trees' far levels keep fewer, larger leaf cards, and looking towards the
-  horizon the shadows stop sooner (the quality's horizon cap). Past about four chunks from the
+  horizon the shadows stop sooner (the quality's horizon cap) and the view itself ends in haze at
+  the horizon distance (`horizon_reach.gd`: the camera's far plane and a depth fog). Past about four chunks from the
   camera a chunk's buildings are merged into one simplified, vertex-coloured mesh (`far_chunks.gd`,
   Merge far buildings): one draw instead of dozens.
 - **Holding 60 UPS** (`ups_governor.gd`). What the client asks for is worked out in the game's
