@@ -833,7 +833,8 @@ func _forward_while_joining() -> void:
 ## first load, the client's chunks and movers; Godot's main thread at 85% of a core, the four cores at 90%)
 ## ran the game at 34 UPS median at normal priority and 56 below; steady 59-60 either way, the client's
 ## frame rate unchanged (60, vsync). Hold 60 UPS then steps the bridge down less during the join.
-## Windows: wmic (below normal 16384, normal 32); elsewhere renice. Off puts it back to normal.
+## Windows: PowerShell's Get-Process (wmic is gone from newer Windows 11: "Could not create child
+## process: wmic"); elsewhere renice. Off puts it back to normal.
 var _priority_low := false
 
 
@@ -845,7 +846,8 @@ func _apply_priority() -> void:
 	_priority_low = want
 	var pid := OS.get_process_id()
 	if OS.get_name() == "Windows":
-		OS.create_process("wmic", ["process", "where", "processid=%d" % pid, "call", "setpriority", "16384" if want else "32"], false)
+		OS.create_process("powershell", ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command",
+			"(Get-Process -Id %d).PriorityClass = '%s'" % [pid, "BelowNormal" if want else "Normal"]], false)
 	else:
 		OS.create_process("renice", ["-n", "5" if want else "0", "-p", str(pid)], false)
 	print("server on this PC: the client's process priority %s (Settings > Graphics > Give the server the CPU first)"
