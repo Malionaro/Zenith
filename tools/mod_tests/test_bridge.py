@@ -1455,18 +1455,34 @@ tick(40)
 pp = puppet.position
 near_belt = spawn("transport-belt", pp.x + 0.5, pp.y + 0.5, force="player", direction=0)
 far_belt = spawn("transport-belt", pp.x + 6.5, pp.y + 0.5, force="player", direction=0)
+# Two on one lane: taking one off leaves the others' stacks from get_detailed_contents invalid, which
+# stopped the pickup with "LuaItemStack API call when LuaItemStack was invalid" in the game.
 F.put_on_belt(near_belt, 1, "copper-plate", 0.5, 7101)
+F.put_on_belt(near_belt, 1, "copper-plate", 0.25, 7105)
 F.put_on_belt(near_belt, 2, "iron-gear-wheel", 0.5, 7102)
 F.put_on_belt(far_belt, 1, "copper-plate", 0.5, 7103)
 before = {n: inv.get_item_count(n) for n in ("copper-plate", "iron-gear-wheel")}
+# The lanes a client that simulates belts is sent again (belt_sim.resend, as a `bre` asks).
+lua.execute("""
+  local bs = package.loaded["scripts.belt_sim"]
+  F_resent, F_resend = {}, F_resend or bs.resend
+  bs.resend = function(cmd)
+    for _, k in ipairs(cmd.l) do F_resent[#F_resent + 1] = k end
+    return F_resend(cmd)
+  end
+""")
 for _ in range(3):
     send({"t": "pickup"})
     tick(9)
+lua.execute('package.loaded["scripts.belt_sim"].resend = F_resend')
 check(near_belt.get_transport_line(1).get_item_count() == 0 and near_belt.get_transport_line(2).get_item_count() == 0,
-      "pickup takes the items off a belt within the character's item_pickup_distance")
+      "pickup takes the items off a belt within the character's item_pickup_distance, several on one lane too")
 check(far_belt.get_transport_line(1).get_item_count() == 1, "but not off a belt further away")
-check([inv.get_item_count(n) - before[n] for n in ("copper-plate", "iron-gear-wheel")] == [1, 1],
+check([inv.get_item_count(n) - before[n] for n in ("copper-plate", "iron-gear-wheel")] == [2, 1],
       "items picked up from a belt go to the inventory")
+resent = sorted(set(lua.eval("F_resent").values()))
+nu = int(near_belt.unit_number)
+check(resent == [nu * 8 + 1, nu * 8 + 2], f"the lanes it took from are sent again to a client that simulates belts: {resent}")
 take()
 tick(40)
 F.put_on_belt(near_belt, 1, "copper-plate", 0.5, 7104)
@@ -1482,8 +1498,8 @@ tick(40)
 take()
 for e in (near_belt, far_belt):
     e.destroy()
-for n in ("copper-plate", "iron-gear-wheel"):  # back as it was, for the inventory checks further on
-    inv.remove(lua.table_from({"name": n, "count": 1}))
+for n, k in (("copper-plate", 2), ("iron-gear-wheel", 1)):  # back as it was, for the inventory checks further on
+    inv.remove(lua.table_from({"name": n, "count": k}))
 g.settings["global"]["f3d-detail-radius"].value = 0
 tick(60)
 check(not of_type(take(), "gi"), "radius 0 turns ground items off")

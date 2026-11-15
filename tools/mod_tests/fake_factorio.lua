@@ -1306,10 +1306,25 @@ local function make_transport_line(e, index)
     get_detailed_contents = function()
       F.detailed_reads = (F.detailed_reads or 0) + 1
       local out = {}
+      -- As in the game: once an item is taken off the line (remove_item), the stacks read before
+      -- are invalid and any use of them is an error.
+      local gen = items.gen or 0
       for _, it in ipairs(items) do
+        local fields = { valid_for_read = true, name = it.name, count = it.count or 1, spoil_percent = it.spoil or 0,
+          quality = strict("LuaQualityPrototype", { name = it.quality or "normal" }) }
+        local stack = setmetatable({}, {
+          __index = function(_, k)
+            if (items.gen or 0) ~= gen then
+              error("LuaItemStack API call when LuaItemStack was invalid.", 2)
+            end
+            if fields[k] == nil then
+              error("LuaItemStack doesn't contain key " .. tostring(k), 2)
+            end
+            return fields[k]
+          end,
+        })
         out[#out + 1] = strict("DetailedItemOnLine", {
-          stack = strict("LuaItemStack", { valid_for_read = true, name = it.name, count = it.count or 1, spoil_percent = it.spoil or 0,
-            quality = strict("LuaQualityPrototype", { name = it.quality or "normal" }) }),
+          stack = stack,
           position = it.position,
           unique_id = it.unique_id,
         })
@@ -1339,6 +1354,7 @@ local function make_transport_line(e, index)
     end,
     remove_item = function(stack)
       assert(type(stack) == "table" and stack.name, "remove_item(items)")
+      items.gen = (items.gen or 0) + 1
       local left = stack.count or 1
       for k = #items, 1, -1 do
         if left > 0 and items[k].name == stack.name and (items[k].quality or "normal") == (stack.quality or "normal") then
