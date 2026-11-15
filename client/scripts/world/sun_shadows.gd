@@ -28,11 +28,19 @@ extends Node
 ## split had, which blurred thin shadows such as a pole's lattice: blurring 0.6 texels keeps their
 ## edges as before. "items": how far the camera may be from the belt items round the character for
 ## their models to cast shadows (belt_items.gd shadows_within).
+##
+## "horizon_cap": the furthest the shadows reach while the view reaches far (a low tilt towards the
+## horizon, first person) and Shadow distance is Automatic. There the ground in view runs out to the
+## view distance, so the shadows went straight to "cap" in Godot's cascades, and every caster in
+## that long box (whole tree lines, each crown a full stand-in) was drawn once per split it touched:
+## the region of casters grows with the square of the distance, so 150 -> 100 tiles draws well under
+## half of them. Past it the shadows fade out (fade) over ground that is small on screen that far
+## off; a tilt of the default view or steeper never reaches far, so it is drawn as before.
 const QUALITY := {
-	"low": {"splits": 1, "horizon_splits": 2, "atlas": 2048, "cap": 80.0, "fade": 0.8, "blend": false, "filter": RenderingServer.SHADOW_QUALITY_SOFT_VERY_LOW, "blur": 1.0, "items": 30.0},
-	"medium": {"splits": 1, "horizon_splits": 2, "atlas": 4096, "cap": 110.0, "fade": 0.8, "blend": false, "filter": RenderingServer.SHADOW_QUALITY_SOFT_LOW, "blur": 1.0, "items": 45.0},
-	"high": {"splits": 1, "horizon_splits": 4, "atlas": 4096, "cap": 150.0, "fade": 0.8, "blend": false, "filter": RenderingServer.SHADOW_QUALITY_SOFT_LOW, "blur": 0.6, "items": 60.0},
-	"ultra": {"splits": 1, "horizon_splits": 4, "atlas": 8192, "cap": 200.0, "fade": 0.8, "blend": true, "filter": RenderingServer.SHADOW_QUALITY_SOFT_LOW, "blur": 1.0, "items": 80.0},
+	"low": {"splits": 1, "horizon_splits": 2, "atlas": 2048, "cap": 80.0, "horizon_cap": 60.0, "fade": 0.8, "blend": false, "filter": RenderingServer.SHADOW_QUALITY_SOFT_VERY_LOW, "blur": 1.0, "items": 30.0},
+	"medium": {"splits": 1, "horizon_splits": 2, "atlas": 4096, "cap": 110.0, "horizon_cap": 80.0, "fade": 0.8, "blend": false, "filter": RenderingServer.SHADOW_QUALITY_SOFT_LOW, "blur": 1.0, "items": 45.0},
+	"high": {"splits": 1, "horizon_splits": 4, "atlas": 4096, "cap": 150.0, "horizon_cap": 100.0, "fade": 0.8, "blend": false, "filter": RenderingServer.SHADOW_QUALITY_SOFT_LOW, "blur": 0.6, "items": 60.0},
+	"ultra": {"splits": 1, "horizon_splits": 4, "atlas": 8192, "cap": 200.0, "horizon_cap": 140.0, "fade": 0.8, "blend": true, "filter": RenderingServer.SHADOW_QUALITY_SOFT_LOW, "blur": 1.0, "items": 80.0},
 }
 ## The view reaches "far" (cascades, horizon_splits) once the shadows' distance is this many times
 ## the nearest ground in view; back to one map below the second figure.
@@ -126,11 +134,14 @@ func _fit(force: bool) -> void:
 		return
 	var cap := cap_for(spec, distance_cap)
 	var want := distance_for(view_depths.y, cap, -1.0 if force else sun.directional_shadow_max_distance, float(spec["fade"]))
+	# Looking far (the horizon, a low tilt) the nearest ground is many times nearer than the
+	# furthest, which one map can't cover sharply: Godot's own cascades then, no further than the
+	# quality's horizon_cap (asked of the full distance, so the cap doesn't decide it).
+	far_view = reaches_far(view_depths, want, far_view)
+	if far_view:
+		want = minf(want, horizon_cap_for(spec, distance_cap))
 	if want != sun.directional_shadow_max_distance or force:
 		sun.directional_shadow_max_distance = want
-	# Looking far (the horizon, a low tilt) the nearest ground is many times nearer than the
-	# furthest, which one map can't cover sharply: Godot's own cascades then.
-	far_view = reaches_far(view_depths, want, far_view)
 	var count := int(spec["horizon_splits"]) if far_view else int(spec["splits"])
 	var mode: DirectionalLight3D.ShadowMode = MODES[count]
 	if sun.directional_shadow_mode != mode:
@@ -182,13 +193,19 @@ static func ground_depths(cam: Camera3D) -> Vector2:
 	return Vector2(nearest, furthest)
 
 
-## The shadow distance for ground in view out to `furthest`: past it by the fade (Godot's shadows
-## fade out from `fade` of the distance on, so the fade starts past the top of the screen), on the
 ## The shadows' cap: the setting's distance when one is chosen, else the quality's.
 static func cap_for(s: Dictionary, chosen: float) -> float:
 	return chosen if chosen > 0.0 else float(s["cap"])
 
 
+## While the view reaches far: the quality's horizon_cap, unless Shadow distance is chosen
+## (then the player's distance, as before).
+static func horizon_cap_for(s: Dictionary, chosen: float) -> float:
+	return chosen if chosen > 0.0 else float(s.get("horizon_cap", s["cap"]))
+
+
+## The shadow distance for ground in view out to `furthest`: past it by the fade (Godot's shadows
+## fade out from `fade` of the distance on, so the fade starts past the top of the screen), on the
 ## ladder (MIN_DISTANCE x STEP^n), at most `cap`. `current` (-1: none) is kept while the view needs
 ## a little less than it.
 static func distance_for(furthest: float, cap: float, current: float, fade := 0.8) -> float:

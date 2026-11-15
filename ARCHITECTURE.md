@@ -143,9 +143,10 @@ sequenceDiagram
   ground. Past "Belt items in full" each lane shows icons instead (`belt_lanes.gd`).
 - **Drawing a big base.** The sun's shadow map is fitted to the ground in view (`sun_shadows.gd`),
   instead of four splits out to 150 tiles. Models have levels of detail and simple shadow stand-ins
-  (`model_lods.gd`). Past about four chunks from the camera a chunk's buildings are merged into one
-  simplified, vertex-coloured mesh (`far_chunks.gd`, Merge far buildings): one draw instead of
-  dozens.
+  (`model_lods.gd`); trees' far levels keep fewer, larger leaf cards, and looking towards the
+  horizon the shadows stop sooner (the quality's horizon cap). Past about four chunks from the
+  camera a chunk's buildings are merged into one simplified, vertex-coloured mesh (`far_chunks.gd`,
+  Merge far buildings): one draw instead of dozens.
 - **Holding 60 UPS** (`ups_governor.gd`). What the client asks for is worked out in the game's
   tick, so when the game runs slow the client asks for less: first a `rate` level, then shorter
   distances, the minimap's refreshes and a frame cap, never changing the player's settings, and

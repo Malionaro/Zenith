@@ -3369,11 +3369,18 @@ func _sun_shadows(cam: Camera3D, sun: DirectionalLight3D) -> void:
 	check(is_equal_approx(sun.directional_shadow_max_distance, fitted) and sun.directional_shadow_mode == DirectionalLight3D.SHADOW_ORTHOGONAL
 		and not WorldMirror._rect_meets_hull(ahead, WorldMirror.shadow_region(cam, sun)) and WorldMirror._rect_meets_hull(Rect2(-16, -16, 32, 32), WorldMirror.shadow_region(cam, sun)),
 		"fitted to the view (one map, %.1f tiles), they don't, and the ground round the focus still does" % sun.directional_shadow_max_distance)
-	# Looking at the horizon: the cap, in cascades.
+	# Looking at the horizon: the quality's horizon cap, in cascades; a Shadow distance chosen in
+	# the settings still reaches as far as chosen.
 	cam.look_at_from_position(Vector3(0.0, 1.6, 0.0), Vector3(30.0, 1.0, 0.0))
 	fitter._fit(false)
-	check(sun.directional_shadow_max_distance == 150.0 and sun.directional_shadow_mode == SunShadows.MODES[int(SunShadows.QUALITY["high"]["horizon_splits"])],
-		"looking at the horizon (first person) the shadows reach the cap in cascades")
+	var horizon_cap := float(SunShadows.QUALITY["high"]["horizon_cap"])
+	check(horizon_cap < float(SunShadows.QUALITY["high"]["cap"]) and sun.directional_shadow_max_distance == horizon_cap
+		and sun.directional_shadow_mode == SunShadows.MODES[int(SunShadows.QUALITY["high"]["horizon_splits"])],
+		"looking at the horizon (first person) the shadows reach the horizon cap (%.0f tiles) in cascades" % sun.directional_shadow_max_distance)
+	fitter.distance_cap = 150.0
+	fitter._fit(false)
+	check(sun.directional_shadow_max_distance == 150.0, "with Shadow distance chosen (150) they reach it at the horizon too")
+	fitter.distance_cap = 0.0
 	cam.look_at_from_position(Vector3(13.6, 23.0, 13.6), Vector3.ZERO)
 	fitter.queue_free()
 	sun.directional_shadow_max_distance = 150.0
@@ -3708,6 +3715,26 @@ func _performance() -> void:
 	check(ModelLods.proxy_for(Visuals.box_mesh()) == null, "a small mesh casts its own shadow")
 	var tree_job = ModelLods._job_for(ModelLibrary.mesh_for("tree-01") as ArrayMesh)
 	check(tree_job != null and not tree_job.view_lods, "a tree keeps its leaf cards whole in view (no LODs), with a shadow stand-in")
+	# Far away a tree draws fewer, larger leaf cards instead (its own levels, TREE_LEVELS): one in two,
+	# then one in four, each card a whole one moved nowhere, the rest of the tree no finer than before.
+	if tree_job != null:
+		check(tree_job.tree and tree_job.leaf.has(true), "a tree with leaf cards gets levels of its own")
+		var tree_levels: Array = ModelLods.ModelLodsMath.tree_levels(tree_job.surfaces, tree_job.leaf, tree_job.textured)
+		var leaf_at: int = tree_job.leaf.find(true)
+		var full_cards: int = (ModelLods.ModelLodsMath._indices_of(tree_job.surfaces[leaf_at]) as PackedInt32Array).size()
+		var tree_ok := tree_levels.size() == ModelLods.TREE_LEVELS.size()
+		var last_pixel := 0.0
+		for k in tree_levels.size():
+			var arrays: Array = tree_levels[k][1]
+			var n := int(ModelLods.TREE_LEVELS[k][0])
+			var cards: int = (arrays[leaf_at][Mesh.ARRAY_INDEX] as PackedInt32Array).size()
+			# Two triangles a card: within a card of 1/n of them.
+			tree_ok = tree_ok and arrays.size() == tree_job.surfaces.size() and absi(cards - full_cards / n) <= 6
+			tree_ok = tree_ok and float(tree_levels[k][2]) > last_pixel
+			last_pixel = float(tree_levels[k][2])
+			for i in arrays.size():
+				tree_ok = tree_ok and (arrays[i][Mesh.ARRAY_INDEX] as PackedInt32Array).size() <= ModelLods.ModelLodsMath._indices_of(tree_job.surfaces[i]).size()
+		check(tree_ok, "tree-01's far levels keep 1/2 and 1/4 of its %d leaf-card indices, switched further off in turn" % full_cards)
 	# Forests: with SSAO on, Godot's depth prepass writes normals and roughness, so a leaf card's
 	# roughness must not come from the weathering noise (each crown is a dozen cut-out layers deep:
 	# a zoomed-out forest's GPU frame 17.5 -> 12.3 ms), and trees keep no per-frame LODs.
