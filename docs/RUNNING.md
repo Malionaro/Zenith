@@ -349,7 +349,9 @@ Then start the client and use Play → Connect to address (`127.0.0.1:34200`), o
 server through `run-server.ps1` (same options), waits for the bridge, starts the client connected
 to it (Godot from `-Godot`, `$env:GODOT` or the PATH) and saves and stops the server when the client
 closes (`-KeepServer` leaves it running). Before the client starts it has Godot import the
-assets that are new or changed (`-NoImport` skips that), so models pulled from git load. `-Mock` uses `tools/mock_server.py` instead of Factorio
+assets that are new or changed (`-NoImport` skips that), so models pulled from git load.
+`-Release` exports a release build of the client (`dist\dev-release\`, needs Godot's export
+templates) and runs that instead of the editor binary's debug build, whose GDScript is slower. `-Mock` uses `tools/mock_server.py` instead of Factorio
 (`-MockArgs` passes its options), `-NoClient` starts only the server, and `-ClientArgs` adds client
 options:
 
