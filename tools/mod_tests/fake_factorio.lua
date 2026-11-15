@@ -1312,6 +1312,18 @@ local function make_transport_line(e, index)
       for _, it in ipairs(items) do
         local fields = { valid_for_read = true, name = it.name, count = it.count or 1, spoil_percent = it.spoil or 0,
           quality = strict("LuaQualityPrototype", { name = it.quality or "normal" }) }
+        -- clear() takes this very item off the line; setting count makes its stack smaller.
+        fields.clear = function()
+          if (items.gen or 0) ~= gen then
+            error("LuaItemStack API call when LuaItemStack was invalid.", 2)
+          end
+          for k2 = #items, 1, -1 do
+            if items[k2] == it then
+              table.remove(items, k2)
+            end
+          end
+          items.gen = (items.gen or 0) + 1
+        end
         local stack = setmetatable({}, {
           __index = function(_, k)
             if (items.gen or 0) ~= gen then
@@ -1321,6 +1333,15 @@ local function make_transport_line(e, index)
               error("LuaItemStack doesn't contain key " .. tostring(k), 2)
             end
             return fields[k]
+          end,
+          __newindex = function(_, k, v)
+            if (items.gen or 0) ~= gen then
+              error("LuaItemStack API call when LuaItemStack was invalid.", 2)
+            end
+            assert(k == "count" and type(v) == "number" and v >= 1, "LuaItemStack: only count can be set here")
+            it.count = v
+            fields.count = v
+            items.gen = (items.gen or 0) + 1
           end,
         })
         out[#out + 1] = strict("DetailedItemOnLine", {
@@ -1355,12 +1376,22 @@ local function make_transport_line(e, index)
     remove_item = function(stack)
       assert(type(stack) == "table" and stack.name, "remove_item(items)")
       items.gen = (items.gen or 0) + 1
+      -- By name only, the back of the line first (the highest position), as the game does: not
+      -- the item a character reached.
       local left = stack.count or 1
-      for k = #items, 1, -1 do
-        if left > 0 and items[k].name == stack.name and (items[k].quality or "normal") == (stack.quality or "normal") then
-          table.remove(items, k)
-          left = left - 1
+      while left > 0 do
+        local back
+        for k = 1, #items do
+          if items[k].name == stack.name and (items[k].quality or "normal") == (stack.quality or "normal")
+              and (not back or items[k].position > items[back].position) then
+            back = k
+          end
         end
+        if not back then
+          break
+        end
+        table.remove(items, back)
+        left = left - 1
       end
       return (stack.count or 1) - left
     end,

@@ -921,6 +921,34 @@ local function tick_mining(c, s)
   end
 end
 
+-- Takes the very item the character reached off its belt line: its stack cleared, or made smaller
+-- when only part of it fitted. LuaTransportLine.remove_item only knows names and took one of that
+-- name from elsewhere on the line (further back), so the item in reach stayed where it was and the
+-- belt looked as if nothing had been picked up. remove_item is only the fallback; if neither
+-- takes anything off, what went into the inventory comes out again. False when nothing came off.
+local function take_off(c, line, st, stack, inserted)
+  local before = line.get_item_count()
+  local ok = pcall(function()
+    if inserted >= stack.count then
+      st.clear()
+    else
+      st.count = stack.count - inserted
+    end
+  end)
+  if ok and line.get_item_count() < before then
+    return true
+  end
+  local exact = { name = stack.name, count = inserted, quality = stack.quality }
+  if line.remove_item(exact) > 0 then
+    return true
+  end
+  local main = c.get_main_inventory()
+  if main then
+    main.remove(exact)
+  end
+  return false
+end
+
 -- Lane keys (unit number * 8 + line) the character took items off: control.lua points this at
 -- belt_items.resend, so a client that simulates belts gets those lanes again at once.
 M.lanes_taken = function(keys) end
@@ -940,34 +968,36 @@ local function pickup_from_belts(c, pos, r, picked)
         return picked, true
       end
       local line = belt.get_transport_line(i)
-      -- Everything about the items in reach is read before any is taken: taking one off the line
-      -- leaves the rest of get_detailed_contents()'s stacks invalid ("LuaItemStack API call when
-      -- LuaItemStack was invalid").
-      local wanted = {}
-      for _, item in pairs(line.get_detailed_contents()) do
-        if #wanted >= PICKUPS_PER_TICK - picked then
+      local took = false
+      while picked < PICKUPS_PER_TICK do
+        -- The first item in reach, read again for each one: taking one off the line leaves the
+        -- stacks get_detailed_contents() gave before invalid ("LuaItemStack API call when
+        -- LuaItemStack was invalid").
+        local item
+        for _, it in pairs(line.get_detailed_contents()) do
+          if distance(pos, line.get_line_item_position(it.position)) <= r then
+            item = it
+            break
+          end
+        end
+        if not item then
           break
         end
-        if distance(pos, line.get_line_item_position(item.position)) <= r then
-          local st = item.stack
-          local stack = { name = st.name, count = st.count, quality = st.quality.name }
-          if st.spoil_percent > 0 then
-            stack.spoil_percent = st.spoil_percent
-          end
-          wanted[#wanted + 1] = stack
+        local st = item.stack
+        local stack = { name = st.name, count = st.count, quality = st.quality.name }
+        if st.spoil_percent > 0 then
+          stack.spoil_percent = st.spoil_percent
         end
-      end
-      local took = false
-      local room = true
-      for _, stack in ipairs(wanted) do
         local inserted = c.insert(stack)
         if inserted <= 0 then
-          room = false
+          if took and belt.unit_number then
+            M.lanes_taken({ belt.unit_number * 8 + i })
+          end
+          return picked, false
+        end
+        if not take_off(c, line, st, stack, inserted) then
           break
         end
-        stack.count = inserted
-        stack.spoil_percent = nil
-        line.remove_item(stack)
         picked = picked + 1
         took = true
       end
@@ -975,9 +1005,6 @@ local function pickup_from_belts(c, pos, r, picked)
       -- check, seconds later: the lane is read and sent again on the next update, as a `bre` asks.
       if took and belt.unit_number then
         M.lanes_taken({ belt.unit_number * 8 + i })
-      end
-      if not room then
-        return picked, false
       end
     end
   end
