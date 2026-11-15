@@ -8,6 +8,10 @@
 #   powershell -ExecutionPolicy Bypass -File server\dev.ps1 -Mock
 #   powershell -ExecutionPolicy Bypass -File server\dev.ps1 -NoClient     # server only, waits for Enter
 #
+# Before the client starts, Godot imports the project's assets (models, textures) that are new or
+# changed since the last import: a model pulled from git but never imported fails to load
+# ("Cannot open file 'res://.godot/imported/....scn'"). -NoImport skips it.
+#
 # Godot is found from -Godot, then $env:GODOT, then godot / godot4 on the PATH. Factorio as in
 # run-server.ps1 (every Steam library, C:\Program Files\Factorio), or -Factorio.
 param(
@@ -25,6 +29,8 @@ param(
   [switch]$NoClient,
   # Leave the server running after the client closes.
   [switch]$KeepServer,
+  # Don't import the client's assets before starting it.
+  [switch]$NoImport,
   # More options for the client, after Godot's `--` (e.g. "--models=C:\my-models").
   [string[]]$ClientArgs = @(),
   [int]$TimeoutSeconds = 180
@@ -68,6 +74,13 @@ function Test-UdpBound([int]$port) {
 # Look the tools up before anything starts, so a missing one stops the script with nothing left running.
 $py = Find-Python
 $godotExe = if ($NoClient) { $null } else { Find-Godot }
+
+if ($godotExe -and -not $NoImport) {
+  Write-Host "Importing the client's new and changed assets (the first time takes a few minutes)"
+  $iargs = @("--headless", "--path", (Join-Path $repo "client"), "--import")
+  $import = Start-Process -FilePath $godotExe -ArgumentList ($iargs | ForEach-Object { '"' + $_ + '"' }) -PassThru -NoNewWindow -Wait
+  if ($import.ExitCode -ne 0) { Write-Host "The import ended with code $($import.ExitCode); starting anyway" }
+}
 
 if (Test-UdpBound $UdpPort) {
   Write-Error "Port $UdpPort is already in use (another server or mock?). Stop it, or pass -UdpPort."

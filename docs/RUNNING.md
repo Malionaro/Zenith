@@ -348,7 +348,8 @@ Then start the client and use Play → Connect to address (`127.0.0.1:34200`), o
 `-- --factorio-port=34200`. On Windows `server\dev.ps1` does all of it in one go: it starts the
 server through `run-server.ps1` (same options), waits for the bridge, starts the client connected
 to it (Godot from `-Godot`, `$env:GODOT` or the PATH) and saves and stops the server when the client
-closes (`-KeepServer` leaves it running). `-Mock` uses `tools/mock_server.py` instead of Factorio
+closes (`-KeepServer` leaves it running). Before the client starts it has Godot import the
+assets that are new or changed (`-NoImport` skips that), so models pulled from git load. `-Mock` uses `tools/mock_server.py` instead of Factorio
 (`-MockArgs` passes its options), `-NoClient` starts only the server, and `-ClientArgs` adds client
 options:
 
