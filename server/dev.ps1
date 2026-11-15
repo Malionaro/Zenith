@@ -12,6 +12,11 @@
 # changed since the last import: a model pulled from git but never imported fails to load
 # ("Cannot open file 'res://.godot/imported/....scn'"). -NoImport skips it.
 #
+# -Release runs a release build of the client instead of the project in Godot's editor binary (its
+# window says "Zenith (DEBUG)"): GDScript without the debug build's checks runs noticeably faster.
+# It is exported first with the "Windows Desktop" preset into dist\dev-release\ (Godot's export
+# templates for this Godot version must be installed: Editor > Manage Export Templates).
+#
 # Godot is found from -Godot, then $env:GODOT, then godot / godot4 on the PATH. Factorio as in
 # run-server.ps1 (every Steam library, C:\Program Files\Factorio), or -Factorio.
 param(
@@ -31,6 +36,8 @@ param(
   [switch]$KeepServer,
   # Don't import the client's assets before starting it.
   [switch]$NoImport,
+  # Run an exported release build of the client (exported now) instead of the debug editor binary.
+  [switch]$Release,
   # More options for the client, after Godot's `--` (e.g. "--models=C:\my-models").
   [string[]]$ClientArgs = @(),
   [int]$TimeoutSeconds = 180
@@ -80,6 +87,20 @@ if ($godotExe -and -not $NoImport) {
   $iargs = @("--headless", "--path", (Join-Path $repo "client"), "--import")
   $import = Start-Process -FilePath $godotExe -ArgumentList ($iargs | ForEach-Object { '"' + $_ + '"' }) -PassThru -NoNewWindow -Wait
   if ($import.ExitCode -ne 0) { Write-Host "The import ended with code $($import.ExitCode); starting anyway" }
+}
+
+# The release build: exported now, from the imported project, so it has what was just pulled.
+$releaseExe = $null
+if ($godotExe -and $Release) {
+  $releaseExe = Join-Path $repo "dist\dev-release\Zenith.exe"
+  New-Item -ItemType Directory -Force -Path (Split-Path $releaseExe -Parent) | Out-Null
+  Write-Host "Exporting a release build of the client to $releaseExe"
+  $eargs = @("--headless", "--path", (Join-Path $repo "client"), "--export-release", "Windows Desktop", $releaseExe)
+  $export = Start-Process -FilePath $godotExe -ArgumentList ($eargs | ForEach-Object { '"' + $_ + '"' }) -PassThru -NoNewWindow -Wait
+  if ($export.ExitCode -ne 0 -or -not (Test-Path $releaseExe)) {
+    Write-Error ("The export failed (exit code $($export.ExitCode)). Godot's export templates for this version may be " +
+      "missing: install them in the editor (Editor > Manage Export Templates), or start without -Release.")
+  }
 }
 
 if (Test-UdpBound $UdpPort) {
@@ -139,9 +160,14 @@ try {
   if ($NoClient) {
     Read-Host "Server running. Press Enter to stop it"
   } else {
+    $exe = $godotExe
     $cargs = @("--path", (Join-Path $repo "client"), "--", "--factorio-port=$UdpPort") + $ClientArgs
-    Write-Host "Starting the client: $godotExe $($cargs -join ' ')"
-    $client = Start-Process -FilePath $godotExe -ArgumentList ($cargs | ForEach-Object { '"' + $_ + '"' }) -PassThru
+    if ($releaseExe) {
+      $exe = $releaseExe
+      $cargs = @("--", "--factorio-port=$UdpPort") + $ClientArgs
+    }
+    Write-Host "Starting the client: $exe $($cargs -join ' ')"
+    $client = Start-Process -FilePath $exe -ArgumentList ($cargs | ForEach-Object { '"' + $_ + '"' }) -PassThru
     $client.WaitForExit()
   }
 } finally {
