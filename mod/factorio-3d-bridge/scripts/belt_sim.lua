@@ -2604,9 +2604,14 @@ local function emit(b, p, period, fr, work, loading)
   spool_step(send_cap())
 end
 
--- Steady units a tick: spread over the update's ticks from what the last one took.
+-- Steady units a tick: spread over the update's ticks from what the last one took, never more than
+-- the bridge's own bound a tick (bound_units, a share of the client's work budget). Without that cap
+-- a big update's share a tick grew with it, and its due tick (DUE_BURST times that) took 14-15 ms on
+-- the owner's 381,000-entity save: with Factorio's own 3.4 ms past the 16.7 ms of a tick at 60 UPS.
+-- What doesn't fit waits for the next update (the watched belts are listed again then, the drift
+-- checks come round again), and an update that keeps not fitting has its square cut (bound).
 local function steady_units(b, period)
-  return math.max(M.units_per_tick, ceil((b.work or 0) * 1.5 / math.max(1, period - 1)))
+  return math.min(math.max(M.units_per_tick, ceil((b.work or 0) * 1.5 / math.max(1, period - 1))), bound_units())
 end
 
 -- The rate.lua job the updates' ticks follow (M.OPTIONS own_rate): their own, `bs`, or the glided
@@ -2685,7 +2690,8 @@ function M.tick()
   local p = payload(b)
   local fast = 0
   local steady = steady_units(b, period)
-  local limit = due and steady * DUE_BURST or steady
+  -- (The due tick does what is left up to DUE_BURST of that, under the same bound a tick.)
+  local limit = due and math.min(steady * DUE_BURST, math.max(steady, bound_units())) or steady
   local spent = 0
   -- The scan (over as many ticks as it takes), then the steady queue.
   if b.scanning then
