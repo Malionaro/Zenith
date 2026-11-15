@@ -6634,6 +6634,15 @@ F.move_on_belt(sb1, 1, 8101, 0.375)
 tick(6)
 flowed = bs_of(take())
 check(u1 * 8 + 1 not in flowed["sl"], f"bs: a watched lane that only flowed on isn't sent: {sorted(flowed['sl'])}")
+# However big an update, its work a tick stays under the bridge's own bound (a share of the client's
+# work budget): the due tick of a big update took 14-15 ms on a 381,000-entity save, past a tick.
+saved_work = g.storage.f3d.bs.work
+g.storage.f3d.bs.work = 10 ** 7
+bs_mod.bound = 2000
+planned = bs_mod.planned_units()
+bs_mod.bound = None
+g.storage.f3d.bs.work = saved_work
+check(planned <= 2000 / 20, f"bs: a huge update's work a tick is capped at the bound: {planned} budget units planned")
 # Drift checks: every unwatched lane's count, front and back about every pc_every updates.
 bs_mod.pc_every = 1
 tick(12)
