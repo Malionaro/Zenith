@@ -11,6 +11,41 @@ const Rockets := preload("res://scripts/world/rockets.gd")
 
 const FOLLOW_RATE := 18.0
 
+## Prediction: while a move key is held, the client's own character moves at once, at its running
+## speed (`me`'s rs), instead of waiting for the positions that come back from the game (command,
+## the game's tick, the message, and the avatar drawn two sends behind: about 100 ms). Each
+## position that comes is compared with where the prediction was when the game made it (a round
+## trip ago, measured from walks starting), and the difference is worked off at CORRECT_RATE: a
+## wall stops the prediction a moment later and pulls it back, and stopping lets the game's last
+## steps catch up. Sideways (an angled walk's zig-zag) only at SIDE_CORRECT_RATE.
+const CORRECT_RATE := 10.0
+const SIDE_CORRECT_RATE := 3.0
+## Further off than this the prediction starts again from the game's position (a teleport).
+const PREDICT_SNAP := 3.0
+## The round trip's bounds, its first guess, and how long the history of predicted positions is.
+const RTT_MIN := 0.02
+const RTT_MAX := 0.6
+const RTT_START := 0.1
+const HISTORY_SECONDS := 1.0
+## The ground direction (x, z) a move key points now, unit length, or zero (player_input.gd sets it).
+var walk_input := Vector2.ZERO
+## Tiles per tick the character runs (`me`'s rs): 0.15 for Factorio's character without bonuses.
+var run_speed := 0.15
+var _predicting := false
+var _pred := Vector3.ZERO
+## [[seconds, Vector3], ...]: where the prediction was, oldest first.
+var _pred_hist: Array = []
+var _correction := Vector3.ZERO
+var _rtt := RTT_START
+var _rtt_measured := false
+## When a walk began from standing (to measure the round trip by its first walking `me`), else -1.
+var _walk_started := -1.0
+var _released_at := -1.0
+var _had_input := false
+var _now := 0.0
+## Not inside a platform's hub or riding a pod, where the character doesn't walk.
+var _can_walk := true
+
 var unit := 0
 var walking := false
 var health := 0
@@ -320,6 +355,7 @@ func _make_gun() -> Node3D:
 func snap_to(pos: Vector2) -> void:
 	_target = Vector3(pos.x, 0, pos.y)
 	position = _target
+	_predicting = false
 	_ticks.clear()
 	_spots.clear()
 	_angles.clear()
@@ -332,6 +368,10 @@ func update_from(msg: Dictionary) -> void:
 	_target = Vector3(int(msg.get("x", 0)) / 256.0, 0.0, int(msg.get("y", 0)) / 256.0)
 	_sample(float(msg.get("k", -1)), _target, float(msg["a"]) / 1000.0 if msg.has("a") else -1.0)
 	walking = int(msg.get("w", 0)) == 1
+	_can_walk = not msg.has("hub") and not msg.has("pod")
+	if msg.has("rs"):
+		run_speed = maxf(0.0, int(msg["rs"]) / 1000.0)
+	_predicted_from(_target)
 	_yaw_goal = _facing_yaw(msg)
 	health = int(msg.get("hp", 0))
 	_has_state = msg.has("hp")
@@ -477,7 +517,97 @@ func _along_line(goal: Vector3, delta: float) -> Vector3:
 	return goal + _offset
 
 
+## A position from the game: measures the round trip once a walk shows, and sets what the
+## prediction is off by.
+func _predicted_from(at: Vector3) -> void:
+	if _walk_started >= 0.0 and walking:
+		var sample := clampf(_now - _walk_started, RTT_MIN, RTT_MAX)
+		_rtt = sample if not _rtt_measured else lerpf(_rtt, sample, 0.3)
+		_rtt_measured = true
+		_walk_started = -1.0
+	if not _predicting:
+		return
+	var then := _history_at(_now - _rtt)
+	var err := Vector3(at.x - then.x, 0.0, at.z - then.z)
+	if err.length() > PREDICT_SNAP:
+		_pred = Vector3(at.x, 0.0, at.z)
+		_pred_hist.clear()
+		_correction = Vector3.ZERO
+		return
+	_correction = err
+
+
+## Where the prediction was `when` (seconds), between the remembered positions.
+func _history_at(when: float) -> Vector3:
+	var n := _pred_hist.size()
+	if n == 0:
+		return _pred
+	if when <= float(_pred_hist[0][0]):
+		return _pred_hist[0][1]
+	for i in range(1, n):
+		var t1: float = _pred_hist[i][0]
+		if when <= t1:
+			var t0: float = _pred_hist[i - 1][0]
+			var f := 0.0 if t1 <= t0 else (when - t0) / (t1 - t0)
+			return (_pred_hist[i - 1][1] as Vector3).lerp(_pred_hist[i][1], f)
+	return _pred_hist[n - 1][1]
+
+
+## Moves the predicted character on this frame; returns false when it isn't predicted (then it is
+## drawn from the game's positions as before).
+func _predict(delta: float) -> bool:
+	var input := walk_input if vehicle == 0 and _can_walk and not (_has_state and health <= 0) else Vector2.ZERO
+	if vehicle != 0 or not _can_walk:
+		_predicting = false
+		return false
+	var starting := not _had_input
+	_had_input = input != Vector2.ZERO
+	if input != Vector2.ZERO:
+		if not _predicting:
+			_predicting = true
+			_pred = Vector3(position.x, 0.0, position.z)
+			_pred_hist.clear()
+			_correction = Vector3.ZERO
+		# A walk from standing: its first walking `me` measures the round trip.
+		if starting and not walking:
+			_walk_started = _now
+		_released_at = -1.0
+	elif _predicting and _released_at < 0.0:
+		_released_at = _now
+	if not _predicting:
+		return false
+	var heading := Vector3(input.x, 0.0, input.y)
+	_pred += heading * run_speed * _clock.rate * delta
+	# The correction: along the walk at CORRECT_RATE, sideways (the zig-zag) slower.
+	var along := heading * _correction.dot(heading) if input != Vector2.ZERO else _correction
+	var side := _correction - along
+	var step := along * (1.0 - exp(-delta * CORRECT_RATE)) + side * (1.0 - exp(-delta * SIDE_CORRECT_RATE))
+	_pred += step
+	_correction -= step
+	for h in _pred_hist:
+		h[1] = (h[1] as Vector3) + step
+	_pred_hist.append([_now, _pred])
+	while _pred_hist.size() > 2 and float(_pred_hist[0][0]) < _now - HISTORY_SECONDS:
+		_pred_hist.pop_front()
+	position = Vector3(_pred.x, position.y, _pred.z)
+	if input != Vector2.ZERO:
+		_yaw_goal = -atan2(input.x, -input.y)
+	# Let go, the game has stopped too and the last steps are caught up: drawn from the game again.
+	var settled := not walking and _correction.length() < 0.02 and _pred.distance_to(Vector3(_target.x, 0.0, _target.z)) < 0.05
+	if _released_at >= 0.0 and ((settled and _now - _released_at > _rtt) or _now - _released_at > 1.5):
+		_predicting = false
+		_smooth_set = false
+	return true
+
+
 func _process(delta: float) -> void:
+	_now += delta
+	if _predict(delta):
+		_drawn_target(delta)  # the clock runs on, for when the game's positions take over again
+		rotation.y = lerp_angle(rotation.y, _body_yaw(), 1.0 - exp(-delta * FOLLOW_RATE))
+		if _rig != null:
+			_animate(delta)
+		return
 	var t := 1.0 - exp(-delta * FOLLOW_RATE)
 	var goal := _along_line(_drawn_target(delta), delta)
 	position = goal if _ticks.size() >= 2 and position.distance_to(goal) < 2.0 else position.lerp(goal, t)
@@ -508,7 +638,7 @@ func _animate(delta: float) -> void:
 		moved = Vector3.ZERO  # a teleport (snap_to, a new surface)
 	var facing := -global_transform.basis.z
 	var distance := moved.dot(facing.normalized())
-	_anim.running = walking
+	_anim.running = walking if not _predicting else (walk_input != Vector2.ZERO or _correction.length() > 0.05)
 	_anim.mining = mining >= 0
 	_anim.firing = firing
 	_anim.aiming = firing and aim_target != null

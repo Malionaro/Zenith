@@ -1179,6 +1179,8 @@ def problems(msg):
             out.append(f"me: sh must be 0 or 1: {msg['sh']!r}")
         if "a" in msg and not (_int(msg["a"]) and 0 <= msg["a"] < 1000):
             out.append(f"me: a must be thousandths of a turn: {msg['a']!r}")
+        if "rs" in msg and not (_int(msg["rs"]) and msg["rs"] >= 0):
+            out.append(f"me: rs must be thousandths of a tile a tick, 0 or more: {msg['rs']!r}")
         if ("sd" in msg) != ("msd" in msg):
             out.append(f"me: sd (shield) and msd (most shield) come together: {msg!r}")
         elif "sd" in msg:

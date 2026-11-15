@@ -636,6 +636,7 @@ func _update_ground() -> void:
 
 func _update_walk(delta: float) -> void:
 	if avatar != null and avatar.vehicle != 0:
+		avatar.walk_input = Vector2.ZERO
 		_update_drive(delta)
 		return
 	_drive_code = 0
@@ -655,6 +656,9 @@ func _update_walk(delta: float) -> void:
 		dir = posmod(int(round(angle / (TAU / 8.0))), 8) * 2
 		# Any angle, in thousandths of a turn; the mod steps between Factorio's 8 ways to follow it.
 		turn = posmod(int(round(angle / TAU * 1000.0)), 1000)
+	# The character moves at once on the screen (avatar.gd's prediction), before the game answers.
+	if avatar != null:
+		avatar.walk_input = Vector2(sin(angle_of(turn)), -cos(angle_of(turn))) if turn >= 0 else Vector2.ZERO
 	_walk_timer -= delta
 	var turned := turn >= 0 and _walk_turn >= 0 and absi(posmod(turn - _walk_turn + 500, 1000) - 500) >= TURN_STEP
 	if dir != _walk_dir or turned or (turn >= 0) != (_walk_turn >= 0) or (dir >= 0 and _walk_timer <= 0.0):
@@ -662,6 +666,11 @@ func _update_walk(delta: float) -> void:
 		_walk_dir = dir
 		_walk_turn = turn
 		_walk_timer = REPEAT
+
+
+## A walk command's angle (thousandths of a turn, clockwise from north) in radians.
+static func angle_of(turn: int) -> float:
+	return turn / 1000.0 * TAU
 
 
 ## A gamepad's left stick, as the move actions' vector (up positive), or zero.

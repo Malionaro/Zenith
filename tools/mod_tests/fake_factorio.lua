@@ -2796,6 +2796,7 @@ local function make_entity(surface, params)
     data.drop_item_distance = 10
     data.resource_reach_distance = 2.7
     data.item_pickup_distance = 1
+    data.character_running_speed = 0.15
     data.character_mining_speed_modifier = 0
     data.crafting_queue_size = 0
     data.is_flying = false

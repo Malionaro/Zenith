@@ -4000,10 +4000,13 @@ class MockGame(mock_info.InfoMixin):
             else:
                 self.message(f"Missing ingredients for {recipe}")
             p["craft"].pop(0)
-        if self.tick % 2 == 0:
+        # Every tick while walking, as the bridge does (the client corrects its prediction by them).
+        if self.tick % 2 == 0 or (p["walk"] and p["vehicle"] is None):
             msg = {"t": "me", "u": p["unit"], "x": fixed(p["x"]), "y": fixed(p["y"]), "d": p["dir"],
                    "w": 1 if p["walk"] else 0, "hp": int(p["hp"]), "mhp": CHARACTER_HEALTH, "q": len(p["craft"]),
                    "sh": 1 if self.tick - p["fired"] <= FIRING_TICKS else 0}
+            if p["vehicle"] is None:
+                msg["rs"] = int(round(WALK_SPEED * 1000))
             if p["walk"] and len(p["walk"]) > 2:
                 msg["a"] = p["walk"][2]
             if FLY and p["vehicle"] is None:

@@ -17,6 +17,9 @@ const FACTORIO_PITCH := 48.0
 const FACTORIO_PX_PER_TILE := 32.0
 ## Orthographic size per unit of distance (see _process).
 const ORTHO_SCALE := 0.65
+## How fast the angled view catches up with the character (per second). The character itself moves
+## at once while walking (avatar.gd's prediction); a slow follow here made walking feel late anyway.
+const FOLLOW_RATE := 14.0
 ## First person: eye height of the 1.7-tile character, field of view, mouse look speed.
 const EYE_HEIGHT := 1.55
 const FIRST_PERSON_FOV := 75.0
@@ -150,7 +153,7 @@ func _process(delta: float) -> void:
 	if target != null:
 		# A ride's camera goes up with the rocket; only the view on foot stays level.
 		var to := target.global_position if in_cinematic() else _follow(target.global_position)
-		global_position = global_position.lerp(to, 1.0 - exp(-delta * 8.0))
+		global_position = global_position.lerp(to, 1.0 - exp(-delta * FOLLOW_RATE))
 	yaw_degrees = lerpf(yaw_degrees, _yaw_goal, 1.0 - exp(-delta * 10.0))
 	# A ride's camera moves slowly, as a film's would.
 	var rate := 1.6 if not _cine_saved.is_empty() else 10.0
