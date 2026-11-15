@@ -292,6 +292,7 @@ Messages marked **R** are reliable.
 | `pw` | | `part`, `parts`, `l`: `[unit, 0, 1 or 2, ...]` flat: electric machines near the focus with no power (0), low power (1) or not connected to any pole (2), once a second; the rest have enough |
 | `ht` | | `part`, `parts`, `l`: `[unit, temperature, ...]` flat: heat pipes, reactors and heat interfaces within `f3d-detail-radius` of the focus, in whole °C, once a second |
 | `sky` | | `d`: daytime in thousandths (0 noon, 500 midnight), `n`: darkness in thousandths (0 in daylight, ~850 at night). Once a second |
+| `bt` | | `l`: `[unique id, ...]`: items the character took off belts (picking up with F, Ctrl+click on a belt), for a client that simulates belts (`bs`): it drops them at once and again once its simulation reaches `k`, since it keeps an item a read of its lane no longer has (taking it for moved on). The lanes are read again in the next `bs` |
 | `msg` | | `text`: something to show the player ("Out of reach"). When research finishes, also `tech` (its name), so the client can say it in the player's language |
 | `hp` | | `part`, `parts`, `l`: `[unit, health in thousandths, ...]` flat: every damaged entity near the focus, every 10 ticks. Entities at full health are left out; an empty update means none |
 | `tf` | | `u` turret unit and `x,y` target position in 1/256 tiles; sent when an ammo, electric or fluid turret actually damages a target (at most every 2, 4 or 6 ticks per turret: bullets, lasers, flames) |

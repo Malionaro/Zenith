@@ -2802,14 +2802,20 @@ function M.resend(cmd)
   end
 end
 
--- Lanes the character took items off (picking up with F, puppet.lua): read and sent again on the
+-- Lanes the character took items off (picking up with F, Ctrl+click: puppet.lua), and the unique ids
+-- of the items that left them (`bt`, below). The lanes are read and sent again on the
 -- next update as a `bre` asks, with every lane of the belts they feed: the client may have carried
 -- a taken item on to the next belt meanwhile, where it would stay drawn until a drift check. The
 -- belts are woken too, so their watched lanes are checked at once. Lanes not loaded are left out.
-function M.taken(keys)
+function M.taken(keys, uids)
   local b = storage.f3d.bs
   if not (b and b.bre and b.wake) then
     return
+  end
+  -- The items themselves, at once: a read of a lane without an item the client still has is taken
+  -- for it having moved on (the client's read_conserve), so a taken one would stay drawn.
+  if uids and #uids > 0 then
+    transport.send_now({ t = "bt", l = uids })
   end
   local list, seen = {}, {}
   local function add(key)

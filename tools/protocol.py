@@ -7,7 +7,7 @@ two can't drift apart. `problems(msg)` returns a list of strings; empty means va
 RELIABLE = {"cmdr", "welcome", "protos", "tprotos", "iprotos", "fprotos", "ready", "chunk", "ents", "add", "upd", "del", "aiu", "tiles", "st", "inv", "recipes",
             "guns", "slots", "qb", "rdet", "craftable", "techs", "clog", "surface", "eprops", "surfs", "planet",
             "bp", "bp_ok", "bpl", "hist", "quals", "iuse", "pidx", "dprotos", "dec", "ccol"}
-IMMEDIATE = {"me", "mv", "bi", "ih", "gi", "sky", "msg", "gui", "hp", "tf", "ts", "afx", "died", "cq", "rs", "fl", "pw", "ht", "chart", "tags", "tr", "ln", "rc", "plat",
+IMMEDIATE = {"me", "mv", "bi", "ih", "gi", "sky", "bt", "msg", "gui", "hp", "tf", "ts", "afx", "died", "cq", "rs", "fl", "pw", "ht", "chart", "tags", "tr", "ln", "rc", "plat",
              "ai", "clip", "chat", "stats", "trl", "seg", "lt", "legs", "cp", "pg", "sp", "fz", "rk", "pst", "bf",
              "eq", "cinfo", "dead", "pl", "ach", "bq", "smap", "al", "pedia", "lnets", "lnet", "bonus", "perms", "spd", "unghost", "hinfo", "terr", "mtr", "mrp", "lpad", "cov", "bfar", "raise", "pj", "gf", "shot", "en", "acol", "wb", "gfx", "mgui", "bs"}
 CHARACTER_ROLES = {"main", "guns", "ammo", "armor", "trash"}
@@ -1619,6 +1619,10 @@ def problems(msg):
         need("l", check=_list)
         if not all(isinstance(v, str) for v in _items(msg.get("l"))):
             out.append("recipes: l must be names")
+    elif t == "bt":
+        rows = msg.get("l")
+        if not (isinstance(rows, list) and rows and all(_int(u) and u > 0 for u in rows)):
+            out.append(f"bt: l must be the unique ids of the items taken off belts, not empty: {rows!r}")
     elif t == "msg":
         need("text", check=lambda v: isinstance(v, str))
         if "tech" in msg and not isinstance(msg["tech"], str):
