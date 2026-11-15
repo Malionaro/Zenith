@@ -2802,6 +2802,43 @@ function M.resend(cmd)
   end
 end
 
+-- Lanes the character took items off (picking up with F, puppet.lua): read and sent again on the
+-- next update as a `bre` asks, with every lane of the belts they feed: the client may have carried
+-- a taken item on to the next belt meanwhile, where it would stay drawn until a drift check. The
+-- belts are woken too, so their watched lanes are checked at once. Lanes not loaded are left out.
+function M.taken(keys)
+  local b = storage.f3d.bs
+  if not (b and b.bre and b.wake) then
+    return
+  end
+  local list, seen = {}, {}
+  local function add(key)
+    if b.lanes[key] and not seen[key] then
+      seen[key] = true
+      list[#list + 1] = key
+    end
+  end
+  for _, key in ipairs(keys) do
+    local unit = floor((key - 1) / LANE_KEYS)
+    add(key)
+    if b.belts[unit] then
+      b.wake[unit] = true
+    end
+    local rec = b.belts[unit]
+    for _, u in ipairs(rec and rec[7] or {}) do
+      for i = 1, LANE_KEYS do
+        add(u * LANE_KEYS + i)
+      end
+      if b.belts[u] then
+        b.wake[u] = true
+      end
+    end
+  end
+  if #list > 0 then
+    M.resend({ l = list })
+  end
+end
+
 -- The square the last update covered {fx, fy, fr} (far lanes aren't read inside it), or nil.
 function M.square()
   local b = storage.f3d.bs

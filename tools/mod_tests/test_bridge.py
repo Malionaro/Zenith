@@ -1459,19 +1459,19 @@ F.put_on_belt(near_belt, 1, "copper-plate", 0.25, 7105)
 F.put_on_belt(near_belt, 2, "iron-gear-wheel", 0.5, 7102)
 F.put_on_belt(far_belt, 1, "copper-plate", 0.5, 7103)
 before = {n: inv.get_item_count(n) for n in ("copper-plate", "iron-gear-wheel")}
-# The lanes a client that simulates belts is sent again (belt_sim.resend, as a `bre` asks).
+# The lanes a client that simulates belts is sent again (belt_sim.taken).
 lua.execute("""
   local bs = package.loaded["scripts.belt_sim"]
-  F_resent, F_resend = {}, F_resend or bs.resend
-  bs.resend = function(cmd)
-    for _, k in ipairs(cmd.l) do F_resent[#F_resent + 1] = k end
-    return F_resend(cmd)
+  F_resent, F_taken = {}, F_taken or bs.taken
+  bs.taken = function(keys)
+    for _, k in ipairs(keys) do F_resent[#F_resent + 1] = k end
+    return F_taken(keys)
   end
 """)
 for _ in range(3):
     send({"t": "pickup"})
     tick(9)
-lua.execute('package.loaded["scripts.belt_sim"].resend = F_resend')
+lua.execute('package.loaded["scripts.belt_sim"].taken = F_taken')
 check(near_belt.get_transport_line(1).get_item_count() == 0 and near_belt.get_transport_line(2).get_item_count() == 0,
       "pickup takes the items off a belt within the character's item_pickup_distance, several on one lane too")
 check(far_belt.get_transport_line(1).get_item_count() == 1, "but not off a belt further away")
@@ -6685,6 +6685,13 @@ F.move_on_belt(sb1, 1, 8101, 0.375)
 tick(6)
 flowed = bs_of(take())
 check(u1 * 8 + 1 not in flowed["sl"], f"bs: a watched lane that only flowed on isn't sent: {sorted(flowed['sl'])}")
+# Lanes the character took items off (belt_sim.taken, issue #18): sent again at once, with every lane
+# of the belt they feed (the client may have carried a taken item on to it), even unwatched ones.
+bs_mod.taken(lua.table_from([u2 * 8 + 1]))
+tick(12)
+taken = bs_of(take())
+check(u2 * 8 + 1 in taken["sl"] and {u3 * 8 + 1, u3 * 8 + 2} <= set(taken["sl"]),
+      f"bs: lanes taken from are sent again with the lanes of the belt they feed: {sorted(taken['sl'])}")
 # Drift checks: every unwatched lane's count, front and back about every pc_every updates.
 bs_mod.pc_every = 1
 tick(12)
