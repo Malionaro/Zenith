@@ -863,6 +863,10 @@ local function tick_mining(c, s)
   end
 end
 
+-- Lane keys (unit number * 8 + line) the character took items off: control.lua points this at
+-- belt_items.resend, so a client that simulates belts gets those lanes again at once.
+M.lanes_taken = function(keys) end
+
 -- Items on belts within reach, like F in Factorio: each one whose spot on its lane is in range goes
 -- into the inventory and comes off its line. A line can only drop items by name (remove_item), so
 -- it takes one of that name and quality off the same line; spoilage comes along with the stack.
@@ -874,10 +878,17 @@ local function pickup_from_belts(c, pos, r, picked)
   })
   for _, belt in pairs(belts) do
     for i = 1, belt.get_max_transport_line_index() do
+      if picked >= PICKUPS_PER_TICK then
+        return picked, true
+      end
       local line = belt.get_transport_line(i)
+      -- Everything about the items in reach is read before any is taken: taking one off the line
+      -- leaves the rest of get_detailed_contents()'s stacks invalid ("LuaItemStack API call when
+      -- LuaItemStack was invalid").
+      local wanted = {}
       for _, item in pairs(line.get_detailed_contents()) do
-        if picked >= PICKUPS_PER_TICK then
-          return picked, true
+        if #wanted >= PICKUPS_PER_TICK - picked then
+          break
         end
         if distance(pos, line.get_line_item_position(item.position)) <= r then
           local st = item.stack
@@ -885,15 +896,30 @@ local function pickup_from_belts(c, pos, r, picked)
           if st.spoil_percent > 0 then
             stack.spoil_percent = st.spoil_percent
           end
-          local inserted = c.insert(stack)
-          if inserted <= 0 then
-            return picked, false
-          end
-          stack.count = inserted
-          stack.spoil_percent = nil
-          line.remove_item(stack)
-          picked = picked + 1
+          wanted[#wanted + 1] = stack
         end
+      end
+      local took = false
+      local room = true
+      for _, stack in ipairs(wanted) do
+        local inserted = c.insert(stack)
+        if inserted <= 0 then
+          room = false
+          break
+        end
+        stack.count = inserted
+        stack.spoil_percent = nil
+        line.remove_item(stack)
+        picked = picked + 1
+        took = true
+      end
+      -- A client that simulates belts (`bs`) would only see the items gone at the lane's next drift
+      -- check, seconds later: the lane is read and sent again on the next update, as a `bre` asks.
+      if took and belt.unit_number then
+        M.lanes_taken({ belt.unit_number * 8 + i })
+      end
+      if not room then
+        return picked, false
       end
     end
   end
