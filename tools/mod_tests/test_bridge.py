@@ -7277,6 +7277,22 @@ check(sorted(got) == sorted({(x, y) for x in (-1, 0, 1) for y in (-1, 0, 1)} - {
       and g.storage.f3d.subs["9,9"] is None,
       f"a square `sub` over the wire adds its new chunks nearest first and drops what it leaves out: {got}")
 
+# Catching up (photo.lua; last, as it moves the phase of the periodic jobs): a whole view waiting
+# (here every generated chunk, 49) is read faster than f3d-chunks-per-tick, until none is left; then
+# the usual limits again.
+# (With the room the client's UPS governor gives a game that keeps up: then f3d-chunks-per-tick, one
+# chunk started a tick, is what holds the reading back, not the work budget.)
+send({"t": "budget", "u": 4000})
+send({"t": "sub", "c": [[cx, cy] for cx in range(-3, 4) for cy in range(-3, 4)]})
+tick(1)
+check(g.storage.f3d.fill is True, "catching up starts when many chunks wait")
+tick(3)
+fast = {(m["cx"], m["cy"]) for m in of_type(take(), "chunk")}
+check(len(fast) > 4, f"while catching up, more than f3d-chunks-per-tick chunks come a tick: {len(fast)} in 4 ticks")
+tick(60)
+take()
+check(g.storage.f3d.fill is None and len(g.storage.f3d.queue) == 0, "and it ends once every chunk is read")
+
 if failures:
     print(f"\n{len(failures)} check(s) failed")
     sys.exit(1)

@@ -22,8 +22,11 @@ const SUBSCRIBE_REFRESH := 5.0  # resend the subscription now and then in case i
 ## at Ultra), which arrived and was built together and stuttered (owner's desktop, 18 fps running).
 ## While the focus moves at most STREAM_MOVING chunks are on their way, standing STREAM_STILL (the
 ## first load), checked every STREAM_STEP seconds, or sooner standing once they are all drawn.
-const STREAM_MOVING := 8
-const STREAM_STILL := 32
+## (Were 8 and 32: so few on their way left the bridge idle between them, waiting for the client, and
+## it never had enough waiting to catch up faster (photo.lua FILL_ON). They are built within the
+## frame budget as they come, so more on their way costs no frames.)
+const STREAM_MOVING := 24
+const STREAM_STILL := 96
 const STREAM_STEP := 0.15
 const STREAM_STEP_QUICK := 0.03  # standing, once every chunk on its way is drawn (_all_came)
 ## While a screenshot loads its view (set_cover) this many: the shot is a loading screen (the picture
@@ -38,6 +41,9 @@ const CACHE_CHUNKS := 1500
 const CACHE_AGE_MSEC := 600000
 const MOVING_FOR := 1.5  # seconds after the focus last changed chunk that it counts as moving
 const JUMP_CHUNKS := 3  # the focus changing chunk by more than this is a jump, not moving
+## Walking, the chunks ahead are asked for first: the wanted list is ordered by the distance from a
+## point this many chunks ahead of the focus, the way it walked (ring_order_ahead).
+const AHEAD_CHUNKS := 2
 const FOCUS_INTERVAL := 0.25
 # Main-thread time a frame may spend rebuilding chunks' entities is their slice in frame_budget.gd
 # (`build`, at least one rebuilt): a busy chunk takes 10-30 ms, and six of them in a frame made
@@ -140,6 +146,9 @@ var _stream_timer := 0.0
 ## walking for the client's first 1.5 s (and the add-on test's held chunk came as 8 chunks, not 9).
 const STOOD := -1000000000000
 var _moved_msec := STOOD
+## The way the focus last walked into a new chunk (each axis -1, 0 or 1), zero after a jump or standing
+## start.
+var _walk_dir := Vector2i.ZERO
 var _focus_timer := 0.0
 var _last_focus_sent := Vector2(INF, INF)
 var _dirty := {}  # Vector2i -> true
@@ -1537,6 +1546,35 @@ static func ring_order(radius: int) -> Array:
 	return order
 
 
+## ring_order, nearest a point AHEAD_CHUNKS ahead the way `dir` points first (dir zero: ring_order),
+## so walking brings in what comes into view first. Every chunk of the square is still in it; the
+## bridge sends what is asked for nearest the middle first, so the bias decides what is asked. Made
+## once per radius and direction (eight), from ring_order's buckets, no comparison sort.
+static var _ahead_orders := {}
+
+
+static func ring_order_ahead(radius: int, dir: Vector2i) -> Array:
+	if dir == Vector2i.ZERO:
+		return ring_order(radius)
+	var key := Vector3i(radius, dir.x, dir.y)
+	var order: Array = _ahead_orders.get(key, [])
+	if not order.is_empty():
+		return order
+	var ahead := dir * AHEAD_CHUNKS
+	var buckets := {}  # squared distance from the point ahead -> offsets, in ring order
+	for offset: Vector2i in ring_order(radius):
+		var d := (offset - ahead).length_squared()
+		if not buckets.has(d):
+			buckets[d] = []
+		(buckets[d] as Array).append(offset)
+	var distances: Array = buckets.keys()
+	distances.sort()
+	for d in distances:
+		order.append_array(buckets[d])
+	_ahead_orders[key] = order
+	return order
+
+
 ## The subscription as `sub` carries it (docs/PROTOCOL.md, world.lua subscribe_square): per row of
 ## the square `radius` round `center` that has any of `list`, the row's chunk y, then runs of [first
 ## chunk x, count]. A list of 10,201 chunks (view distance 50) was about 120 KB, more than a
@@ -1592,6 +1630,7 @@ func _update_subscription(delta: float) -> void:
 		if center != _wanted_center:
 			var walked := not chunks.is_empty() and maxi(absi(center.x - _wanted_center.x), absi(center.y - _wanted_center.y)) <= JUMP_CHUNKS
 			_moved_msec = Time.get_ticks_msec() if walked else STOOD
+			_walk_dir = Vector2i(signi(center.x - _wanted_center.x), signi(center.y - _wanted_center.y)) if walked else Vector2i.ZERO
 			if _wanted_center.x != 0x7fffffff:
 				_recheck_coarse(_wanted_center, center)
 		_wanted_center = center
@@ -1604,7 +1643,7 @@ func _update_subscription(delta: float) -> void:
 		if _cover_seen.is_valid():
 			_build_shot(center, radius, most, square)
 		else:
-			for offset: Vector2i in ring_order(radius):
+			for offset: Vector2i in ring_order_ahead(radius, _walk_dir):
 				if _wanted.size() >= most:
 					break
 				_wanted.append(center + offset)

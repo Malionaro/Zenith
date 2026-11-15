@@ -2392,8 +2392,8 @@ func _stream_spread() -> void:
 	check(order.size() == 29 * 29 and square.size() == order.size() and ordered and order[0] == Vector2i.ZERO,
 		"the subscription's order: every chunk of the square once, nearest first (%d)" % order.size())
 	# Walking: each step asks for what asking from scratch would (still-wanted chunks kept, the
-	# nearest of the rest while fewer than the allowance are on their way), nearest first, and only
-	# chunks asked for are kept.
+	# nearest of the rest to a point ahead the way it walked while fewer than the allowance are on
+	# their way: ring_order_ahead), in that order, and only chunks asked for are kept.
 	var sw := WorldMirror.new()
 	add_child(sw)
 	sw.view_radius = 6
@@ -2413,12 +2413,13 @@ func _stream_spread() -> void:
 		var on_way := 0
 		# Walking a few at a time; the first steps are a standing start (nothing drawn yet).
 		var allowance := WorldMirror.STREAM_MOVING if Time.get_ticks_msec() - sw._moved_msec < WorldMirror.MOVING_FOR * 1000.0 else WorldMirror.STREAM_STILL
-		for off: Vector2i in WorldMirror.ring_order(6):
+		var order6 := WorldMirror.ring_order_ahead(6, sw._walk_dir)
+		for off: Vector2i in order6:
 			if asked_before.has(center + off):
 				expect[center + off] = true
 				if coming_before.has(center + off) and not sw._drawn(center + off):
 					on_way += 1
-		for off: Vector2i in WorldMirror.ring_order(6):
+		for off: Vector2i in order6:
 			if not expect.has(center + off) and on_way < allowance:
 				expect[center + off] = true
 				on_way += 1
@@ -2426,8 +2427,9 @@ func _stream_spread() -> void:
 		for c in sw._subscribed:
 			got[c] = true
 		same = same and got == expect and sw.chunks.size() == got.size()
+		var ahead := center + sw._walk_dir * WorldMirror.AHEAD_CHUNKS
 		for i in range(1, sw._subscribed.size()):
-			if (sw._subscribed[i] - center).length_squared() < (sw._subscribed[i - 1] - center).length_squared():
+			if (sw._subscribed[i] - ahead).length_squared() < (sw._subscribed[i - 1] - ahead).length_squared():
 				nearest_first = false
 		# Half the chunks on their way arrive (no ground, nothing to build).
 		var n := 0
@@ -2438,7 +2440,15 @@ func _stream_spread() -> void:
 				acv.loaded = true
 				acv.tile_ids = PackedInt32Array()
 	check(same and nearest_first,
-		"walking, the subscription asks for what asking from scratch would, nearest first, and keeps only those chunks")
+		"walking, the subscription asks for what asking from scratch would, the chunks ahead first, and keeps only those chunks")
+	# The order ahead: every chunk once, nearest a point AHEAD_CHUNKS east first when walking east.
+	var east := WorldMirror.ring_order_ahead(6, Vector2i(1, 0))
+	var east_set := {}
+	for c: Vector2i in east:
+		east_set[c] = true
+	check(east.size() == 13 * 13 and east_set.size() == east.size() and east[0] == Vector2i(WorldMirror.AHEAD_CHUNKS, 0)
+		and WorldMirror.ring_order_ahead(6, Vector2i.ZERO) == WorldMirror.ring_order(6),
+		"walking, the chunks ahead come first: every chunk of the square once, from %s" % [east[0]])
 	for f in 400:
 		sw._free_unloaded()
 		if sw._unloaded.is_empty():
@@ -3622,7 +3632,10 @@ func _performance() -> void:
 	sw.view_radius = 10
 	sw._update_subscription(0.2)
 	var first: Array = sw._subscribed.duplicate()
-	var nearest := first.all(func(c: Vector2i) -> bool: return c.length_squared() <= 10)  # the 32 nearest
+	var nearest_set := {}
+	for c: Vector2i in WorldMirror.ring_order(10).slice(0, WorldMirror.STREAM_STILL):
+		nearest_set[c] = true
+	var nearest := first.all(func(c: Vector2i) -> bool: return nearest_set.has(c))  # the STREAM_STILL nearest
 	for c in first:
 		var cv: ChunkView = sw.chunks[c]
 		cv.loaded = true
