@@ -19,6 +19,17 @@ M.SHARE = 0.85      -- of the work budget for chunk snapshots (0.7 otherwise): t
 M.BACKLOG = 256     -- messages waiting to be sent before no more chunks are read (64 otherwise)
 M.BYTES = 4         -- times f3d-bytes-per-tick sent a tick: localhost UDP takes it easily
 
+-- Catching up: after a join, a teleport, a surface change or a fast walk the client waits for a
+-- whole view of chunks (441 at view distance 10), read one a tick (f3d-chunks-per-tick) under a
+-- 32 KB a tick outbox: several seconds of a half-empty world. While at least FILL_ON chunks wait
+-- to be read (world.lua's queue), until none is left, they get photo mode's limits: more chunks
+-- started a tick, more of the work budget, a longer outbox and more bytes a tick. The work budget
+-- itself stays the client's UPS governor's, so the game stays near 60 UPS as in photo mode; only
+-- the other jobs (live state near the character) wait a little longer meanwhile.
+-- Deterministic: the flag lives in storage.f3d and follows the queue, which follows the client's
+-- commands and the game's events.
+M.FILL_ON = 16
+
 -- Whether the client in storage.f3d is taking a screenshot now.
 function M.on()
   local s = storage.f3d
@@ -31,6 +42,17 @@ function M.on()
     return false
   end
   return true
+end
+
+-- Whether the client in storage.f3d is catching up on its view (world.lua sets it).
+function M.filling()
+  local s = storage.f3d
+  return s ~= nil and s.fill == true
+end
+
+-- Photo mode's limits apply: a screenshot loading, or catching up.
+function M.boost()
+  return M.on() or M.filling()
 end
 
 -- {on}: 1 a screenshot is loading (again), 0 it is over.
@@ -47,6 +69,7 @@ function M.reset()
   local s = storage.f3d
   if s then
     s.photo_until = nil
+    s.fill = nil
   end
 end
 

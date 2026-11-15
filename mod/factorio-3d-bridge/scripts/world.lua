@@ -1107,10 +1107,17 @@ function M.tick()
   -- that isn't generated (`none`) costs a count of its entities, so a view the client kept comes
   -- back within a few ticks instead of a chunk a tick (a surface change and back, Factorissimo's
   -- buildings: 441 chunks took 7.4 s).
-  -- A screenshot loading (photo.lua) reads more a tick, with more of the budget and a longer outbox.
+  -- A screenshot loading (photo.lua) reads more a tick, with more of the budget and a longer outbox,
+  -- and so does catching up: many chunks waiting (photo.FILL_ON), until none is left.
+  local waiting = #s.queue
+  if waiting >= photo.FILL_ON then
+    s.fill = true
+  elseif waiting == 0 and not s.snap then
+    s.fill = nil
+  end
   local starts = settings.global["f3d-chunks-per-tick"].value
   local share, backlog = WORLD_SHARE, MAX_BACKLOG
-  if photo.on() then
+  if photo.boost() then
     starts, share, backlog = math.max(starts, photo.STARTS), photo.SHARE, photo.BACKLOG
   end
   while transport.backlog() < backlog do

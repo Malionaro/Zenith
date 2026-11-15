@@ -258,8 +258,8 @@ function M.flush()
   local s = storage.f3d
   local client = s.client
   local budget = settings.global["f3d-bytes-per-tick"].value
-  if photo.on() then
-    budget = budget * photo.BYTES -- a screenshot loading its chunks (photo.lua)
+  if photo.boost() then
+    budget = budget * photo.BYTES -- a screenshot loading its chunks, or catching up (photo.lua)
   end
   local sent = 0
   while s.outbox_head <= s.outbox_tail and sent < budget do

@@ -222,7 +222,8 @@ function M.report()
     parts[#parts + 1] = name .. " " .. (ok and tostring(n) or "?")
   end
   return { string.format("[Zenith] work budget %d units a tick; queues: %s%s", b.limit, table.concat(parts, ", "),
-    photo.on() and " (photo mode: a screenshot is loading its chunks)" or "") }
+    photo.on() and " (photo mode: a screenshot is loading its chunks)"
+      or photo.filling() and " (catching up: the chunks in view are read faster)" or "") }
 end
 
 return M

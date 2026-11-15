@@ -118,7 +118,9 @@ sequenceDiagram
 - **The world mirror** (`scripts/world/`): entity records per chunk, drawn as one
   `MultiMeshInstance3D` per mesh per chunk (never a node per belt); movers, belt items, inserter
   arms, ground items, fluids and power, wires, ghosts each have their own layer. Chunks are asked
-  for a few at a time, nearest first, and built within a per-frame allowance.
+  for a few dozen at a time, nearest first (walking, those ahead first), and built within a
+  per-frame allowance. While many wait to be read the bridge catches up faster (photo.lua: photo
+  mode's limits, still under the client's work budget).
 - **Models**: `client/assets/models/<prototype>.glb`, made by the Blender scripts in
   `tools/models/` (or converted from Wube's printable models). Each part carries a colour sampled
   from Factorio's sprite when the model is built (`tools/models/part_colors.py`; only the numbers
