@@ -1489,9 +1489,21 @@ tick(1)
 left_ids = [int(it.unique_id) for it in long_belt.get_transport_line(1).get_detailed_contents().values()]
 check(left_ids == [7201] and inv.get_item_count("iron-ore") == ore_before + 1,
       f"pickup takes the item in reach off the belt, not one of that name further back: {left_ids}")
-tick(59)  # (60 ticks in all: the periodic messages the checks after look at keep their beat)
+# Where a belt item's stack can't be changed, the lane is laid again without it (relay_lane).
+tick(29)
+F.put_on_belt(long_belt, 1, "iron-ore", 0.05, 7203)
+F.put_on_belt(long_belt, 2, "copper-plate", 0.5, 7204)  # the other lane is left alone
+F.belt_stacks_read_only = True
+send({"t": "pickup"})
+tick(1)
+F.belt_stacks_read_only = False
+line1 = long_belt.get_transport_line(1)
+relaid = [(it.stack.name, round(it.position, 3)) for it in line1.get_detailed_contents().values()]
+check(relaid == [("iron-ore", 0.95)] and inv.get_item_count("iron-ore") == ore_before + 2,
+      f"with read-only belt stacks the lane is laid again without the item in reach, the rest where it was: {relaid}")
+tick(29)  # (60 ticks in all: the periodic messages the checks after look at keep their beat)
 long_belt.destroy()
-inv.remove(lua.table_from({"name": "iron-ore", "count": 1}))
+inv.remove(lua.table_from({"name": "iron-ore", "count": 2}))
 resent = sorted(set(lua.eval("F_resent").values()))
 nu = int(near_belt.unit_number)
 check(resent == [nu * 8 + 1, nu * 8 + 2], f"the lanes it took from are sent again to a client that simulates belts: {resent}")

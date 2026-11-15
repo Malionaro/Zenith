@@ -863,14 +863,58 @@ local function tick_mining(c, s)
   end
 end
 
+-- Says in Factorio's log, once a run each, which way a belt pickup had to take an item off: the
+-- items' stacks can't be changed in every Factorio version, and the log shows which one this is.
+local pickup_notes = {}
+local function pickup_note(text)
+  if not pickup_notes[text] then
+    pickup_notes[text] = true
+    log("[factorio-3d-bridge] belt pickup: " .. text)
+  end
+end
+
+-- Lays a belt line again without the item `uid` (or with `keep` of it left, when only part of its
+-- stack was taken): reads every item, clears the line and puts the others back at their positions.
+-- False, with the line untouched, when an item can't be put back as it was.
+local function relay_lane(line, uid, keep)
+  local ok, done = pcall(function()
+    local rest = {}
+    for _, it in pairs(line.get_detailed_contents()) do
+      local st = it.stack
+      local okn, number = pcall(function() return st.item_number end)
+      if okn and number then
+        return false -- an item with data of its own: it couldn't be put back the same
+      end
+      local count = st.count
+      if it.unique_id == uid then
+        count = keep
+      end
+      if count > 0 then
+        local def = { name = st.name, count = count, quality = st.quality.name }
+        if st.spoil_percent > 0 then
+          def.spoil_percent = st.spoil_percent
+        end
+        rest[#rest + 1] = { it.position, def }
+      end
+    end
+    line.clear()
+    for _, r in ipairs(rest) do
+      line.insert_at(r[1], r[2], r[2].count)
+    end
+    return true
+  end)
+  return ok and done
+end
+
 -- Takes the very item the character reached off its belt line: its stack cleared, or made smaller
--- when only part of it fitted. LuaTransportLine.remove_item only knows names and took one of that
--- name from elsewhere on the line (further back), so the item in reach stayed where it was and the
--- belt looked as if nothing had been picked up. remove_item is only the fallback; if neither
--- takes anything off, what went into the inventory comes out again. False when nothing came off.
-local function take_off(c, line, st, stack, inserted)
+-- when only part of it fitted; where the stack can't be changed, the lane laid again without it
+-- (relay_lane). LuaTransportLine.remove_item only knows names and took one of that name from
+-- elsewhere on the line (further back), so the item in reach stayed where it was and the belt
+-- looked as if nothing had been picked up: it is only the last fallback. If nothing takes anything
+-- off, what went into the inventory comes out again. False when nothing came off.
+local function take_off(c, line, item, st, stack, inserted)
   local before = line.get_item_count()
-  local ok = pcall(function()
+  local ok, err = pcall(function()
     if inserted >= stack.count then
       st.clear()
     else
@@ -880,6 +924,13 @@ local function take_off(c, line, st, stack, inserted)
   if ok and line.get_item_count() < before then
     return true
   end
+  pickup_note("its stack couldn't be changed (" .. tostring(err or "nothing came off") .. "), the lane is laid again")
+  -- The lane laid again without it: every other item put back where it was (insert_at), when they
+  -- are all plain items (an item with data of its own, armour with a grid, can't be put back so).
+  if relay_lane(line, item.unique_id, stack.count - inserted) then
+    return true
+  end
+  pickup_note("the lane couldn't be laid again: taken by name (remove_item)")
   local exact = { name = stack.name, count = inserted, quality = stack.quality }
   if line.remove_item(exact) > 0 then
     return true
@@ -937,7 +988,7 @@ local function pickup_from_belts(c, pos, r, picked)
           end
           return picked, false
         end
-        if not take_off(c, line, st, stack, inserted) then
+        if not take_off(c, line, item, st, stack, inserted) then
           break
         end
         picked = picked + 1
