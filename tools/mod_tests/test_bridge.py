@@ -1418,6 +1418,9 @@ for _ in range(3):
 msgs = take()
 check(not plate_e.valid and not gear_e.valid and wood_e.valid,
       "pickup takes the items within the character's item_pickup_distance, not the one further away")
+picked = sorted(r for f in of_type(msgs, "fly") for r in f["l"])
+check([r[:2] for r in picked] == [["iron-gear-wheel", 1], ["iron-plate", 1]],
+      f"issue #19: picking up says what it took in a flying text: {picked}")
 check([inv.get_item_count(n) - before[n] for n in ("iron-plate", "iron-gear-wheel", "wood")] == [1, 1, 0],
       "picked-up items go to the inventory (mine_entity on the item-entity)")
 check(len(of_type(msgs, "gi")) >= 4, f"ground items are sent every detail interval while picking up: {len(of_type(msgs, 'gi'))}")
@@ -1723,6 +1726,9 @@ dels = of_type(msgs, "del")
 check(any(d["p"] == eid["tree-01"] and d["x"] == tree[2] for d in dels), "mined tree is deleted on the client")
 inv = of_type(msgs, "inv")
 check(inv and ["wood", 5] in inv[-1]["l"], "wood lands in the inventory")
+flies = of_type(msgs, "fly")
+check(len(flies) == 1 and flies[0]["l"] == [["wood", 4, 5]] and (flies[0]["x"], flies[0]["y"]) == (tree[2], tree[3]),
+      f"issue #19: mining says what it gave in a flying text at the tree: {flies}")
 
 # --- mining ore down to nothing ----------------------------------------------------------------
 ore = ore[0]
@@ -1735,6 +1741,8 @@ check(of_type(msgs, "upd"), "ore amount update is sent while mining")
 check(any(d["p"] == eid["iron-ore"] for d in of_type(msgs, "del")), "depleted ore is deleted")
 inv = of_type(msgs, "inv")
 check(inv and ["iron-ore", 2] in inv[-1]["l"], "both ore units were mined")
+check([f["l"] for f in of_type(msgs, "fly")] == [[["iron-ore", 1, 1]], [["iron-ore", 1, 2]]],
+      f"a flying text for each unit of ore: {of_type(msgs, 'fly')}")
 
 # --- issue #10: mining a wagon standing on a rail takes the wagon, by its unit number ------------
 rail = spawn("straight-rail", 3.0, 3.0, force="player")
@@ -3854,6 +3862,14 @@ send({"t": "fast", **target_of(box_chest), "half": 0})
 tick(2)
 check(F.inventories[box_chest]["chest"].get_item_count("iron-plate") == 0 and inv.get_item_count("iron-plate") == plates - 1,
       "Ctrl+click with nothing held takes everything out")
+flies = of_type(take(), "fly")
+put = math.ceil(min(have, 100) / 2)
+check([f["l"] for f in flies] == [[["iron-plate", -put, have - put]], [["iron-plate", put + 1, plates - 1]]]
+      and all((f["x"], f["y"]) == (target_of(box_chest)["x"], target_of(box_chest)["y"]) for f in flies),
+      f"issue #19: fast transfer says what went in and came out, at the chest: {flies}")
+send({"t": "fast", **target_of(box_chest), "half": 0})
+tick(2)
+check(not of_type(take(), "fly"), "nothing moved, no flying text")
 
 # Copy and paste settings (Shift+right / left click): an assembler's recipe.
 asm_a = spawn("assembling-machine-1", 6.5, 6.5, force="player")

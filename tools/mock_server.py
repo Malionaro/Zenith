@@ -2370,6 +2370,15 @@ class MockGame(mock_info.InfoMixin):
     def message(self, text):
         self.send_now({"t": "msg", "text": text})
 
+    def fly(self, before, x, y):
+        """`fly`: Factorio's flying text for what came into or left the inventory since `before` (a
+        copy of it), at (x, y) in tiles; nothing when nothing changed."""
+        inv = self.player["inventory"]
+        rows = [[k, inv.get(k, 0) - before.get(k, 0), inv.get(k, 0)] for k in sorted(set(inv) | set(before))
+                if inv.get(k, 0) != before.get(k, 0)]
+        if rows:
+            self.send_now({"t": "fly", "x": fixed(x), "y": fixed(y), "l": rows})
+
     def start_mining(self, msg):
         p = self.player
         target = self.find(msg)
@@ -3340,6 +3349,7 @@ class MockGame(mock_info.InfoMixin):
                 return self.message("Out of reach")
             item = msg.get("item")
             half = msg.get("half") == 1
+            before = dict(inv)
             if item:
                 n = min(inv.get(item, 0), int(msg.get("n", 0)) or stack_size(item))
                 n = math.ceil(n / 2) if half else n
@@ -3356,6 +3366,7 @@ class MockGame(mock_info.InfoMixin):
                         if not m["inv"][role][k]:
                             del m["inv"][role][k]
                         self.give(k, n)
+            self.fly(before, msg.get("x", 0) / 256, msg.get("y", 0) / 256)
             self.send_inventory()
             if self.screen:
                 self.screen["due"] = self.tick
@@ -3978,7 +3989,9 @@ class MockGame(mock_info.InfoMixin):
             else:
                 m["progress"] += 1
                 if m["progress"] >= m["time"]:
+                    before, at = dict(inv), m["entity"]
                     keep = self.finish_mining(m["entity"])
+                    self.fly(before, at.x, at.y)
                     m["progress"] = 0
                     if not keep:
                         p["mining"] = None
@@ -3987,9 +4000,11 @@ class MockGame(mock_info.InfoMixin):
                 p["pickup"] = None
             else:
                 near = [g for g in self.ground if math.hypot(g[1] - p["x"], g[2] - p["y"]) <= PICKUP_DISTANCE]
+                before = dict(inv)
                 for g in near[:PICKUPS_PER_TICK]:
                     self.ground.remove(g)
                     inv[g[0]] = inv.get(g[0], 0) + 1
+                self.fly(before, p["x"], p["y"])
         if p["craft"] and self.tick % 30 == 0:
             recipe = p["craft"][0]
             needs, (product, count) = RECIPES[recipe]

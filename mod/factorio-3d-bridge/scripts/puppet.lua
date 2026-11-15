@@ -686,6 +686,49 @@ function M.contents(inventory)
   return list
 end
 
+-- The main inventory's counts by item name (qualities summed), to compare before and after an
+-- action (M.fly). Nil without a main inventory.
+function M.counts(c)
+  local inventory = c.valid and c.get_main_inventory()
+  if not inventory then
+    return nil
+  end
+  local out = {}
+  for _, item in pairs(inventory.get_contents()) do
+    out[item.name] = (out[item.name] or 0) + item.count
+  end
+  return out
+end
+
+-- Factorio's flying text ("+5 Iron plate (25)", "-5 Coal (20)"): what came into or left the main
+-- inventory since `before` (M.counts), shown at `at` (a map position). Immediate: `fly` with
+-- l = [[item, change, total now], ...], nothing when nothing changed.
+function M.fly(c, before, at)
+  local now = before and M.counts(c)
+  if not now then
+    return
+  end
+  local list = {}
+  for name, n in pairs(now) do
+    if n ~= (before[name] or 0) then
+      list[#list + 1] = { name, n - (before[name] or 0), n }
+    end
+  end
+  for name, n in pairs(before) do
+    if not now[name] then
+      list[#list + 1] = { name, -n, 0 }
+    end
+  end
+  if #list == 0 then
+    return
+  end
+  -- pairs over names has no set order; the same order on every peer isn't needed (only sent), but
+  -- a steady one keeps the lines from swapping places.
+  table.sort(list, function(a, b) return a[1] < b[1] end)
+  at = at or c.position
+  transport.send_now({ t = "fly", x = world.fixed(at.x), y = world.fixed(at.y), l = list })
+end
+
 -- The main inventory's contents. Only sent when it changed.
 local function send_inventory(c, s)
   local inventory = c.get_main_inventory()
@@ -851,7 +894,9 @@ local function tick_mining(c, s)
     * (1 + c.character_mining_speed_modifier + c.force.manual_mining_speed_modifier)
   m.progress = m.progress + speed / 60
   if m.progress >= m.time then
+    local before, at = M.counts(c), m.entity.position
     local done, reason = finish_mining(c, m.entity)
+    M.fly(c, before, at)
     if not done then
       s.mining = nil
       message(reason)
@@ -904,18 +949,7 @@ end
 -- player, so that is how a player-less character picks up. Items on belts are taken off their
 -- lines (pickup_from_belts). Once the inventory is full it stops trying (and says so once) until
 -- the client lets go.
-local function tick_pickup(c, s)
-  local p = s.pickup
-  if not p then
-    return
-  end
-  if game.tick > p.until_tick then
-    s.pickup = nil
-    return
-  end
-  if p.full then
-    return
-  end
+local function pickup_items(c, p)
   local pos = c.position
   local r = c.item_pickup_distance + PICKUP_SLACK
   local found = c.surface.find_entities_filtered({
@@ -942,6 +976,23 @@ local function tick_pickup(c, s)
     p.full = true
     message("Inventory full")
   end
+end
+
+local function tick_pickup(c, s)
+  local p = s.pickup
+  if not p then
+    return
+  end
+  if game.tick > p.until_tick then
+    s.pickup = nil
+    return
+  end
+  if p.full then
+    return
+  end
+  local before = M.counts(c)
+  pickup_items(c, p)
+  M.fly(c, before, c.position)
 end
 
 function M.tick()
