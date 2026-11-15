@@ -74,6 +74,8 @@ const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 const QualityMarks := preload("res://scripts/world/quality_marks.gd")
 const AltArrows := preload("res://scripts/world/alt_arrows.gd")
 const SunShadows := preload("res://scripts/world/sun_shadows.gd")
+const HorizonReach := preload("res://scripts/world/horizon_reach.gd")
+const DebugOverlayCounts := preload("res://scripts/debug/debug_overlay.gd")
 const AddonHost := preload("res://scripts/addons/addon_host.gd")
 const InterfaceState := preload("res://scripts/ui/interface_state.gd")
 const ViewPriority := preload("res://scripts/world/view_priority.gd")
@@ -157,6 +159,8 @@ const SUN_SHADOW_BIAS := 0.05
 const SUN_SHADOW_NORMAL_BIAS := 1.5
 var _sun: DirectionalLight3D
 var sun_shadows: SunShadows
+## How far the angled view draws tilted low towards the horizon (Settings > Graphics > Horizon distance).
+var horizon_reach: HorizonReach
 ## The look in use (Settings > Graphics > Look; add-ons add their own): light, tonemapping, grading.
 var looks: Looks
 ## Time of day as drawn, eased towards the latest "sky" message. Daytime 0 is noon.
@@ -482,6 +486,11 @@ func start_game() -> void:
 	rig.target = avatar
 	decoratives.rig = rig
 	_game.add_child(rig)
+	horizon_reach = HorizonReach.new()
+	horizon_reach.name = "HorizonReach"
+	horizon_reach.rig = rig
+	horizon_reach.env = _env
+	_game.add_child(horizon_reach)
 	if ReviewShots.requested():
 		var shots := ReviewShots.new()
 		shots.rig = rig
@@ -642,6 +651,7 @@ func end_game() -> void:
 	combat = null
 	avatar = null
 	rig = null
+	horizon_reach = null
 	hud = null
 	platform_panel = null
 	player_tags = null
@@ -740,6 +750,9 @@ func _apply_game_settings() -> void:
 	# UPS governor holds it back (ups_governor.gd).
 	var held := ups_governor
 	world.view_radius = clampi(int(held.limit("view", float(Settings.get_value("graphics", "view_radius")))), 1, WorldMirror.MAX_VIEW_RADIUS)
+	if horizon_reach != null:
+		horizon_reach.view_radius = world.view_radius
+		horizon_reach.setting = clampf(float(Settings.get_value("graphics", "horizon_distance")), -1.0, 2000.0)
 	ModelLods.apply_quality(str(Settings.get_value("graphics", "lod_quality")), get_viewport())
 	world.far_chunks.enabled = bool(Settings.get_value("graphics", "merge_far"))
 	var animate_cards := bool(Settings.get_value("graphics", "animate_mod_buildings"))
@@ -1182,6 +1195,51 @@ func _update_status(elapsed: float) -> void:
 			hud.status.text += "\n" + merged
 		if world.held_count() > 0:
 			hud.status.text += "\n%d chunks held past the view (api.world.hold_chunks)" % world.held_count()
+		if hud.ui.debug_overlay:
+			hud.status.text += "\n" + _render_line()
+
+
+## The debug line's (F4) numbers on drawing: what the renderer drew last frame, its CPU and GPU
+## time, the scripts' time, the camera's tilt and zoom, the chunks in the camera's view out to its
+## far plane, and what the horizon reach (horizon_reach.gd) does. The GPU and render CPU times are
+## measured only once the line has shown (Godot's timestamps, a few queries a frame).
+func _render_line() -> String:
+	var vp := get_viewport().get_viewport_rid()
+	if not _measuring_render:
+		RenderingServer.viewport_set_measure_render_time(vp, true)
+		_measuring_render = true
+	var cam := get_viewport().get_camera_3d()
+	var in_view := 0
+	if cam != null:
+		var planes := cam.get_frustum()
+		for c: Vector2i in world.chunks:
+			if _box_in_planes(planes, Vector3(c.x * 32, -2.0, c.y * 32), Vector3(c.x * 32 + 32, 12.0, c.y * 32 + 32)):
+				in_view += 1
+	var text := "draw calls %d · triangles %s · objects %d · GPU %.1f ms · render CPU %.1f ms · scripts %.1f ms" % [
+		int(Performance.get_monitor(Performance.RENDER_TOTAL_DRAW_CALLS_IN_FRAME)),
+		DebugOverlayCounts._big(int(Performance.get_monitor(Performance.RENDER_TOTAL_PRIMITIVES_IN_FRAME))),
+		int(Performance.get_monitor(Performance.RENDER_TOTAL_OBJECTS_IN_FRAME)),
+		RenderingServer.viewport_get_measured_render_time_gpu(vp), RenderingServer.viewport_get_measured_render_time_cpu(vp),
+		Performance.get_monitor(Performance.TIME_PROCESS) * 1000.0]
+	text += "\ncamera tilt %d° · zoom %d · far %d · chunks in view %d of %d" % [roundi(rig.pitch_degrees), roundi(rig.distance),
+		roundi(cam.far) if cam != null else 0, in_view, world.chunks.size()]
+	if horizon_reach != null:
+		text += " · " + horizon_reach.status()
+	return text
+
+
+var _measuring_render := false
+
+
+## Whether a box (lo..hi) is at least partly inside a camera's frustum planes (Camera3D.get_frustum,
+## normals pointing out, the far plane among them).
+static func _box_in_planes(planes: Array[Plane], lo: Vector3, hi: Vector3) -> bool:
+	for plane: Plane in planes:
+		# The box's corner furthest against the plane's outward normal: outside if even that is.
+		var p := Vector3(lo.x if plane.normal.x > 0.0 else hi.x, lo.y if plane.normal.y > 0.0 else hi.y, lo.z if plane.normal.z > 0.0 else hi.z)
+		if plane.distance_to(p) > 0.0:
+			return false
+	return true
 
 
 func _build_environment() -> void:

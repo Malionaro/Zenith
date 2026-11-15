@@ -101,6 +101,7 @@ const ModelLods := preload("res://scripts/world/model_lods.gd")
 const BeltLods := preload("res://scripts/world/belt_lods.gd")
 const ItemCardsScript := preload("res://scripts/world/item_cards.gd")
 const SunShadows := preload("res://scripts/world/sun_shadows.gd")
+const HorizonReach := preload("res://scripts/world/horizon_reach.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
 const CharacterAnimScript := preload("res://scripts/player/character_anim.gd")
 const CharacterPoseScript := preload("res://scripts/player/character_pose.gd")
@@ -3381,7 +3382,20 @@ func _sun_shadows(cam: Camera3D, sun: DirectionalLight3D) -> void:
 	fitter._fit(false)
 	check(sun.directional_shadow_max_distance == 150.0, "with Shadow distance chosen (150) they reach it at the horizon too")
 	fitter.distance_cap = 0.0
+	# The horizon reach (horizon_reach.gd): looking at the horizon the ground in view has no end;
+	# from the default angled view it ends well inside the reach, so nothing is held in there.
+	var horizon_depth := HorizonReach.ground_depth(cam, 0.0)
 	cam.look_at_from_position(Vector3(13.6, 23.0, 13.6), Vector3.ZERO)
+	var steep_depth := HorizonReach.ground_depth(cam, 0.0)
+	var reach_node = HorizonReach.new()
+	var auto_reach: float = reach_node.reach_tiles()
+	reach_node.setting = -1.0
+	var off_reach: float = reach_node.reach_tiles()
+	reach_node.setting = 320.0
+	check(horizon_depth == INF and steep_depth > 10.0 and steep_depth + HorizonReach.TALL_MARGIN < auto_reach and auto_reach == 224.0
+		and off_reach <= 0.0 and reach_node.reach_tiles() == 320.0,
+		"the horizon reach holds a low view in (Automatic %d tiles at view distance 10) and never the default one (ground ends at %.0f)" % [int(auto_reach), steep_depth])
+	reach_node.free()
 	fitter.queue_free()
 	sun.directional_shadow_max_distance = 150.0
 	sun.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS
