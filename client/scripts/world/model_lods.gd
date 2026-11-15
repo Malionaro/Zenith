@@ -67,6 +67,26 @@ const TEXTURED_FLOORS := [0.3, 0.15]
 ## Textured models: each level is drawn only once the model's longest side is at most this many
 ## pixels on screen (counted against Level of detail's pixels of error: lod_threshold 1 is High).
 const TEXTURED_PIXELS := [64.0, 32.0]
+## Trees (a leaf-card crown) get levels of their own, made differently (ModelLodsMath.tree_levels):
+## simplifying merged a crown's cards into other shapes and relit it (flicker), so trees had none and
+## every tree to the edge of the view drew its full 1,500-2,500 triangles. From the angled view
+## tilted low towards the horizon that is the whole forest out to the view distance (ten times the
+## chunks of the default tilt), most of the frame. Far away a crown keeps one card in `n`, each grown
+## about its own middle by n^TREE_CARD_GROWTH (so the crown stays about as full, its cards not moved
+## or turned: no relighting), the trunk simplified by Godot's simplifier within a pixel there. Each
+## level is drawn once the tree is at most `pixels` tall on screen (as TEXTURED_PIXELS, so the same
+## at any Level of detail setting, with HYSTERESIS): for Nauvis' 5-8 tile trees at 1080p and the
+## default field of view one card in two from about 140 tiles from the camera, one in four from about
+## 240 (a third further at 1440p). The default view (about 40 tiles deep) and the trees round the
+## character at the furthest zoom stay whole.
+## [keep one card in n, pixels].
+const TREE_LEVELS := [[2, 96.0], [4, 56.0]]
+## Kept cards grow by n^this along each side: 0.5 would keep the crown's leaf area exactly (and its
+## overdraw); a little less thins the far crowns' overdraw too, where their leaves have turned into
+## solid disks anyway (factorio_material.gdshaderinc leaf_cut).
+const TREE_CARD_GROWTH := 0.4
+## --no-tree-levels: trees drawn whole everywhere, as before (for comparisons).
+static var tree_levels_on := not ("--no-tree-levels" in OS.get_cmdline_user_args())
 ## The custom channel formats in a surface's format, which add_surface_from_arrays needs again.
 const CUSTOM_FORMATS := 0xFFF << Mesh.ARRAY_FORMAT_CUSTOM_BASE
 ## Meta on an ArrayMesh holding its surfaces' arrays on the CPU (model_library.gd keeps them):
@@ -132,6 +152,10 @@ class Job:
 	## LOD step kept only 13-24% of Nauvis trees' crowns (seen from above), so trees a little way
 	## off cast a trunk's shadow and no crown's (owner: "some trees have no shadows").
 	var proxy_lods := true
+	## A tree: its levels are made by thinning its leaf cards (tree_levels) rather than simplifying.
+	## Per source surface whether it is leaf cards.
+	var tree := false
+	var leaf: Array = []
 	var vertices := PackedVector3Array()
 	var normals := PackedVector3Array()
 	var indices := PackedInt32Array()
@@ -161,6 +185,10 @@ class Job:
 		var simplified := ModelLodsMath.simplify(vertices, normals, indices)
 		indices = simplified[0]
 		lods = simplified[1] if proxy_lods else {}
+		if tree:
+			# Shown by poll() as any model's levels (_make_levels); none made leaves the tree whole.
+			levels = ModelLodsMath.tree_levels(surfaces, leaf, textured)
+			levels_done = true
 		if not view_lods:
 			return
 		for s in surfaces:
@@ -588,6 +616,125 @@ class ModelLodsMath:
 		var w := (d00 * v1.dot(v2) - d01 * v0.dot(v2)) / den
 		return u > 0.02 and w > 0.02 and u + w < 0.98
 
+	## A tree's levels (TREE_LEVELS), in levels()' form: [[error, [arrays per surface], tiles a pixel
+	## may be at most], ...], coarser in turn. Leaf-card surfaces (`leaf`) keep one card in n
+	## (thin_cards); the others (bark, the crown's dark inner shell) take their coarsest LOD within a
+	## pixel where the level starts, or stay whole. Empty when no surface is leaf cards.
+	static func tree_levels(surfaces: Array, leaf: Array, textured := false) -> Array:
+		if not leaf.has(true) or leaf.size() != surfaces.size():
+			return []
+		var lo := Vector3(INF, INF, INF)
+		var hi := -lo
+		for s in surfaces:
+			for p: Vector3 in (s[0] as PackedVector3Array):
+				lo = lo.min(p)
+				hi = hi.max(p)
+		if lo.x > hi.x:
+			return []
+		var longest: float = (hi - lo)[(hi - lo).max_axis_index()]
+		# The other surfaces' LODs, worked out once for both levels.
+		var other_lods: Array = []
+		for i in surfaces.size():
+			var s: Array = surfaces[i]
+			if leaf[i]:
+				other_lods.append({})
+				continue
+			var uv: Variant = (s[4] as Array)[Mesh.ARRAY_TEX_UV] if textured else null
+			other_lods.append(surface_lods(s[0], s[1], s[2], s[3], uv))
+		var out: Array = []
+		for spec: Array in TREE_LEVELS:
+			var n := int(spec[0])
+			var pixel := longest / float(spec[1])
+			var arrays: Array = []
+			for i in surfaces.size():
+				var full: Array = surfaces[i][4]
+				if leaf[i]:
+					var thin := thin_cards(full, n)
+					if thin.is_empty():
+						return out  # too few cards to thin: no (further) levels
+					arrays.append(thin)
+					continue
+				var best := -1.0
+				var best_key: Variant = null
+				for size in other_lods[i]:
+					if float(size) <= pixel and float(size) > best:
+						best = float(size)
+						best_key = size
+				arrays.append(compact(full, other_lods[i][best_key]) if best_key != null else full)
+			# error 0: picked only by the tree's size on screen (switch_error).
+			out.append([0.0, arrays, pixel])
+		return out
+
+	## A leaf-card surface's arrays with one card in `n` kept (a card: the triangles joined by shared
+	## vertices), every kept card grown about its own middle by n^TREE_CARD_GROWTH. Cards keep their
+	## place, facing and normals, so the crown is lit as before and only looks a little coarser.
+	## The cards kept are spread through the surface's order (each n-th), which spreads them through
+	## the crown. Empty when there are too few cards to thin.
+	static func thin_cards(arrays: Array, n: int) -> Array:
+		var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+		var idx: PackedInt32Array
+		if arrays[Mesh.ARRAY_INDEX] != null:
+			idx = arrays[Mesh.ARRAY_INDEX]
+		else:
+			idx.resize(verts.size())
+			for k in verts.size():
+				idx[k] = k
+		var up := PackedInt32Array()
+		up.resize(verts.size())
+		for k in verts.size():
+			up[k] = k
+		for t in range(0, idx.size() - 2, 3):
+			for k in 2:
+				var a := Parts._root(up, idx[t + k])
+				var b := Parts._root(up, idx[t + k + 1])
+				if a != b:
+					up[maxi(a, b)] = mini(a, b)
+		# Each card (its root vertex) numbered in the order its first triangle comes.
+		var card_of := {}
+		var root_of := PackedInt32Array()
+		root_of.resize(idx.size() / 3)
+		for t in range(0, idx.size() - 2, 3):
+			var r := Parts._root(up, idx[t])
+			root_of[t / 3] = r
+			if not card_of.has(r):
+				card_of[r] = card_of.size()
+		if card_of.size() < n * 8:
+			return []
+		# Every n-th card from the first: a coarser level's cards (n = 4) are among the finer one's
+		# (n = 2), so switching between them only drops cards, it swaps none.
+		var kept := {}
+		for r: int in card_of:
+			if int(card_of[r]) % n == 0:
+				kept[r] = true
+		# Each kept card's middle (the average of its vertices).
+		var sums := {}
+		var counts := {}
+		var seen := PackedByteArray()
+		seen.resize(verts.size())
+		var out_idx := PackedInt32Array()
+		for t in range(0, idx.size() - 2, 3):
+			var r := root_of[t / 3]
+			if not kept.has(r):
+				continue
+			for k in 3:
+				var v := idx[t + k]
+				out_idx.append(v)
+				if seen[v] == 0:
+					seen[v] = 1
+					sums[r] = (sums.get(r, Vector3.ZERO) as Vector3) + verts[v]
+					counts[r] = int(counts.get(r, 0)) + 1
+		var grow := pow(float(n), TREE_CARD_GROWTH)
+		var grown := verts.duplicate()
+		for v in verts.size():
+			if seen[v] == 0:
+				continue
+			var r := Parts._root(up, v)
+			var middle: Vector3 = (sums[r] as Vector3) / float(counts[r])
+			grown[v] = middle + (verts[v] - middle) * grow
+		var with_grown := arrays.duplicate()
+		with_grown[Mesh.ARRAY_VERTEX] = grown
+		return compact(with_grown, out_idx)
+
 	## A surface's arrays with only the vertices `idx` uses, `idx` renumbered to them: a level's own
 	## small vertex buffer rather than the whole model's again.
 	static func compact(arrays: Array, idx: PackedInt32Array) -> Array:
@@ -896,6 +1043,7 @@ static func _job_for(mesh: ArrayMesh) -> Job:
 	job.view_lods = view_lods
 	job.textured = textured(mesh)
 	var triangles := 0
+	var boned := false
 	for i in mesh.get_surface_count():
 		var sm := mesh.surface_get_material(i) as ShaderMaterial
 		var rig = sm.get_shader_parameter("rig_mode") if sm != null else null
@@ -904,17 +1052,23 @@ static func _job_for(mesh: ArrayMesh) -> Job:
 		# A tree's crown is many separate leaf cards, which simplifying merges into other shapes, so
 		# each LOD switch as the camera moved relit whole crowns (flicker). Trees keep their own
 		# mesh in view; their shadow stand-in still simplifies.
-		if sm != null and sm.resource_name.begins_with("leafcard"):
+		var leaf := sm != null and sm.resource_name.begins_with("leafcard")
+		if leaf:
 			job.view_lods = false
 			job.proxy_lods = false
+			# Its own kind of levels instead (TREE_LEVELS), unless levels are off for comparisons.
+			job.tree = view_lods and tree_levels_on and not _legacy
+		job.leaf.append(leaf)
 		if mesh.surface_get_primitive_type(i) != Mesh.PRIMITIVE_TRIANGLES:
 			return null
 		var arrays := arrays_of(mesh, i)
 		if arrays[Mesh.ARRAY_BONES] != null:
 			job.view_lods = false
+			boned = true
 		var idx = arrays[Mesh.ARRAY_INDEX]
 		job.surfaces.append([arrays[Mesh.ARRAY_VERTEX], arrays[Mesh.ARRAY_NORMAL], idx, arrays[Mesh.ARRAY_CUSTOM2], arrays])
 		triangles += (idx as PackedInt32Array).size() / 3 if idx != null else (arrays[Mesh.ARRAY_VERTEX] as PackedVector3Array).size() / 3
+	job.tree = job.tree and not boned
 	return job if triangles >= MIN_TRIANGLES else null
 
 
