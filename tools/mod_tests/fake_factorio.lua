@@ -1317,6 +1317,9 @@ local function make_transport_line(e, index)
           if (items.gen or 0) ~= gen then
             error("LuaItemStack API call when LuaItemStack was invalid.", 2)
           end
+          if F.belt_stacks_read_only then
+            error("LuaItemStack on a transport line is read only (F.belt_stacks_read_only)", 2)
+          end
           for k2 = #items, 1, -1 do
             if items[k2] == it then
               table.remove(items, k2)
@@ -1337,6 +1340,9 @@ local function make_transport_line(e, index)
           __newindex = function(_, k, v)
             if (items.gen or 0) ~= gen then
               error("LuaItemStack API call when LuaItemStack was invalid.", 2)
+            end
+            if F.belt_stacks_read_only then
+              error("LuaItemStack on a transport line is read only (F.belt_stacks_read_only)", 2)
             end
             assert(k == "count" and type(v) == "number" and v >= 1, "LuaItemStack: only count can be set here")
             it.count = v
@@ -1397,6 +1403,22 @@ local function make_transport_line(e, index)
     end,
     can_insert_at_back = function()
       return #items < 4
+    end,
+    -- Everything off the line.
+    clear = function()
+      for k = #items, 1, -1 do
+        items[k] = nil
+      end
+      items.gen = (items.gen or 0) + 1
+    end,
+    -- An item at a line position (a new unique id, as the game gives).
+    insert_at = function(position, stack, belt_stack_size)
+      assert(type(position) == "number" and type(stack) == "table" and stack.name, "insert_at(position, items, belt_stack_size?)")
+      F.next_item_id = (F.next_item_id or 9000) + 1
+      items[#items + 1] = { name = stack.name, quality = stack.quality ~= "normal" and stack.quality or nil, position = position,
+        unique_id = F.next_item_id, count = stack.count, spoil = stack.spoil_percent }
+      items.gen = (items.gen or 0) + 1
+      return true
     end,
     insert_at_back = function(stack)
       assert(type(stack) == "table" and stack.name and (stack.count or 1) == 1, "insert_at_back(items)")
