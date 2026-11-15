@@ -1158,7 +1158,10 @@ function M.tick()
   if game.tick % STATE_INTERVAL == 0 or (s.walk and is_walking(c)) then
     send_state(c, s)
   end
-  if game.tick % INVENTORY_INTERVAL == 0 then
+  -- While mining or picking up, the inventory changes as the client watches: checked every
+  -- STATE_INTERVAL ticks then (sent only when it changed), not half a second later.
+  local busy = s.mining or s.pickup
+  if game.tick % (busy and STATE_INTERVAL or INVENTORY_INTERVAL) == 0 then
     send_inventory(c, s)
   end
   if game.tick % RECIPES_INTERVAL == 0 then
