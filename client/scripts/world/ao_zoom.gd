@@ -6,24 +6,36 @@ extends Node
 ## it, every frame:
 ##
 ##   - Godot's SSAO (when Settings > Graphics > Ambient occlusion or a look has it on) at full strength
-##     up close, fading out between SSAO_FULL and SSAO_GONE, and switched off altogether past that, so
-##     a zoomed-out view pays nothing for it (the depth pre-pass writing normals was most of its cost),
-##     with a margin each way so it doesn't toggle on the edge. The look's and the setting's own values
-##     stay on the Environment; the faded copy goes to the renderer (RenderingServer.environment_set_ssao).
+##     up close, fading out between SSAO_FULL and SSAO_GONE, and switched off altogether just short of
+##     SSAO_GONE (the depth pre-pass writing normals was most of its cost), with a margin each way so it
+##     doesn't toggle on the edge. Godot's own distance fade (Settings.SSAO_FADE: 60 to 140 tiles from
+##     the camera, per pixel) works on top of this one, and at 1440p and 4K it has hidden SSAO before
+##     this switches it off: a view zoomed out between the two still pays for SSAO nobody sees. The
+##     look's and the setting's own values stay on the Environment; the faded copy goes to the renderer
+##     (RenderingServer.environment_set_ssao).
 ##   - The contact rims under buildings and along belts (contact_shade.gdshader) fade by the same
 ##     measure per pixel, between RIM_FULL and RIM_GONE (ContactShade.material() reads them).
 ##
 ## The baked occlusion of the models (their vertices' COLOR) stays at every zoom: it is smooth, so it
 ## neither shimmers nor costs anything far off. These are the thresholds' one place (docs/USER-GUIDE.md,
 ## Graphics, says what they mean for the player).
+##
+## SSAO's pixels are counted on at most ModelLods.max_lines (1440, or 1080 at Level of detail Low), as
+## the levels of detail are: in real pixels a 4K screen kept it on twice as far out as 1080p, and never
+## off inside the furthest default zoom, so the pre-pass always wrote normals there. The rims stay in
+## real pixels: they cost nothing, and what ends them is shimmering under a real pixel.
+
+const ModelLods := preload("res://scripts/world/model_lods.gd")
 
 ## Tiles per pixel at the view's middle. At 1080p with the angled view's 35 degree field of view a
 ## camera 10 tiles off is about 0.006, the default 30 tiles about 0.018, the furthest zoom (140)
-## 0.08; SSAO is full to about 68 tiles off and gone by 145 (a 1440p screen's pixels are three
-## quarters the size: a third further; 4K twice as far). Owner: AO "has to be clearly visible" at
-## normal play zooms: it was full only to 38 tiles, then 51, and still faded a step or two out from
-## the default zoom at 1080p. These hold it from the closest zoom to past twice the default; only the
-## long zooms lose it (it costs the depth pre-pass's normals; Settings > Graphics > Ambient occlusion).
+## 0.08; SSAO is full to about 68 tiles off, switched off at about 140 and gone by 145 (a 1440p
+## screen's pixels are three quarters the size: a third further; 4K is counted as 1440 lines, the
+## same), though Godot's own fade has taken it by 140 tiles from the camera at any size. Owner: AO
+## "has to be clearly visible" at normal play zooms: it was full only to 38 tiles, then 51, and still
+## faded a step or two out from the default zoom at 1080p. These hold it from the closest zoom to past
+## twice the default; only the long zooms lose it (it costs the depth pre-pass's normals; Settings >
+## Graphics > Ambient occlusion).
 const SSAO_FULL := 0.04
 const SSAO_GONE := 0.085
 ## SSAO goes off below this share of its strength and comes back on above ON_AGAIN.
@@ -60,7 +72,8 @@ func _process(delta: float) -> void:
 	var cam := get_viewport().get_camera_3d()
 	if cam == null:
 		return
-	tiles_per_pixel = view_tiles_per_pixel(cam, get_viewport().get_visible_rect().size)
+	var screen := get_viewport().get_visible_rect().size
+	tiles_per_pixel = view_tiles_per_pixel(cam, Vector2(screen.x, ModelLods.counted_lines(screen.y)))
 	ssao_share = 1.0 - smoothstep(SSAO_FULL, SSAO_GONE, tiles_per_pixel)
 	var wanted := env.ssao_enabled
 	if not wanted:

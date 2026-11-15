@@ -34,6 +34,9 @@ public:
 
 	enum Kind { STRAIGHT = 1, CURVE = 2, UG_VISIBLE = 3, UG_HIDDEN = 4, SPLIT_IN = 5, SPLIT_OUT = 6, LOADER = 7, OTHER = 8 };
 	enum Edge { EDGE_RUN_OFF = 0, EDGE_STOP = 1, EDGE_ORACLE = 2 };
+	// (handoff) belt_sim.gd's HAND_* and TAKE_REACH.
+	enum Hand { HAND_TAKEN = 0, HAND_READ = 1, HAND_NONE = 2, HAND_PUT = 3, HAND_HAD = 4, HAND_NO_LANE = 5 };
+	static constexpr i64 TAKE_REACH = 160;
 
 private:
 	struct Line {
@@ -156,6 +159,9 @@ private:
 	bool head_move = true;
 	i64 tick = -1;
 	i64 n_line_steps = 0;
+	// Counts the relinks that worked links out again (the reline-only ones, switched belts, leave next_of
+	// as it was): the drawing (BeltDrawNative's later queue) tries its held changes again when it moves.
+	i64 links_ver = 0;
 	i64 n_shifted = 0;  // (probes) items moved with a read of a lane beside them
 	// A read never leaves an item past its line's back end (belt_sim.gd's read_bound); n_past_back: those
 	// that went so (probes).
@@ -177,6 +183,45 @@ private:
 	bool shift_keep = true;
 	bool read_skip_same = true;  // belt_sim.gd read_skip_same
 	i64 n_same = 0;
+	// A read first makes the takes queued for its belt up to TAKE_LEAD ticks on, of the items it hasn't on its
+	// lane; a take after a read as of its tick takes the item that read's _rescue moved (belt_sim.gd's
+	// take_first: _takes_first, _take_rescued; K9). _takes: unit -> takes not made yet, by seq; _rescued: lane
+	// index -> what its last read's _rescue moved.
+	bool take_first = true;
+	static constexpr i64 TAKE_LEAD = 3;
+	static constexpr i64 RESCUE_WINDOW = 60;
+	struct PendingTake {
+		i64 seq, at, item, left, hx, hy, ins;
+	};
+	std::unordered_map<i64, std::vector<PendingTake>> _takes;
+	struct Rescued {
+		i64 tick = 0;
+		std::vector<i64> uid, pos;
+		std::vector<int32_t> itm, stk;
+	};
+	std::unordered_map<int, Rescued> _rescued;
+	i64 n_take_read = 0;
+	i64 n_take_rescued = 0;
+	// belt_sim.gd's take_line (K19): what is queued applied by tick, a tick's takes first; a take of the item
+	// its belt's queued read hasn't (_take_known; _qload: lane key -> reads queued, not applied: tick, items).
+	bool take_line = true;
+	static constexpr i64 TAKE_EVIDENCE = 12;
+	// belt_sim.gd's take_edge: a take looks for its item past its belt's front edge too, as far as the lanes
+	// ran since the take's tick (and TAKE_LEAD's slack): a late take at the edge found nothing, the next lane's
+	// read put the item back at its entry (a phantom).
+	bool take_edge = true;
+	// belt_sim.gd's ug_guard: a hidden tunnel lane's geometric next is only an underground's visible half, and it
+	// never side-loads (with the bridge's next 0 it fed a belt beside its exit).
+	bool ug_guard = true;
+	// belt_sim.gd's next_named: the lanes' metas name each tunnel's exit (lm next); false: a recording's, no dead end.
+	bool next_named = true;
+	i64 n_take_known = 0;
+	std::unordered_map<i64, std::vector<std::pair<i64, std::vector<i64>>>> _qload;
+	i64 _take_known(i64 at, i64 unit, i64 item, i64 n, i64 hx, i64 hy, i64 ins);
+	i64 _take_left(i64 unit, i64 seq, i64 n);
+	void _takes_first(int i, const std::vector<i64> &items);
+	void _note_rescued(int i, Line *L, const std::vector<i64> &P, const std::vector<i64> &before, i64 lo);
+	i64 _take_rescued(i64 at, i64 unit, i64 item, i64 n, i64 hx, i64 hy, i64 ins);
 	// Splitter inputs the bridge saw stand as their last read left them (`sh`): lane index -> the tick
 	// from which their items don't cross into the outputs, until the lane's next read (belt_sim.gd's
 	// _in_holds, hold_inputs).
@@ -212,6 +257,8 @@ private:
 	std::unordered_map<i64, int> _key_idx;
 	std::vector<i64> l_key, l_seq, l_xnext;
 	std::vector<int32_t> l_kind, l_len, l_step, l_extra, l_x0, l_y0, l_x1, l_y1;
+	std::vector<int32_t> l_xm, l_ym;  // (handoff) its middle (line position length / 2)
+	std::vector<i64> l_read;  // (handoff) the tick of its newest read applied (-1 none)
 	std::vector<int32_t> l_next, l_side, l_side_at, l_sp0, l_sp1, l_line, l_base, l_run;
 	std::vector<uint8_t> l_off, l_alive;
 	std::vector<std::vector<int>> l_feeders, l_sideins;
@@ -223,10 +270,17 @@ private:
 	// Lanes leading out of what the bridge sends (lm next < 0), and their walls: [tick, front uid (0:
 	// none), position], oldest first (belt_sim.gd's _out_keys, _walls).
 	std::unordered_set<i64> _out_keys;
+	// (dead_walls) A lane leading nowhere here that the bridge didn't say leads out is walled by its
+	// reads too (belt_sim.gd dead_walls, _dead_end, _walled).
+	bool dead_walls = false;
+	static constexpr int DEAD_KEEP = 4;  // (dead_walls) walls a lane not leading out keeps
+	bool _dead_end(i64 key) const;
+	bool _walled(i64 key) const;
 	struct Wall {
 		i64 tick, uid, pos;
 	};
 	std::unordered_map<i64, std::vector<Wall>> _walls;
+	std::unordered_map<i64, Wall> _dead_last;  // (dead_walls) a lane's last read: [tick, front uid, position]
 	const Wall *_wall_at(i64 key, i64 t);
 	bool _wall_settled(i64 key, i64 t) const;
 
@@ -260,9 +314,31 @@ private:
 
 	// Output.
 	std::vector<i64> out_uid, out_key, out_tick, out_gone, out_mismatch;
+	std::vector<int32_t> out_mismatch_n;  // per mismatch: 1 the count differed (or a lane linked up), 0 places or ids only
 	std::vector<i64> out_gone_tick;  // the tick each item went on
 	std::vector<int32_t> out_gone_at;  // the changes before it (in out_uid)
 	std::vector<int32_t> out_item, out_stack, out_pos, out_speed, out_reach, out_run;
+	// (handoff: take_at, put_at) What each inserter's take or put did (belt_sim.gd's out_hand_*).
+	std::vector<i64> out_hand_uid, out_hand_tick, out_hand_ins, out_hand_key;
+	std::vector<int32_t> out_hand_pos, out_hand_why;
+	i64 n_hand[6] = { 0, 0, 0, 0, 0, 0 };
+	double _pj_pos = 0.0;
+	double _pj_d2 = 0.0;
+	void _apply_take(i64 at, i64 unit, i64 item, i64 n, i64 hx, i64 hy, i64 ins);
+	struct TakeCand {
+		double d2;
+		i64 uid;
+		int32_t stk;
+		int lane;
+		i64 pos;
+	};
+	std::vector<TakeCand> _tc;  // belt_sim.gd's _tc_u, _tc_s, _tc_l, _tc_p
+	int _tc_lane = -1;
+	i64 _take_cands(i64 at, i64 unit, i64 item, i64 hx, i64 hy, bool ignore_read = false);
+	void _apply_put(i64 at, i64 key, i64 uid, i64 item, i64 stack, i64 pos, i64 ins);
+	void _project(int i, double hx, double hy);
+	void _take_one(i64 uid, i64 at);
+	void _hand_out(i64 uid, i64 at, i64 ins, i64 key, i64 pos, int why);
 
 	std::vector<int> _seg_i, _seg_v;
 	i64 _ah_new = 0;
@@ -321,6 +397,7 @@ private:
 	void _unlink(int i);
 	static bool _near(i64 ax, i64 ay, i64 bx, i64 by);
 	bool _ug_back_half(int i) const;
+	bool _tunnel_leads_on(int h) const;
 	void _link(int a);
 	static i64 _round_half_even(double x);
 	void _build_splitters();
@@ -419,10 +496,15 @@ public:
 	i64 run_of(i64 key);
 	void put_item(i64 key, i64 uid, i64 item, i64 stack, i64 pos);
 	void take_item(i64 uid, bool gone);
+	void take_at(i64 at_tick, i64 unit, i64 item, i64 n, i64 hx, i64 hy, i64 inserter);
+	void put_at(i64 at_tick, i64 key, i64 uid, i64 item, i64 stack, i64 pos, i64 inserter);
+	PackedInt64Array peek_take(i64 at_tick, i64 unit, i64 item, i64 n, i64 hx, i64 hy);
+	PackedInt64Array get_n_hand() const;
+	void set_n_hand(const PackedInt64Array &a);
 	Dictionary take_changes();
 	i64 next_of(i64 key);
 	Array items_state();
-	PackedInt32Array lane_fronts(const PackedInt64Array &keys);
+	PackedInt32Array lane_fronts(const PackedInt64Array &keys, int speed_of = 0);
 	Dictionary stats();
 	void mark_split_holds();
 	Dictionary debug_links();
@@ -460,12 +542,30 @@ public:
 	bool get_read_skip_same() const { return read_skip_same; }
 	void set_n_same(i64 v) { n_same = v; }
 	i64 get_n_same() const { return n_same; }
+	void set_take_first(bool v) { take_first = v; }
+	bool get_take_first() const { return take_first; }
+	void set_n_take_read(i64 v) { n_take_read = v; }
+	i64 get_n_take_read() const { return n_take_read; }
+	void set_n_take_rescued(i64 v) { n_take_rescued = v; }
+	i64 get_n_take_rescued() const { return n_take_rescued; }
+	void set_take_line(bool v) { take_line = v; }
+	bool get_take_line() const { return take_line; }
+	void set_take_edge(bool v) { take_edge = v; }
+	bool get_take_edge() const { return take_edge; }
+	void set_ug_guard(bool v) { ug_guard = v; }
+	bool get_ug_guard() const { return ug_guard; }
+	void set_next_named(bool v) { next_named = v; }
+	bool get_next_named() const { return next_named; }
+	void set_n_take_known(i64 v) { n_take_known = v; }
+	i64 get_n_take_known() const { return n_take_known; }
 	void set_split_wake(bool v) { split_wake = v; }
 	bool get_split_wake() const { return split_wake; }
 	void set_n_woke(i64 v) { n_woke = v; }
 	i64 get_n_woke() const { return n_woke; }
 	void set_hold_inputs(bool v) { hold_inputs = v; }
 	bool get_hold_inputs() const { return hold_inputs; }
+	void set_dead_walls(bool v) { dead_walls = v; }
+	bool get_dead_walls() const { return dead_walls; }
 	void set_n_held(i64 v) { n_held = v; }
 	i64 get_n_held() const { return n_held; }
 	void set_n_past_back(i64 v) { n_past_back = v; }
@@ -481,6 +581,11 @@ public:
 	PackedInt64Array get_step_us() const;
 	PackedInt64Array get_why_tick() const;
 	void set_why_tick(const PackedInt64Array &a);
+	i64 get_links_ver() const { return links_ver; }
+	void set_links_ver(i64 v) { links_ver = v; }
+	// Whether the next relink will work links out again (lanes changed since): next_of may then answer
+	// otherwise than it did.
+	bool links_pending() const { return _dirty_any && !_dirty_v.empty(); }
 	i64 get_us_relink() const { return us_relink; }
 	void set_us_relink(i64 v) { us_relink = v; }
 	i64 get_us_queue() const { return us_queue; }

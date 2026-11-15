@@ -1630,10 +1630,10 @@ def big_wriggler():
 # first is used), so they are measured as heaps (creature_hull.py `relief`, RELIEFS): every
 # east-west column is a half-ellipse across a round footprint whose top shows where the picture's
 # outline is, and the sacs are set into it where the picture's green bulges are. The sacs swell and settle
-# on Factorio's idle loop (16 frames forward then back at 0.1 a tick: 5.3 s), in the vertex
+# on Factorio's idle loop (16 frames forward then back, 30 steps, at 0.1 a tick: 5 s), in the vertex
 # shader: each is a `sac_*` limb of an idle rig (wube_rig.py's table, creature_models.gd).
 
-SPAWNER_RATE = 0.1 * 60 / 32  # loops a second
+SPAWNER_RATE = 0.1 * 60 / 30  # loops a second (the biter spawner's 0.9 counts its loop the same way)
 SPAWNER_PULSE = 0.09  # how much a sac swells
 
 

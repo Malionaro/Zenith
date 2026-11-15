@@ -22,10 +22,10 @@ typedef int64_t i64;
 // belt_records.gd
 static constexpr int TEXELS = 4;
 static constexpr int ROW = 1024;
-static constexpr int PAGE_ROWS = 16;
+static constexpr int PAGE_ROWS = 16;  // (--belt-draw-small-pages=off)
+static constexpr int SMALL_ROWS = 4;
+static constexpr int START_PAGES = 8;  // (small) the pages the array starts with
 static constexpr int FLOATS = TEXELS * 4;
-static constexpr int PER_PAGE = ROW * PAGE_ROWS / TEXELS;
-static constexpr int PAGE_FLOATS = PER_PAGE * FLOATS;
 static constexpr int MIN_RUN = 64;
 static constexpr float HIDDEN = -1.0f;
 static constexpr double MAX_YAW = 0.35;  // item_cards.gd
@@ -48,16 +48,18 @@ inline double wrapd(double value, double min, double max) {
 	return std::fabs(range) < 1e-15 ? min : value - (range * std::floor((value - min) / range));
 }
 
-// GDScript's hash(int): Variant::hash() -> hash_one_uint64, a uint32.
+// GDScript's hash(int): Variant::hash() -> hash_one_uint64, a uint32. Godot 4.7's hashfuncs.h (the
+// shifts and multiplier changed from 4.5's 21/24/3,8/14/2,4/28/31: on 4.7.2 every item's turn drawn by
+// the C++ paths differed from the GDScript paths' until this followed; checked against hash() of
+// 0, -1, 12345, 257790904, -93708885 and -190439571 on 4.7.2).
 inline uint32_t hash_int(i64 x) {
 	uint64_t v = (uint64_t)x;
-	v = (~v) + (v << 21);
-	v = v ^ (v >> 24);
-	v = (v + (v << 3)) + (v << 8);
-	v = v ^ (v >> 14);
-	v = (v + (v << 2)) + (v << 4);
-	v = v ^ (v >> 28);
-	v = v + (v << 31);
+	v = (~v) + (v << 18);
+	v = v ^ (v >> 31);
+	v = v * 21;
+	v = v ^ (v >> 11);
+	v = v + (v << 6);
+	v = v ^ (v >> 22);
 	return (uint32_t)v;
 }
 
@@ -77,6 +79,18 @@ inline i64 roundi(double x) {
 // item_cards.gd yaw_for
 inline double yaw_for(i64 seed) {
 	return ((double)posmod((i64)hash_int(seed), 2001) / 1000.0 - 1.0) * MAX_YAW;
+}
+
+// item_cards.gd lattice_turn (belt_path.gdshaderinc belt_lattice_turn): a packed lane's item's turn from who
+// it is along its run (its low 20 bits) and the run's seed, without a pile's copies.
+inline double lattice_turn(i64 who, i64 run) {
+	uint32_t x = (uint32_t)(who & 0xFFFFF) + (uint32_t)run * 2654435769u;
+	x = x ^ (x >> 16);
+	x = x * 2146121005u;
+	x = x ^ (x >> 15);
+	x = x * 2221713035u;
+	x = x ^ (x >> 16);
+	return ((double)(x % 2001u) / 1000.0 - 1.0) * MAX_YAW;
 }
 
 template <class P, class T>
@@ -180,6 +194,11 @@ struct Ordered {
 
 // belt_records.gd: the records' pages, the ones written since take_pages() handed to the main thread.
 struct Records {
+	// A page's rows, records and floats, and the pages the array starts with (set_small, before any alloc).
+	int rows = PAGE_ROWS;
+	int per_page = ROW * PAGE_ROWS / TEXELS;
+	int page_floats = ROW * PAGE_ROWS / TEXELS * FLOATS;
+	int start_pages = 1;
 	std::vector<float> data;
 	int pages = 0;
 	std::vector<int> dirty;  // pages written since take_pages, in order
@@ -188,6 +207,7 @@ struct Records {
 	int top = 0;
 	std::unordered_map<int, std::vector<int>> free;
 
+	void set_small(bool small);
 	int alloc(int n);
 	void release(int start, int size);
 	void copy(int from, int to, int n);

@@ -13,6 +13,7 @@ local building = require("scripts.building")
 local planners = require("scripts.planners")
 local history = require("scripts.history")
 local combat = require("scripts.combat")
+local repair = require("scripts.repair")
 local turrets = require("scripts.turrets")
 local collectors = require("scripts.collectors")
 local shots = require("scripts.shots")
@@ -40,6 +41,7 @@ local force_info = require("scripts.force_info")
 local spiders = require("scripts.spiders")
 local belt_items = require("scripts.belt_items")
 local movers = require("scripts.movers")
+local inserters = require("scripts.inserters")
 local console = require("scripts.console")
 local modules = require("scripts.modules")
 local rate = require("scripts.rate")
@@ -49,7 +51,9 @@ local requests = require("scripts.requests")
 local gfx = require("scripts.gfx")
 local mod_gui = require("scripts.mod_gui")
 local belt_sim = require("scripts.belt_sim")
+local perf = require("scripts.perf")
 local barrier = require("scripts.barrier")
+local alt_mode = require("scripts.alt_mode")
 
 local M = {}
 
@@ -111,6 +115,7 @@ function M.handshake(keep_view)
   puppet.reset()
   screens.reset()
   combat.reset()
+  repair.reset()
   turrets.reset()
   collectors.reset()
   shots.reset()
@@ -119,10 +124,11 @@ function M.handshake(keep_view)
   ui_actions.reset()
   alerts.reset()
   requests.reset()
-  s.working = {}
+  alt_mode.contents_cmd({ on = 0 }) -- a client in Alt-mode says so again after the welcome
+  s.working, s.st_at, s.st_in, s.split_sig, s.lamp_col, s.lamp_ao = {}, nil, nil, nil, nil, nil
   s.belt_refresh = {}
   s.pipe_refresh = {}
-  s.wire_sigs = {}
+  s.wire_sigs, s.wire_at, s.wire_in = {}, nil, nil
   s.handshake_tick = game.tick
   local c = puppet.get()
   local surface = world.surface()
@@ -130,6 +136,12 @@ function M.handshake(keep_view)
   local p = c and c.position or { x = 0, y = 0 }
   s.focus = { x = p.x, y = p.y, r = 32 }
   s.puppet_unit = c and c.unit_number or 0
+  -- A name for this save that stays with it (its map seed and the tick the bridge first met a
+  -- client): the client keeps its look-only turns of buildings per save (I9).
+  if not s.save_id then
+    local ok, seed = pcall(function() return game.surfaces[1].map_gen_settings.seed end)
+    s.save_id = string.format("%s-%d", ok and tostring(seed) or "0", game.tick)
+  end
   gfx.reset()
   transport.send_reliable(gfx.welcome_fields(M.surface_fields(surface, {
     t = "welcome",
@@ -141,6 +153,7 @@ function M.handshake(keep_view)
     mp = game.is_multiplayer(),
     -- Square subscriptions (`sub` o, r, w) out to world.MAX_RADIUS: a client asks older bridges for a list.
     sq = world.MAX_RADIUS,
+    sid = s.save_id,
   })))
   -- The rest a stage a tick (handshake_tick): together they took 35 ms in one tick on the owner's
   -- save. Meanwhile only the transport and the stages run (control.lua), as before for one tick.
@@ -237,16 +250,17 @@ function M.change_surface(c)
   world.clear()
   screens.reset()
   combat.reset()
+  repair.reset()
   turrets.reset()
   collectors.reset()
   shots.reset()
   driving.reset()
   map.reset()
   puppet.reset()
-  s.working = {}
+  s.working, s.st_at, s.st_in, s.split_sig, s.lamp_col, s.lamp_ao = {}, nil, nil, nil, nil, nil
   s.belt_refresh = {}
   s.pipe_refresh = {}
-  s.wire_sigs = {}
+  s.wire_sigs, s.wire_at, s.wire_in = {}, nil, nil
   s.surface_index = surface.index
   s.focus = { x = p.x, y = p.y, r = 32 }
   local msg = M.surface_fields(surface, { t = "surface", x = world.fixed(p.x), y = world.fixed(p.y) })
@@ -479,11 +493,14 @@ local function drop_client()
     end
     extras()[port] = nil
   end
-  s.rate = nil
+  if not rate.held() then
+    s.rate = nil
+  end
   s.photo_until = nil
   puppet.reset()
   screens.reset()
   combat.reset()
+  repair.reset()
   turrets.reset()
   collectors.reset()
   shots.reset()
@@ -543,6 +560,15 @@ end
 
 local handlers = {}
 
+-- A hello's `dd` (tiles out to which the client draws decoratives), or nil: a whole number 0-4096.
+local function decorative_distance(v)
+  v = tonumber(v)
+  if v and v == v and v >= 0 then
+    return math.min(4096, math.floor(v))
+  end
+  return nil
+end
+
 function handlers.hello(msg, port)
   local s = storage.f3d
   local sid = tostring(msg.sid or "")
@@ -550,8 +576,11 @@ function handlers.hello(msg, port)
     heard_since_load = true
     s.client = { sid = sid, port = port, last_seen = game.tick, z = msg.z == 1, dc = msg.dc == 1, b = msg.b == 1,
       bl = msg.bl == 1, bs = msg.bs == 1, bg = msg.bl == 1 and msg.bg == 1, br = msg.bl == 1 and msg.br == 1,
-      v = tonumber(msg.v) or 0, mg = msg.mg ~= 0 }
-    s.rate = nil -- a new client starts at full rate; it sends `rate` if it wants another
+      ie = msg.ie == 1 or msg.ie == 2, ih_too = msg.ie == 2, ho = msg.ho == 1, v = tonumber(msg.v) or 0, mg = msg.mg ~= 0,
+      dq = msg.dq == 1, lv = msg.lv == 1, dd = decorative_distance(msg.dd) }
+    if not rate.held() then
+      s.rate = nil -- a new client starts at full rate; it sends `rate` if it wants another
+    end
     s.bud = nil -- and with the default work budget, not one the last client set
     M.handshake()
     return
@@ -564,12 +593,30 @@ function handlers.hello(msg, port)
   s.client.bl = msg.bl == 1
   -- A client that simulates belts itself (belt_sim.lua) gets `bs` instead of `bi`.
   s.client.bs = msg.bs == 1
+  -- A client that plays the inserters' swings from events (inserters.lua) gets `ie` instead of `ih`
+  -- (`ie` 1), or as well as `ih` (2: the item from the events, the pose from the samples).
+  s.client.ie = msg.ie == 1 or msg.ie == 2
+  s.client.ih_too = msg.ie == 2
+  -- And with `ho` 1 (inserters.lua placed records) the items a hand put on a belt, by id, for the
+  -- client's belt simulation to put on as the hand lets go.
+  s.client.ho = msg.ho == 1
   -- Belt groups (belt_items.lua) build on kept lanes: a client says both.
   s.client.bg = msg.bl == 1 and msg.bg == 1
   -- Straight runs (belt_items.lua): plain lanes moved by the client, also on kept lanes.
   s.client.br = msg.bl == 1 and msg.br == 1
   -- Mods' windows (mod_gui.lua): off only for a client that says so; one that doesn't say gets them.
   s.client.mg = msg.mg ~= 0
+  -- Datagram numbering (transport.lua `dg`): a client that says so counts the datagrams it loses.
+  s.client.dq = msg.dq == 1
+  -- Chunks it keeps after they leave its square (world.lua `kept`): told the counts its copy matches.
+  s.client.lv = msg.lv == 1
+  -- How far it draws decoratives (world.lua dec_distance): further now, the chunks held come.
+  local dd = decorative_distance(msg.dd)
+  local grew = dd ~= s.client.dd and (dd == nil or (s.client.dd ~= nil and dd > s.client.dd))
+  s.client.dd = dd
+  if grew then
+    world.dec_in_range()
+  end
   -- Decoratives turned on in the client's settings: send the dictionary and resend the chunks.
   if msg.dc == 1 and not s.client.dc then
     s.client.dc = true
@@ -591,7 +638,7 @@ end
 -- A square (`o`, `r`, `w`, what the client sends) or a list (`c`, small ones: tests, older clients).
 function handlers.sub(msg)
   if msg.w ~= nil then
-    world.subscribe_square(msg.o, msg.r, msg.w, msg.h)
+    world.subscribe_square(msg.o, msg.r, msg.w, msg.h, msg.f)
   elseif type(msg.c) == "table" then
     world.subscribe(msg.c, msg.h)
   end
@@ -636,6 +683,7 @@ handlers.walk = puppet.walk
 handlers.mine = puppet.mine
 handlers.mine_stop = puppet.mine_stop
 handlers.pickup = puppet.pickup
+handlers.repair = repair.cmd
 handlers.build = function(cmd)
   if cmd.sf == 1 then
     return planners.superforced(cmd)
@@ -774,6 +822,7 @@ handlers.flip = ui_actions.flip
 handlers.copy = ui_actions.copy
 handlers.paste = ui_actions.paste
 handlers.alt = ui_actions.alt
+handlers.altc = alt_mode.contents_cmd
 handlers.chat = ui_actions.chat
 requests.add("stats", ui_actions.stats, 300)
 handlers.stats = requests.handler("stats")
@@ -814,6 +863,17 @@ handlers.mpress = mod_gui.press
 handlers.modreq = modules.request
 requests.add("hinfo", modules.hover, 50)
 handlers.hinfo = requests.handler("hinfo")
+
+-- J22, J28: items the character put into or took out of a building (a screen's slots, Ctrl+click, Z): the
+-- turrets' ammo and burners' fuel in its reach are looked at again in a tick or two (alerts.lua), so their
+-- warnings come and go then, not at the next read.
+for _, t in ipairs({ "take", "put", "move", "xfer", "fast", "drop" }) do
+  local handle = handlers[t]
+  handlers[t] = function(cmd, port)
+    handle(cmd, port)
+    alerts.items_moved()
+  end
+end
 
 local function dispatch(handler, msg, port)
   local s = storage.f3d
@@ -870,6 +930,52 @@ local function oldest_parked(parked, at)
   return best
 end
 
+-- A Zenith that quits without a goodbye (a crash, killed) and starts again comes back with a new
+-- session id, often from another port (the old one not yet free, or another client on it), while
+-- the bridge still holds the old one for its timeout: as a second client it got a new character
+-- at the spawn instead of its own. A live Zenith says hello every second (from its main thread),
+-- so a hello from a new port is taken as the restart of a client silent STALE ticks or more, which
+-- it replaces, character and all. One heard within LIVE ticks is alive: the new port is another
+-- Zenith beside it. Between the two the new hello waits (it comes again in a second) rather than
+-- guess. Ticks at normal speed: hellos are a real second apart, so more ticks when the game runs
+-- faster (the debug menu's speed, up to 16x). A live Zenith frozen past STALE while another joins
+-- loses its place to it, and gets a character of its own when it answers again.
+local LIVE = 90
+local STALE = 240
+
+-- The client a hello from a new port takes the place of: the first client's state (`s`) if it is
+-- gone, else the other client silent longest (lowest port first on a tie), nil if none. Second,
+-- true when one is neither heard lately nor gone yet.
+local function gone_client(s)
+  local per = math.max(1, game.speed)
+  local live, stale = LIVE * per, STALE * per
+  local function silent(state)
+    return game.tick - (state.client.last_seen or 0)
+  end
+  local quiet = silent(s)
+  if quiet >= stale then
+    return s, false
+  end
+  local unsure = quiet > live
+  local best, best_quiet, best_port
+  for port, state in pairs(extras()) do
+    if state.client then
+      local q = silent(state)
+      if q >= stale then
+        if not best or q > best_quiet or (q == best_quiet and port < best_port) then
+          best, best_quiet, best_port = state, q, port
+        end
+      elseif q > live then
+        unsure = true
+      end
+    end
+  end
+  if best then
+    return best, false
+  end
+  return nil, unsure
+end
+
 -- A new client next to the first: a fresh state, with its old character if it was here before.
 local function add_client(msg, port)
   local state = { extra = true }
@@ -921,10 +1027,22 @@ function M.on_packet(event)
   local s = storage.f3d
   -- In single-player the game plays one character, so a new port takes over, as before.
   if msg.t == "hello" and s.client and s.client.port ~= port and game.is_multiplayer() then
-    if table_size(extras()) < MAX_EXTRA then
-      add_client(msg, port)
+    local gone, unsure = gone_client(s)
+    if unsure then
+      return  -- it says hello again in a second, by when the silent one has answered or is gone
+    elseif gone == s then
+      -- The first client's Zenith started again: falls through to take its place and character.
+    elseif gone then
+      local extra_list = extras()
+      extra_list[gone.client.port] = nil
+      extra_list[port] = gone
+      return M.serve(gone, dispatch, handler, msg, port)
+    else
+      if table_size(extras()) < MAX_EXTRA then
+        add_client(msg, port)
+      end
+      return
     end
-    return
   end
   profile.run("pkt:" .. msg.t, dispatch, handler, msg, port)
 end
@@ -980,9 +1098,10 @@ function M.status_command(cmd)
     end
     lines[#lines + 1] = string.format(
       "[Zenith] client on port %d, last seen %d ticks ago; %d chunks subscribed, %d queued, %d messages waiting",
-      s.client.port, game.tick - s.client.last_seen, subs, #s.queue, transport.backlog())
-    if rate.level() > 0 then
-      lines[#lines + 1] = "[Zenith] slowed down to rate level " .. rate.level() .. " (the client's `rate`)"
+      s.client.port, game.tick - s.client.last_seen, subs, world.queued_count(), transport.backlog())
+    if rate.level() > 0 or rate.held() then
+      lines[#lines + 1] = "[Zenith] slowed down to rate level " .. rate.level()
+        .. (rate.held() and " (held by /f3d-rate)" or " (the client's `rate`)")
     end
     -- The client's protocol (its hello's `v`): one of an incompatible release reads messages wrong.
     if s.client.v and s.client.v ~= M.PROTOCOL then
@@ -1063,10 +1182,22 @@ function M.player_command(cmd)
   M.reply(cmd, puppet.player_command(cmd))
 end
 
--- /f3d-rate <0-3>: every client's slow-down level, as its `rate` command would set it (for
--- measuring; the client sets its own).
+-- /f3d-rate <0-3> [hold] | free: every client's slow-down level, as its `rate` command would set it
+-- (for measuring; the client sets its own). With `hold` the level stays against the clients' `rate`
+-- commands until `/f3d-rate free`.
 function M.rate_command(cmd)
-  local l = tonumber(cmd.parameter) or 0
+  local param = tostring(cmd.parameter or "")
+  if param:match("^%s*free%s*$") then
+    M.each_client(rate.free)
+    M.reply(cmd, { "[Zenith] rate level " .. rate.level() .. " (the client's again)" })
+    return
+  end
+  local l = tonumber(param:match("^%s*(%-?%d+)")) or 0
+  if param:match("hold") then
+    M.each_client(rate.hold, l)
+    M.reply(cmd, { "[Zenith] rate level " .. rate.level() .. " held (/f3d-rate free gives it back)" })
+    return
+  end
   M.each_client(rate.set, { l = l })
   M.reply(cmd, { "[Zenith] rate level " .. rate.level() })
 end
@@ -1075,6 +1206,16 @@ end
 -- fixes one by one; with no arguments it says them.
 function M.bs_command(cmd)
   M.reply(cmd, belt_sim.option_command(cmd.parameter))
+end
+
+-- /f3d-perf [name on|off|default]: the performance switches (perf.lua); with no arguments it says them.
+function M.perf_command(cmd)
+  M.reply(cmd, perf.command(cmd.parameter))
+end
+
+-- /f3d-ih trace [ticks] [radius] | off: the inserter hands' debug trace (inserters.lua).
+function M.ih_command(cmd)
+  M.reply(cmd, inserters.command(cmd.parameter))
 end
 
 function M.profile_command(cmd)
@@ -1096,5 +1237,7 @@ console.extra["f3d-player"] = M.player_command
 console.extra["f3d-profile"] = M.profile_command
 console.extra["f3d-rate"] = M.rate_command
 console.extra["f3d-bs"] = M.bs_command
+console.extra["f3d-perf"] = M.perf_command
+console.extra["f3d-ih"] = M.ih_command
 
 return M

@@ -51,6 +51,9 @@ var gun_shown := false
 
 var _t := 0.0
 var _run_phase := 0.0
+## I21: each foot coming down in the run loop (the phase passing 0 and half way), counted for
+## fx.gd's footsteps, so they keep the cycle's beat at every speed.
+var footfalls := 0
 var _mine_clock := 0.0
 var _combat := 0.0
 var _fall := 0.0
@@ -85,7 +88,10 @@ func step(pose: CharacterPose, delta: float, distance: float) -> void:
 	var in_air := air_state != Air.GROUND
 	if running and not dead and not in_air:
 		var turn := distance / _loop_length() * TAU
+		var half := floori(_run_phase / PI)
 		_run_phase = fposmod(_run_phase + turn, TAU)
+		if floori(_run_phase / PI) != half:
+			footfalls += 1
 		if absf(turn) > 0.00001:
 			_phase_rate = turn / dt
 	elif _w["run"] > 0.01:
@@ -489,6 +495,11 @@ func _air_step(delta: float) -> void:
 		Air.LANDING:
 			_lift = 1.0 - smoothstep(0.15, 0.5, k)
 			thrust = 0.7 * (1.0 - smoothstep(0.35, 0.6, k))
+
+
+## How far the body is drawn over the ground in flight (tiles): the camera centres on it there.
+func drawn_lift() -> float:
+	return flight_height * _lift
 
 
 ## How much of the air pose shows (0 on the ground, 1 hovering).

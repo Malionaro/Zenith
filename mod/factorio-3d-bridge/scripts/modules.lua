@@ -9,11 +9,14 @@
 -- machine screen, 1-based), clr? (1: take the requests back: slot s's, or all)}.
 --
 -- Also the hover panel's answer (`hinfo`, M.hover): modules and their effects, beacons, the
--- electricity Factorio's entity info shows, and a roboport's links.
+-- electricity Factorio's entity info shows, a roboport's links, what is inside (I2), how far a
+-- craft and the burning fuel are (I26) and a crafter's ingredients and products a second (J15).
 
+local entity_ui = require("scripts.entity_ui")
 local puppet = require("scripts.puppet")
 local transport = require("scripts.transport")
 local world = require("scripts.world")
+local alt_mode = require("scripts.alt_mode")
 
 local M = {}
 
@@ -104,13 +107,173 @@ function M.roboport_links(e)
   return out
 end
 
--- What Factorio's entity info shows for a machine with module slots or a beacon, answering
+-- The inventories the hover panel lists (I2), by entity type: {role, {defines.inventory names,
+-- the first that exists}}. By type because the defines share numbers (chest and fuel are both 1),
+-- so asking a furnace for its "chest" would hand back its fuel. Modules are `m`; fuel, burnt
+-- results and a crafter's output are asked for by their own getters below.
+local HOVER_INVENTORIES = {
+  container = { { "chest", { "chest" } } },
+  ["logistic-container"] = { { "chest", { "chest" } }, { "trash", { "logistic_container_trash" } } },
+  ["linked-container"] = { { "chest", { "chest" } } },
+  ["infinity-container"] = { { "chest", { "chest" } } },
+  ["cargo-wagon"] = { { "cargo", { "cargo_wagon" } } },
+  ["artillery-wagon"] = { { "ammo", { "artillery_wagon_ammo" } } },
+  ["artillery-turret"] = { { "ammo", { "artillery_turret_ammo" } } },
+  ["ammo-turret"] = { { "ammo", { "turret_ammo" } } },
+  car = { { "trunk", { "car_trunk" } }, { "ammo", { "car_ammo" } } },
+  ["spider-vehicle"] = { { "trunk", { "spider_trunk" } }, { "ammo", { "spider_ammo" } } },
+  ["assembling-machine"] = { { "input", { "assembling_machine_input", "crafter_input" } } },
+  furnace = { { "input", { "furnace_source", "crafter_input" } } },
+  ["rocket-silo"] = { { "input", { "rocket_silo_input", "assembling_machine_input", "crafter_input" } } },
+  lab = { { "input", { "lab_input" } } },
+  roboport = { { "robots", { "roboport_robot" } }, { "repair", { "roboport_material" } } },
+  ["space-platform-hub"] = { { "chest", { "hub_main" } } },
+  ["cargo-landing-pad"] = { { "chest", { "cargo_landing_pad_main" } } },
+}
+local CRAFTERS = { ["assembling-machine"] = true, furnace = true, ["rocket-silo"] = true }
+-- Kinds of item listed per inventory at most: a mixed chest of a hundred kinds stays one panel.
+local HOVER_ITEMS = 30
+
+local function define_of(names)
+  for _, name in ipairs(names) do
+    local index = try(function() return defines.inventory[name] end)
+    if index then
+      return index
+    end
+  end
+  return nil
+end
+
+-- [[name, count, quality?], ...] totals per item, or nil when empty.
+local function totals(inventory)
+  if not inventory then
+    return nil
+  end
+  local out = {}
+  for _, it in pairs(try(function() return inventory.get_contents() end) or {}) do
+    if #out >= HOVER_ITEMS then
+      break
+    end
+    local row = { it.name, it.count }
+    local quality = type(it.quality) == "string" and it.quality or (it.quality and it.quality.name)
+    if quality and quality ~= "normal" then
+      row[3] = quality
+    end
+    out[#out + 1] = row
+  end
+  return #out > 0 and out or nil
+end
+
+-- What is inside, as Factorio's entity info lists it (I2): [[role, [[name, count, quality?], ...]],
+-- ...] in the panel's order, empty inventories left out; nil when there is nothing. Only the
+-- hovered entity is read, about once a second (requests.lua's budget).
+function M.hover_inventories(e)
+  local out = {}
+  local function add(role, inventory)
+    local list = totals(inventory)
+    if list then
+      out[#out + 1] = { role, list }
+    end
+  end
+  for _, pair in ipairs(HOVER_INVENTORIES[e.type] or {}) do
+    local index = define_of(pair[2])
+    add(pair[1], index and try(function() return e.get_inventory(index) end))
+  end
+  if CRAFTERS[e.type] then
+    add("output", try(function() return e.get_output_inventory() end))
+  end
+  add("fuel", try(function() return e.get_fuel_inventory() end))
+  add("burnt", try(function() return e.get_burnt_result_inventory() end))
+  return #out > 0 and out or nil
+end
+
+-- A crafter's craft for the hover panel's bar (I26): `pr` how far (thousandths) and `ps` how much a
+-- second of game time makes at 60 UPS (thousandths: its crafting speed with modules and beacons
+-- over the recipe's time), so the client draws the bar on between answers.
+local function crafting(msg, e)
+  if not CRAFTERS[e.type] then
+    return
+  end
+  local progress = try(function() return e.crafting_progress end)
+  if type(progress) ~= "number" then
+    return
+  end
+  msg.pr = math.max(0, math.min(1000, math.floor(progress * 1000 + 0.5)))
+  msg.ps = M.progress_rate(e)
+end
+
+-- Thousandths of a craft a second of game time makes: crafting speed / the recipe's energy; nil
+-- without a recipe.
+function M.progress_rate(e)
+  local recipe = try(function() return e.get_recipe() end)
+  if not recipe and e.type == "furnace" then
+    recipe = try(function() return e.previous_recipe end)
+    local name = recipe and (type(recipe.name) == "string" and recipe.name or try(function() return recipe.name.name end))
+    recipe = name and try(function() return e.force.recipes[name] end) or nil
+  end
+  local energy = recipe and try(function() return recipe.energy end)
+  local speed = try(function() return e.crafting_speed end)
+  if type(energy) ~= "number" or energy <= 0 or type(speed) ~= "number" then
+    return nil
+  end
+  return math.floor(speed / energy * 1000 + 0.5)
+end
+
+-- What a crafting machine takes and makes a second, running flat out at its speed now (J15: Factorio's
+-- entity info lists a machine's ingredients and products per second): {i = [[type, name, thousandths
+-- a second], ...], o = [...]}, nil without a recipe (a furnace's last one counts, as its Alt-mode icon).
+-- The crafting speed has its modules' and beacons' speed in it; each product gains the machine's
+-- productivity (modules, beacons, the recipe's research), up to the recipe's cap, except the part
+-- ignored_by_productivity, and counts at its probability, with extra_count_fraction.
+function M.rates(e)
+  if not CRAFTERS[e.type] then
+    return nil
+  end
+  local recipe = alt_mode.shown_recipe(e)
+  local energy = recipe and try(function() return recipe.energy end)
+  local speed = try(function() return e.crafting_speed end)
+  if type(energy) ~= "number" or energy <= 0 or type(speed) ~= "number" or speed <= 0 then
+    return nil
+  end
+  local crafts = speed / energy
+  local prod = try(function() return e.productivity_bonus end)
+  prod = type(prod) == "number" and math.max(0, prod) or 0
+  local cap = try(function() return recipe.prototype.maximum_productivity end)
+  if type(cap) == "number" then
+    prod = math.min(prod, cap)
+  end
+  local function per_second(amount)
+    return math.floor(amount * crafts * 1000 + 0.5)
+  end
+  local i, o = {}, {}
+  for _, x in ipairs(try(function() return recipe.ingredients end) or {}) do
+    i[#i + 1] = { x.type or "item", x.name, per_second(x.amount or 0) }
+  end
+  for _, x in ipairs(try(function() return recipe.products end) or {}) do
+    local amount = x.amount
+    if not amount and x.amount_min then
+      amount = (x.amount_min + (x.amount_max or x.amount_min)) / 2
+    end
+    amount = amount or 0
+    local boosted = math.max(0, amount - (x.ignored_by_productivity or 0))
+    local each = (amount + (x.extra_count_fraction or 0) + boosted * prod) * (x.probability or 1)
+    o[#o + 1] = { x.type or "item", x.name, per_second(each) }
+  end
+  if #i == 0 and #o == 0 then
+    return nil
+  end
+  return { i = i, o = o }
+end
+
+-- What Factorio's entity info shows for a machine with module slots or a beacon (G12), answering
 -- the client's `hinfo` {q, u, p, x, y} for the entity under the mouse: `hinfo` {q, u, eff? (its
 -- effects: a machine's from its modules and beacons; a beacon's its modules' sum, before the
 -- distribution effectivity, as 2.1.23 reports it), m? (its modules
 -- [[name, count, quality?], ...]), b? (beacons reaching a machine), n? (machines a beacon reaches),
 -- de? (a beacon's distribution effectivity, thousandths), el? (its electricity, M.electricity),
--- rn? (a roboport's links to other roboports, M.roboport_links)}.
+-- rn? (a roboport's links to other roboports, M.roboport_links), inv? (what is inside,
+-- M.hover_inventories), pr? ps? (a crafter's progress and its rate), bn? (the burning fuel left,
+-- thousandths), io? (a crafter's ingredients and products a second, M.rates)}.
 -- Reads only.
 function M.hover(cmd)
   local q = math.floor(tonumber(cmd.q) or 0)
@@ -137,6 +300,10 @@ function M.hover(cmd)
     if e.type == "roboport" then
       msg.rn = M.roboport_links(e)
     end
+    msg.inv = M.hover_inventories(e)
+    crafting(msg, e)
+    msg.io = M.rates(e)
+    msg.bn = try(function() return entity_ui.burner_left(e) end)
     if e.type == "beacon" then
       local receivers = try(function() return e.get_beacon_effect_receivers() end)
       msg.n = receivers and #receivers or nil

@@ -13,10 +13,15 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import mock_server  # noqa: E402
 import mock_space  # noqa: E402
+import mock_machines  # noqa: E402
 import mock_vehicles  # noqa: E402
 import mock_turrets  # noqa: E402
 import mock_shots  # noqa: E402
 import protocol  # noqa: E402
+
+# A FAIL line can hold any character: on Windows, output to a file or pipe is in the system's code page,
+# and one character it lacks stopped the run with UnicodeEncodeError.
+sys.stdout.reconfigure(errors="backslashreplace")
 
 failures = []
 
@@ -157,6 +162,26 @@ check(set(dec) == set(wanted), f"every subscribed chunk's decoratives ({len(dec)
 n = sum(len(v) // 4 for v in dec.values())
 check(n > 100 and all(v in did.values() for l in dec.values() for v in l[0::4]), f"decoratives on the grass, with dictionary ids ({n})")
 del HELLO["dc"]
+send(HELLO)
+step(2)
+take()
+
+# I18: a client whose hello says lv is told the counts of chunks that leave its subscription (kept);
+# offered back with them, an unchanged chunk is answered with same.
+HELLO["lv"] = 1
+send(HELLO)
+step(2)
+send({"t": "sub", "c": [list(c) for c in wanted if c != (2, 2)]})
+step(2)
+kept = of_type(take(), "kept")
+row = kept[0]["l"] if kept else []
+check(len(row) == 4 and row[:2] == [2, 2], f"a chunk leaving the subscription is told as kept: {kept}")
+if len(row) == 4:
+    send({"t": "sub", "c": [list(c) for c in wanted], "h": [[kept[0]["rs"], 2, 2, row[2], row[3]]]})
+    step(5)
+    back = [m for m in of_type(take(), "chunk") if (m["cx"], m["cy"]) == (2, 2)]
+    check(len(back) == 1 and back[0].get("same") == row[2], f"and offered back with those counts it is answered with same: {back}")
+del HELLO["lv"]
 send(HELLO)
 step(2)
 take()
@@ -368,6 +393,8 @@ if trees:
     step(30)
     msgs = take()
     check(any(d["p"] == tree[1] and d["x"] == tree[2] for d in of_type(msgs, "del")), "mined tree is removed")
+    mnd = [m for m in of_type(msgs, "mnd") if m["p"] == tree[1] and m["x"] == tree[2]]
+    check(mnd and mnd[0]["g"] == 1 and mnd[0]["l"] == [["wood", 4]], f"J20: and said at once, with the wood it gave (mnd): {mnd}")
     inv = of_type(msgs, "inv")
     check(inv and any(e[0] == "wood" and e[1] >= 14 for e in inv[-1]["l"]), "wood added to the inventory")
 else:
@@ -721,10 +748,19 @@ check(any(m["text"] == "Can't research automation" for m in of_type(msgs, "msg")
 send({"t": "research_cancel", "name": "electronics"})
 step(600)
 msgs = take()
+step(2)
+msgs += take()
 techs = {r[0]: r[6] for m in of_type(msgs, "techs") for r in m["l"]}
 check(techs.get("logistics") == 2 and techs.get("logistics-2") == 0 and of_type(msgs, "rs")[-1]["cur"] == "",
       f"finished research resends the tree: {techs}")
-check(any(m.get("tech") == "logistics" for m in of_type(msgs, "msg")), "and says so, naming the technology")
+check([m["l"] for m in of_type(msgs, "rdone")] == [[["logistics", 0]]], f"and says so once (rdone), naming the technology: {of_type(msgs, 'rdone')}")
+# An infinite technology names the level it finished and goes on to the next (K23).
+send({"t": "research", "name": "mining-productivity-3"})
+step(605)
+msgs = take()
+levels = {r[0]: r[9] for m in of_type(msgs, "techs") for r in m["l"]}
+check([m["l"] for m in of_type(msgs, "rdone")] == [[["mining-productivity-3", 3]]] and levels.get("mining-productivity-3") == 4,
+      f"an infinite research's rdone names the level done, the tree the next: {of_type(msgs, 'rdone')} {levels.get('mining-productivity-3')}")
 
 # blueprints, ghosts and planners
 game.player["x"], game.player["y"] = -1.0, 24.0
@@ -899,6 +935,13 @@ c00 = next((m for m in of_type(msgs, "chart") if (m["cx"], m["cy"]) == (0, 0)), 
 check(c00 and c00["n"] == 16 and c00["pal"][c00["px"][1 * 16 + 2]] == [250, 200, 40],
       f"the starter belt is on the map: {c00 and c00['pal']}")
 check(of_type(msgs, "tags"), "a map request sends the tags")
+# chart_same: asked again with the picture's stamp, an unchanged chunk comes back as `same`.
+st00 = c00.get("st") if c00 else None
+send({"t": "map", "cx1": 0, "cy1": 0, "cx2": 0, "cy2": 0, "res": 2, "h": [[0, 0, st00]]})
+step(2)
+again00 = next((m for m in of_type(take(), "chart") if (m["cx"], m["cy"]) == (0, 0)), None)
+check(isinstance(st00, int) and again00 and again00.get("same") == st00 and "px" not in again00,
+      f"a chart carries its stamp, and an unchanged one asked with it comes back as same: {st00} {again00 and sorted(again00)}")
 send({"t": "map", "cx1": -1, "cy1": -1, "cx2": 0, "cy2": 0, "res": 4})
 step(3)
 ov = [r for m in of_type(take(), "chart") for r in m.get("ov", [])]
@@ -919,6 +962,10 @@ el = hi.get(7, {}).get("el", {})
 check(el.get("mx") == 77500 and el.get("mn") == 2500 and el.get("b", 0) > 0 and 0 <= el.get("e", -1) <= el["b"]
       and hi.get(6, {}).get("el", {}).get("mn") == 0,
       f"hinfo: an assembler's and a beacon's electricity (H20): {hi}")
+hi_io = hi.get(7, {}).get("io", {})
+hi_recipe = game.machines.get(find_ent("assembling-machine-1", 8.5, -2.5)[0], {}).get("recipe")
+check(hi_io.get("o", [[None, None]])[0][:2] == ["item", hi_recipe] and hi_io.get("i") and all(r[2] > 0 for r in hi_io["i"] + hi_io["o"]),
+      f"hinfo: an assembler's ingredients and products a second (J15): {hi_io} ({hi_recipe})")
 game.remove(hb)
 rp = game.add(mock_server.Entity(game._unit(), "roboport", 60.0, -6.0))
 send({"t": "hinfo", "q": 8, "u": game.roboport.unit, "p": 0, "x": 0, "y": 0})
@@ -1664,6 +1711,141 @@ check(len(off_rows) == 2 and {r[1] for r in off_rows} == {0, 5} and "r" in game.
       f"--belts-off: st 5 and 0 every 5 s: {[r[:2] for r in off_rows]}")
 game.belts_off = []
 game.belts_empty = 0
+# J6: Alt-mode on (`altc`): `ac` lists the chests round the focus with what they hold most of; off, none.
+send({"t": "sub", "c": [[0, 0]]})
+send({"t": "focus", "x": int(5.5 * 256), "y": int(10.5 * 256), "r": 32})
+send({"t": "altc", "on": 1, "g": 2})
+step(61)
+ac_rows = {r[0]: r for m in of_type(take(), "ac") if m["g"] == 2 for r in m["l"]}
+ac_unit = next(e.unit for e in game.entities.values() if e.name == "wooden-chest" and (e.x, e.y) == (5.5, 10.5))
+want_icons = game.chest_icons(game.machine(game.entities[ac_unit]))
+check(want_icons and ac_rows.get(ac_unit) == [ac_unit, want_icons[0]] + ([want_icons[1:]] if len(want_icons) > 1 else []),
+      f"altc: the starter chest's Alt-mode icons in `ac`, most held first (J6): {ac_rows} {want_icons}")
+send({"t": "altc", "on": 0})
+step(61)
+check(not of_type(take(), "ac"), "altc off: no more `ac`")
+# K1, K2: --alt-icons' machines: `am` lists the assembler's four modules, the lab's seven packs and two
+# modules, the drill's and the beacon's modules (the client draws a beacon's only on hover).
+game.build_alt_icons()
+send({"t": "sub", "c": [[0, -1], [0, 0]]})
+send({"t": "focus", "x": int(14.5 * 256), "y": int(-12.5 * 256), "r": 32})
+send({"t": "altc", "on": 1, "g": 3})
+step(61)
+am_rows = {r[0]: r for m in of_type(take(), "am") if m["g"] == 3 for r in m["l"]}
+am_by_name = {game.entities[u].name: r[1:] for u, r in am_rows.items() if u in game.entities and game.entities[u].y == -12.5}
+check(am_by_name.get("assembling-machine-3") == [["speed-module", "speed-module", "productivity-module", "productivity-module"]]
+      and am_by_name.get("lab") == [["speed-module", "productivity-module"], mock_machines.LAB_INPUTS]
+      and am_by_name.get("electric-mining-drill") == [["speed-module"] * 3] and am_by_name.get("beacon") == [["speed-module"] * 2],
+      f"altc: --alt-icons' modules and the lab's packs in `am` (K1, K2): {am_by_name}")
+eprops_x = {r[0]: r[4] for r in mock_server.EPROPS if len(r) > 4}
+check(eprops_x.get(mock_server.EID["lab"], {}).get("isq", [[None]])[1][0] == "l"
+      and eprops_x.get(mock_server.EID["assembling-machine-3"], {}).get("ids") == [0, -0.3, 1],
+      "the mock's eprops say where Alt-mode puts them (isq, ids)")
+send({"t": "altc", "on": 0})
+step(61)
+check(not of_type(take(), "am"), "altc off: no more `am`")
+# J26: only where the cursor is from the character (`n`, `ox`, `oy`, as the client sends over nothing
+# in its view): the mock's sweep mines what is under that point, as the mod's does. (Last: its ticks
+# would move the timed checks above.)
+sweep_tree = next((e for e in game.entities.values() if e.type == "tree"), None)
+if sweep_tree is not None:
+    game.player["x"], game.player["y"] = sweep_tree.x - 2, sweep_tree.y
+    for _ in range(12):
+        send({"t": "mine", "n": 1, "ox": 2 * 256, "oy": 0})
+        step(9)
+    step(30)
+    send({"t": "mine_stop"})
+    step(2)
+    take()
+check(sweep_tree is not None and sweep_tree.key() not in game.entities, "J26: the mock's sweep mines the tree under the point")
+
+# F off a belt (issue #18), last too (its ticks would move the timed checks above): a client that simulates belts
+# (bs) again, the starter belt's lanes loaded first.
+HELLO["bs"] = 1
+send(HELLO)
+step(40)
+take()
+# The starter belt's items within reach come off, said at once (pku: each one's lane and unique id, where it
+# was), and their lanes come again in sl without them.
+belt_x = game.belt[0].x
+game.player["x"], game.player["y"] = belt_x + 0.9, game.belt[6].y
+send({"t": "pickup"})
+step(2)
+pmsgs = take()
+picked = [r for m in of_type(pmsgs, "pku") for r in m["l"]]
+on_belt = [r for r in picked if r[4]]
+check(on_belt and all(r[5] and math.hypot(r[2] / 256 - game.player["x"], r[3] / 256 - game.player["y"]) <= mock_server.PICKUP_DISTANCE + 0.01
+                      and r[4] == game.lane_key(r[2] / 256, r[3] / 256) and items.get(r[7]) == r[0] for r in on_belt),
+      f"F: the belt's items within reach are taken and said at once (pku, lane key and id): {on_belt[:3]}")
+gone = {r[5] for r in on_belt}
+step(14)
+resent = [m for m in of_type(pmsgs + take(), "bs") if m["k"] > max((m2["k"] for m2 in of_type(pmsgs, "pku")), default=0)]
+left_uids = set()
+for m in resent:
+    sl, i = m.get("sl", []), 0
+    while i < len(sl):
+        left_uids |= {sl[i + 3 + 4 * j] for j in range(sl[i + 2])}
+        i += 3 + sl[i + 2] * 4
+check({r[4] for r in on_belt} <= sl_keys(resent) and not gone & left_uids,
+      f"F: the lanes taken from come again in sl without the taken items: {sorted({r[4] for r in on_belt})}")
+
+# K10: the mock's coloured lamps in `st`'s lc: the circuit's one going red, green, blue every 300 ticks, the
+# window's one amber.
+step(620)
+lamp_lc = {}
+for m in of_type(take(), "st"):
+    l = m.get("lc") or []
+    for i in range(0, len(l), 2):
+        lamp_lc.setdefault(l[i], []).append(l[i + 1])
+cycler, amber = list(game.lamp_colors)
+check(len(set(lamp_lc.get(cycler, [])) & {0xFF0000, 0x00FF00, 0x0000FF}) >= 2 and set(lamp_lc.get(amber, [])) <= {0xFFA000},
+      f"K10: a lamp's colour goes in st's lc when it changes: {lamp_lc}")
+
+
+# K20: the mock's always-on lamp says so in st's ao (with its first state); its Always on turned off sends
+# ao 0, on again 1.
+def ao_pairs(msgs):
+    return {(a[i], a[i + 1]) for m in of_type(msgs, "st") for a in [m.get("ao") or []] for i in range(0, len(a), 2)}
+
+
+always_unit = next(iter(game.always_on_lamps))
+always_ent = next(e for e in game.entities.values() if e.unit == always_unit)
+first = game.lamp_ao_sent.get(always_unit)
+game.machine(always_ent)["ao"] = 0
+step(31)
+ao_off = ao_pairs(take())
+game.machine(always_ent)["ao"] = 1
+step(31)
+ao_on = ao_pairs(take())
+check(first == 1 and (always_unit, 0) in ao_off and (always_unit, 1) in ao_on,
+      f"K20: the always-on lamp's ao: first {first}, turned off {ao_off}, on again {ao_on}")
+
+# K13: a repair pack held on a damaged wall mends it (4 health a tick, a wall's modifier 2), says so in me's
+# rp, its bar rises in hp, and stops without a target.
+wall = next(e for e in game.entities.values() if e.unit in game.building_hp and e.name == "stone-wall")
+game.player["x"], game.player["y"] = wall.x - 2.0, wall.y
+step(2)
+take()
+before = game.building_hp[wall.unit]
+send({"t": "repair", "u": wall.unit, "p": protos["stone-wall"], "x": mock_server.fixed(wall.x), "y": mock_server.fixed(wall.y),
+      "item": "repair-pack"})
+step(12)
+rmsgs = take()
+mended = game.building_hp.get(wall.unit, mock_server.BUILDING_HEALTH["stone-wall"]) - before
+rp = [m for m in of_type(rmsgs, "me") if m.get("rp") == 1]
+bars = [dict(zip(m["l"][::2], m["l"][1::2])).get(wall.unit) for m in of_type(rmsgs, "hp")]
+check(36 <= mended <= 48 and rp and rp[-1]["rx"] == mock_server.fixed(wall.x) and any(b is not None and b > before * 1000 / 350 for b in bars),
+      f"K13: repair mends the wall, me's rp says where, hp's bar rises: {mended} {rp[-1:]} {bars}")
+send({"t": "repair"})
+step(2)
+held = game.building_hp.get(wall.unit)
+step(10)
+check(game.building_hp.get(wall.unit) == held and game.player["repair"] is None, "K13: repair without a target stops")
+step(30)
+slot_msgs = of_type(rmsgs + take(), "slots")
+worn = [s for s in (slot_msgs[-1]["l"]["main"] if slot_msgs else []) if s and s[0] == "repair-pack"]
+check(worn and len(worn[0]) == 5 and worn[0][2:4] == ["normal", -1] and 900 <= worn[0][4] < 1000,
+      f"K13: the worn pack's slot carries its durability: {worn}")
 
 if failures:
     print(f"\n{len(failures)} check(s) failed")

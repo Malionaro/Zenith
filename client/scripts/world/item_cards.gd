@@ -50,6 +50,19 @@ var casts_shadow := true:
 		casts_shadow = value
 		for mmi: MultiMeshInstance3D in _kinds.values():
 			mmi.cast_shadow = _shadow_setting()
+## The render layers of every kind's MultiMesh (GeometryInstance3D.layers). Items on belts are on
+## BELT_LAYER, which the character's lantern and flashlight leave out of their shadow casters
+## (avatar.gd): a kind is one MultiMesh over the whole square, so each of the lantern's six cube faces
+## that touched it drew every item of it again. The sun's shadows still have them.
+var render_layers := 1:
+	set(value):
+		if value == render_layers:
+			return
+		render_layers = value
+		for mmi: MultiMeshInstance3D in _kinds.values():
+			mmi.layers = value
+## Items on belts (belt_items.gd), apart from avatar.gd's SELF_LAYER (bit 19).
+const BELT_LAYER := 1 << 18
 ## Settings → Graphics → Item icons: off draws every item without a model as its coloured block.
 static var use_icons := true
 ## Off when Settings → Graphics → Items in 3D is "Icons only": every item as its icon.
@@ -85,6 +98,25 @@ static func yaw_for(seed: int) -> float:
 ## pile (0 the bottom or a lone item), each copy PILE_TURN more than the one under it.
 static func turn_for(seed: int, copy := 0) -> float:
 	return yaw_for(seed) + PILE_TURN * copy
+
+
+## The turn of an item on a packed lane (belt_lattice.gd, drawn by belt_path.gdshaderinc's
+## belt_lattice_turn, which this follows step for step): `who` it is along its run (only its low 20 bits
+## count) and the run's seed, in the same range as yaw_for and the same pile rule. A lattice's slots slide
+## and wrap, so a slot can't keep a turn of its own: the item it carries is who the shader works out.
+static func lattice_turn(who: int, run: int, copy := 0) -> float:
+	var x := ((who & 0xFFFFF) + (run & 0xFFFFFFFF) * 2654435769) & 0xFFFFFFFF
+	x = x ^ (x >> 16)
+	x = _mul32(x, 2146121005)
+	x = x ^ (x >> 15)
+	x = _mul32(x, 2221713035)
+	x = x ^ (x >> 16)
+	return (float(x % 2001) / 1000.0 - 1.0) * MAX_YAW + PILE_TURN * copy
+
+
+## a * b modulo 2^32, as a shader's uint (a and b below 2^32; GDScript's int is 64 bits).
+static func _mul32(a: int, b: int) -> int:
+	return (a * (b & 0xFFFF) + (((a * (b >> 16)) & 0xFFFF) << 16)) & 0xFFFFFFFF
 
 
 func reset() -> void:
@@ -318,6 +350,7 @@ func _kind(item_id: int) -> MultiMeshInstance3D:
 	var mmi := MultiMeshInstance3D.new()
 	mmi.multimesh = mm
 	mmi.cast_shadow = _shadow_setting()
+	mmi.layers = render_layers
 	mmi.name = "Items_%s%s" % [item if item != "" else str(item_of(item_id)), "_icon" if item_id < 0 else ""]
 	add_child(mmi)
 	_kinds[item_id] = mmi
@@ -346,18 +379,44 @@ var _loading := {}
 static var _icon_jobs := {}
 
 
+## Kinds whose model or icon came are dressed for at most this long a frame, at least one a frame
+## (--item-dress-usec=N; 0, the default: all at once). Tried at 1500 for the 60-95 ms frame a join's
+## first kinds made at -62,-26: no gain (one kind's dress was the frame, waiting for its shader; the
+## warm-up, shader_warmup.gd, is what takes that away), and belt_items.gd writes every item again each
+## time a kind is dressed, so trickling them made the belts' first load take 72 s instead of 22-23.
+static var dress_usec := 0
+static var _dress_arg_read := false
+
+
 func _process(_delta: float) -> void:
 	if _loading.is_empty():
 		return
+	if not _dress_arg_read:
+		_dress_arg_read = true
+		for a in OS.get_cmdline_user_args():
+			if a.begins_with("--item-dress-usec="):
+				dress_usec = maxi(0, int(a.substr(18)))
+	var t0 := Time.get_ticks_usec()
+	var done := 0
 	for id in _loading.keys():
+		if dress_usec > 0 and done > 0 and Time.get_ticks_usec() - t0 > dress_usec:
+			break
 		var item: String = _loading[id]
-		if not _look_ready(item, id < 0):
+		var tl := Time.get_ticks_usec()
+		var ready := _look_ready(item, id < 0)
+		_prof("poll_look", tl)
+		if not ready:
 			continue
 		_loading.erase(id)
 		var mmi: MultiMeshInstance3D = _kinds.get(id)
 		if mmi != null:
+			tl = Time.get_ticks_usec()
 			_dress(id, item, mmi)
+			_prof("poll_dress", tl)
+			if Probing.on and Time.get_ticks_usec() - tl > 5000:
+				print("ITEMCARDS slow dress %s (%d): %d ms, model %s" % [item, id, (Time.get_ticks_usec() - tl) / 1000, _turns.has(id)])
 			mmi.visible = true
+		done += 1
 
 
 ## Whether an item's look is known: its model read (or none), and without one its icon. Otherwise
@@ -393,30 +452,44 @@ static func _look_ready(item: String, icon := false) -> bool:
 ## Gives a kind its model, icon card or block.
 func _dress(item_id: int, item: String, mmi: MultiMeshInstance3D) -> void:
 	var mm := mmi.multimesh
+	var t0 := Time.get_ticks_usec()
 	var model: Mesh = ItemModels.mesh_for(item) if use_models and item_id >= 0 else null
 	var texture: Texture2D = null
 	if model == null and item != "" and use_icons:
 		texture = ItemIcons.texture_for(item)
+	_prof("d_look", t0)
 	var material: ShaderMaterial
 	if model != null:
+		t0 = Time.get_ticks_usec()
 		mm.mesh = model
+		_prof("d_mesh", t0)
+		t0 = Time.get_ticks_usec()
 		material = ItemModels.material()
 		_turns[item_id] = true
+		_prof("d_material", t0)
+		t0 = Time.get_ticks_usec()
 		_pile[item_id] = clampf(model.get_aabb().size.y, 0.03, 0.2)
+		_prof("d_aabb", t0)
 	elif texture != null:
+		t0 = Time.get_ticks_usec()
 		mm.mesh = _card()
+		_prof("d_mesh", t0)
+		t0 = Time.get_ticks_usec()
 		material = ShaderMaterial.new()
 		material.shader = CardShader
 		material.set_shader_parameter("icon", texture)
+		_prof("d_material", t0)
 	else:
 		mm.mesh = _block()
 		material = ItemModels.block_material(ItemIcons.color_for(item))
 		_lift[item_id] = Vector3(0.0, BLOCK_SIZE.y * 0.5, 0.0)
 		_pile[item_id] = BLOCK_SIZE.y
+	t0 = Time.get_ticks_usec()
 	mmi.material_override = material
 	if _paths != null:
 		material.set_shader_parameter("belt_paths", _paths)
 	_materials[material] = true
+	_prof("d_override", t0)
 
 
 ## Flat and facing up, with the top of the icon to the north.

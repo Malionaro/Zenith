@@ -13,6 +13,9 @@ more depth and detail. Needs Zenith's add-on API 1.5 (`api.shaders`, docs/ADDONS
   off by default
 - the sky's reflection on metal
 - depth haze that grows with distance
+- clouds: soft, shaded clouds in the sky and their shadows drifting over the factory, from one
+  pattern the add-on draws once into a texture when it starts (`shaders/cloud_field.gdshader`, about
+  8 MB of video memory), in place of Zenith's own flat clouds
 - temporal anti-aliasing as an option (off by default: it softens moving belts), so far detail doesn't shimmer as the camera moves
   (your own anti-aliasing setting comes back when the add-on is off). MSAA is off while the look is on:
   Zenith draws SMAA in its place, since the grade pass reads a depth MSAA blurs at every edge (from the
@@ -37,4 +40,9 @@ strong sunrise and sunset are.
 It costs GPU time: ambient occlusion most (about 1-1.5 ms a frame on a desktop graphics card at a
 busy base: Godot's depth pre-pass then writes every pixel's normal), bounce light about as much again
 (off by default; for Ultra-class cards), then bloom, the grade pass (one full-screen read and write)
-and the haze. Turn ambient occlusion off on its page first if the frame rate drops.
+and the haze. Turn ambient occlusion off on its page first if the frame rate drops. Since 0.4.5 the
+clouds cost a texture read where they worked out noise on every pixel, which mattered most with the
+sky in view (first person, a low camera); temporal anti-aliasing replaces SMAA instead of running
+over it.
+
+What changed in each version: [CHANGELOG.md](CHANGELOG.md).

@@ -49,6 +49,7 @@ const ModsWindow := preload("res://scripts/menu/mods_window.gd")
 const AddonsWindow := preload("res://scripts/menu/addons_window.gd")
 const AddonRequests := preload("res://scripts/addons/addon_requests.gd")
 const GameSwap := preload("res://scripts/menu/game_swap.gd")
+const Rcon := preload("res://scripts/menu/rcon.gd")
 const Controls := preload("res://scripts/player/controls.gd")
 const PerfTest := preload("res://scripts/menu/perf_test.gd")
 
@@ -63,6 +64,10 @@ const CONNECT_TIMEOUT_MSEC := 30000
 ## The world counts as loaded once this many chunks are drawn (or a few seconds after "ready").
 const READY_CHUNKS := 9
 const READY_GRACE_MSEC := 6000
+## Then the screen stays while the chunks round the character are built with every model and the
+## models' pipelines compiled (world.gd join_left, pipeline_warm.gd): a first draw of a model froze
+## a frame for 0.2-0.9 s in play. At most this long after "ready"; `--join-warm=off` skips it.
+const WARM_GRACE_MSEC := 25000
 
 enum State { MENU, BUSY, CONNECTING, PLAYING }
 
@@ -73,6 +78,9 @@ var state := State.MENU
 ## How the current game was reached: "launched" (our server), "address" or "direct".
 var session := ""
 var session_address := ""
+## RCON of a server on another PC, through its relay (server/relay.py --rcon-port), when the Connect
+## dialog was given its password: what pausing needs there (main.gd _has_rcon). Closed with the game.
+var remote_rcon: Rcon = null
 
 var _root := Control.new()
 var _page: Control = null
@@ -243,7 +251,8 @@ func _process(delta: float) -> void:
 ## Ctrl+F9 ("Show in Factorio"), or the Factorio button at the HUD's top left: the same game in
 ## Factorio's own window, started joined to the menu's server if it isn't open.
 func _show_factorio() -> void:
-	var said := GameSwap.show_factorio(launcher.game_port if session == "launched" and launcher.is_running() else 0)
+	var said := GameSwap.show_factorio(launcher.game_port if session == "launched" and launcher.is_running() else 0,
+		"" if Bridge.server_on_this_pc() else Bridge.factorio_host)
 	if said != "" and main != null and main.hud != null:
 		main.hud.show_message(said)
 
@@ -565,7 +574,7 @@ func _fill_worlds() -> void:
 		var s: Dictionary = _saves[i]
 		if s["source"] != last_source:
 			last_source = s["source"]
-			var where := "  Server saves (server/saves)" if last_source == "server" else "  Factorio's saves (loaded as a copy)"
+			var where := "  " + _source_heading(last_source)
 			if not _worlds_dir.is_empty():
 				where += "  ›  " + str(_worlds_dir["dir"]).trim_prefix(str(_worlds_dir["root"])).trim_prefix("/")
 			var head := Kit.label(where, "FHeading")
@@ -627,6 +636,16 @@ func _fill_worlds() -> void:
 	_fill_details()
 
 
+## The load screen's heading over a root's saves.
+static func _source_heading(source: String) -> String:
+	match source:
+		"server":
+			return "Server saves (server/saves)"
+		"zenith":
+			return "Zenith downloads' saves (loaded as a copy)"
+	return "Factorio's saves (loaded as a copy)"
+
+
 func _fill_details() -> void:
 	var dbox: VBoxContainer = _page.find_child("Details", true, false)
 	for c in dbox.get_children():
@@ -661,7 +680,11 @@ func _fill_details() -> void:
 	dbox.add_child(title)
 	dbox.add_child(Kit.label("Last played: %s" % Saves.when(int(s["modified"]))))
 	dbox.add_child(Kit.label("Size: %.1f MB" % (int(s["size"]) / 1048576.0)))
-	var where := "The 3D server's saves" if s["source"] == "server" else "Your Factorio saves. Load makes a copy in the server's saves; the original isn't touched."
+	var where := "The 3D server's saves"
+	if s["source"] == "zenith":
+		where = "Saved by a downloaded Zenith (your user folder). Load makes a copy in the server's saves; the original isn't touched."
+	elif s["source"] == "factorio":
+		where = "Your Factorio saves. Load makes a copy in the server's saves; the original isn't touched."
 	var note := MenuKit.paragraph(where, 344)
 	note.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
 	dbox.add_child(note)
@@ -682,7 +705,7 @@ func _load_selected() -> void:
 		return
 	var s: Dictionary = _saves[_selected]
 	var path := str(s["path"])
-	if s["source"] == "factorio":
+	if s["source"] != "server":
 		path = Saves.copy_to_server(path)
 		if path == "":
 			_show_message("Error", "Couldn't copy %s into %s." % [s["path"], Paths.saves_dir()])
@@ -859,31 +882,65 @@ func _show_connect() -> void:
 	var parts := MenuKit.window("Connect to address")
 	MenuKit.overlay_center(o).add_child(parts[0])
 	var box: VBoxContainer = parts[1]
-	box.add_child(MenuKit.paragraph("The address of a running bridge: Factorio started with --enable-lua-udp <port> and the factorio-3d-bridge mod (server/run-server.ps1 uses 34200), or the mock server (python tools/mock_server.py). Factorio only accepts the client from this computer.", 460))
-	var edit := MenuKit.textbox("127.0.0.1:34200")
+	box.add_child(MenuKit.paragraph("The address of a running bridge. On this PC: Factorio started with --enable-lua-udp <port> and the factorio-3d-bridge mod (server/run-server.ps1 uses 34200), or the mock server (python tools/mock_server.py). On another PC: that PC's address and the port of the relay running beside its server (python3 server/relay.py, TCP 34200), like 192.168.1.20:34200.", 460))
+	var last := str(Settings.get_value("factorio", "last_address"))
+	var edit := MenuKit.textbox(last if last != "" else "127.0.0.1:34200")
 	edit.custom_minimum_size.x = Kit.px(460)
 	box.add_child(edit)
+	box.add_child(MenuKit.paragraph("RCON password, for a server on another PC whose relay carries RCON (optional: lets Zenith pause the game there; it is in the server's server/data/rcon-password.txt):", 460))
+	var password := MenuKit.textbox("", "none")
+	password.secret = true
+	password.custom_minimum_size.x = Kit.px(460)
+	box.add_child(password)
 	var row: Array = MenuKit.dialog_buttons("Back", "Connect")
 	box.add_child(row[0])
 	_on(row[1], _pop_overlay, "gui-back")
 	var go := func() -> void:
 		var text := edit.text.strip_edges()
-		var host := "127.0.0.1"
-		var port := 0
-		if text.contains(":"):
-			host = text.get_slice(":", 0)
-			port = int(text.get_slice(":", 1))
-		else:
-			port = int(text)
-		if port <= 0 or port > 65535:
-			_show_message("Error", "\"%s\" isn't an address. Write it as host:port, like 127.0.0.1:34200." % text)
+		var address := parse_address(text)
+		if address.is_empty():
+			_show_message("Error", "\"%s\" isn't an address. Write it as host:port, like 127.0.0.1:34200 or 192.168.1.20:34200." % text)
 			return
+		Settings.set_value("factorio", "last_address", text)
 		_clear_overlays()
-		_connect_address(host if host != "" and host != "localhost" else "127.0.0.1", port)
+		_connect_address(str(address[0]), int(address[1]), password.text)
 	_on(row[2], go, "gui-green-confirm")
 	edit.text_submitted.connect(func(_t: String) -> void: go.call())
+	password.text_submitted.connect(func(_t: String) -> void: go.call())
 	_push_overlay(o)
 	edit.grab_focus.call_deferred()
+
+
+## "host:port", "host" (port 34200), "port" (this PC), "[v6 address]:port" -> [host, port]; [] when it
+## isn't one. "localhost" is 127.0.0.1.
+static func parse_address(text: String) -> Array:
+	text = text.strip_edges()
+	var host := "127.0.0.1"
+	var port_text := ""
+	if text.begins_with("["):
+		host = text.get_slice("]", 0).trim_prefix("[")
+		port_text = text.get_slice("]", 1).trim_prefix(":")
+		if port_text == "":
+			port_text = "34200"
+	elif text.count(":") == 1:
+		host = text.get_slice(":", 0)
+		port_text = text.get_slice(":", 1)
+	elif text.count(":") > 1:
+		host = text  # an IPv6 address alone
+		port_text = "34200"
+	elif text.is_valid_int():
+		port_text = text
+	else:
+		host = text
+		port_text = "34200"
+	if not port_text.is_valid_int() or host.contains(" "):
+		return []
+	var port := int(port_text)
+	if port <= 0 or port > 65535:
+		return []
+	if host == "" or host.to_lower() == "localhost":
+		host = "127.0.0.1"
+	return [host, port]
 
 
 func _show_hybrid() -> void:
@@ -1272,13 +1329,35 @@ func _launch(path: String, host := {}) -> void:
 	_enter_game("127.0.0.1", launcher.udp_port, launcher.client_port, "Loading " + path.get_file().get_basename())
 
 
-func _connect_address(host: String, port: int) -> void:
+func _connect_address(host: String, port: int, rcon_password := "") -> void:
 	if state != State.MENU:
 		return
 	session = "address"
-	session_address = "%s:%d" % [host, port]
-	var listen := ServerLauncher.free_udp_port(34201 if port == 34200 else port + 1)
+	session_address = ("[%s]:%d" if host.contains(":") else "%s:%d") % [host, port]
+	# A server on another PC goes through its relay (TCP): no UDP port of ours to pick.
+	var remote: bool = Bridge.through_relay(host)
+	var listen := 0 if remote else ServerLauncher.free_udp_port(34201 if port == 34200 else port + 1)
 	_enter_game(host, port, listen, "Connecting to " + session_address)
+	if remote and rcon_password != "":
+		_open_remote_rcon(host, port, rcon_password)
+
+
+## RCON through the relay at host:port (server/relay.py --rcon-port), for pausing on a server on
+## another PC. Said on the HUD when it can't be had: the game plays on without it.
+func _open_remote_rcon(host: String, port: int, password: String) -> void:
+	var rcon := Rcon.new()
+	remote_rcon = rcon
+	var ok: bool = await rcon.open(get_tree(), port, password, host, true)
+	if remote_rcon != rcon:
+		rcon.close()  # left the game meanwhile
+		return
+	if not ok:
+		remote_rcon = null
+		print("menu: no RCON through the relay: " + rcon.error)
+		if main != null and main.hud != null:
+			main.hud.show_message("No RCON on the server: " + rcon.error)
+		return
+	print("menu: RCON through the relay at %s:%d" % [host, port])
 
 
 ## Builds the game world, points the bridge at the server and waits for the world (Cancel goes
@@ -1293,11 +1372,14 @@ func _enter_game(host: String, port: int, listen: int, title: String) -> void:
 	get_tree().root.theme = MenuKit.theme()  # the HUD set Kit's; this one has it all and the menus' too
 	main.set_game_input(false)
 	Bridge.connect_to(host, port, listen)
-	_show_progress(title, "Connecting to the bridge at %s…" % session_address, 0.8, true)
+	_show_progress(title, ("Connecting to the relay at %s…" if Bridge.via_relay else "Connecting to the bridge at %s…") % session_address, 0.8, true)
 	state = State.CONNECTING
 	_connect_started = Time.get_ticks_msec()
 	_ready_since = 0
-	print("menu: connecting to %s from UDP %d" % [session_address, listen])
+	if Bridge.via_relay:
+		print("menu: connecting to %s through its relay (TCP)" % session_address)
+	else:
+		print("menu: connecting to %s from UDP %d" % [session_address, listen])
 
 
 func _update_connecting() -> void:
@@ -1308,28 +1390,50 @@ func _update_connecting() -> void:
 		_fail_connect("The server stopped while the client was connecting.\n" + launcher._log_errors(0))
 		return
 	if not Bridge.connected:
+		var relay := Bridge.relay_status() if Bridge.via_relay else ""
+		if relay.begins_with("refused"):
+			_fail_connect("The relay at %s %s." % [session_address, relay])
+			return
+		if relay == "connected":
+			_set_progress("Connected to the relay, waiting for the bridge…", 0.8)
 		if Time.get_ticks_msec() - _connect_started > CONNECT_TIMEOUT_MSEC:
-			_fail_connect("No answer from the bridge at %s.\nIs Factorio running with --enable-lua-udp %d and the factorio-3d-bridge mod enabled?" % [session_address, Bridge.factorio_port])
+			if relay == "connected":
+				_fail_connect("The relay at %s answers, but no bridge behind it.\nIs Factorio running on that PC with --enable-lua-udp and the factorio-3d-bridge mod, and the relay's --bridge-port the same port?" % session_address)
+			elif Bridge.via_relay:
+				_fail_connect("No relay answers at %s (%s).\nIs python3 server/relay.py running on that PC, its TCP port open in the firewall, and this PC's address allowed (--allow; the default is the local network)?" % [session_address, relay])
+			else:
+				_fail_connect("No answer from the bridge at %s.\nIs Factorio running with --enable-lua-udp %d and the factorio-3d-bridge mod enabled?" % [session_address, Bridge.factorio_port])
 		return
 	if not Bridge.world_ready:
 		_set_progress("Receiving prototypes…", 0.85)
 		return
 	if _ready_since == 0:
 		_ready_since = Time.get_ticks_msec()
+		if main.has_method("set_joining"):
+			main.set_joining(true)
 	var chunks: int = main.loaded_chunks()
-	_set_progress("Loading world… (%d chunks)" % chunks, 0.88 + 0.12 * minf(1.0, chunks / float(READY_CHUNKS)))
-	if chunks >= READY_CHUNKS or Time.get_ticks_msec() - _ready_since > READY_GRACE_MSEC:
-		_hide_progress()
-		state = State.PLAYING
-		_played_seconds = 0.0
-		main.set_game_input(true)
-		print("menu: in the game (%s, %d chunks)" % [session_address, chunks])
-		if Settings.arg_value("--menu=").get_slice(":", 0) in ["esc", "save-as", "settings"]:
-			_toggle_esc_menu()
-			if Settings.arg_value("--menu=") == "save-as":
-				_show_save_as()
-			elif Settings.arg_value("--menu=").begins_with("settings"):
-				_show_settings(Settings.arg_value("--menu=").get_slice(":", 1))  # as the Esc menu's Settings button
+	var waited := Time.get_ticks_msec() - _ready_since
+	if chunks < READY_CHUNKS and waited <= READY_GRACE_MSEC:
+		_set_progress("Loading world… (%d chunks)" % chunks, 0.88 + 0.08 * minf(1.0, chunks / float(READY_CHUNKS)))
+		return
+	var left: int = main.join_left() if main.has_method("join_left") and Settings.arg_value("--join-warm=") != "off" else 0
+	if left > 0 and waited <= WARM_GRACE_MSEC:
+		_set_progress("Preparing models and shaders… (%d left)" % left, 0.96 + 0.04 * minf(1.0, float(waited) / WARM_GRACE_MSEC))
+		return
+	if main.has_method("set_joining"):
+		main.set_joining(false)
+	_hide_progress()
+	state = State.PLAYING
+	_played_seconds = 0.0
+	main.set_game_input(true)
+	print("menu: in the game (%s, %d chunks, %d s after ready%s)" % [session_address, chunks, waited / 1000,
+		", %d still preparing" % left if left > 0 else ""])
+	if Settings.arg_value("--menu=").get_slice(":", 0) in ["esc", "save-as", "settings"]:
+		_toggle_esc_menu()
+		if Settings.arg_value("--menu=") == "save-as":
+			_show_save_as()
+		elif Settings.arg_value("--menu=").begins_with("settings"):
+			_show_settings(Settings.arg_value("--menu=").get_slice(":", 1))  # as the Esc menu's Settings button
 
 
 func _fail_connect(text: String) -> void:
@@ -1363,6 +1467,9 @@ func _leave_game(save: bool) -> void:
 	_clear_overlays()
 	if main != null:
 		main.end_game()
+	if remote_rcon != null:
+		remote_rcon.close()
+		remote_rcon = null
 	if session == "launched" and launcher.is_running():
 		_show_progress("Exit to menu", "Saving and stopping the server…" if save else "Stopping the server…", 0.3, true)
 		await launcher.stop(save)
@@ -1472,6 +1579,8 @@ func _toggle_esc_menu() -> void:
 	players.visible = main != null and main.hud != null and main.hud.ui.model.players.size() > 1
 	buttons.add_child(players)
 	var where_text := ("Server: " if session == "launched" else "Bridge: ") + session_address
+	if Bridge.via_relay:
+		where_text += " (another PC, through its relay%s)" % (", RCON" if remote_rcon != null and remote_rcon.is_open() else "")
 	if session == "launched" and not launcher.hosting.is_empty():
 		where_text += "  ·  hosting \"%s\" on port %d" % [launcher.hosting.get("name", ""), launcher.game_port]
 	var row: Array = MenuKit.dialog_buttons("Exit", "", true)

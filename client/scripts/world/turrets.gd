@@ -26,6 +26,7 @@ const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const SoundBank := preload("res://scripts/fx/sound_bank.gd")
 const FxSettings := preload("res://scripts/fx/fx_settings.gd")
 const BeamShader := preload("res://shaders/fx_beam.gdshader")
+const GroundHeight := preload("res://scripts/world/ground_height.gd")
 
 ## A target counts as current this long after a report names it (reports come every 6 ticks).
 const TARGET_HOLD := 0.4
@@ -112,6 +113,10 @@ const FLAME_ENERGY := 2.4
 const FLAME_LANDING_ENERGY := 2.2
 const FLAME_LANDING_RANGE := 7.0
 const FLAME_LANDING_HEIGHT := 2.0
+## On an add-on's hills (ground_height.gd) the turret's model and its cards are lifted in their
+## shaders; its lights and beams are placed here, lifted by the height under the muzzle and under the
+## target. Each is read again only when the hills change or its point moves this far (tiles).
+const HILL_REREAD := 0.25
 
 
 class TurretState:
@@ -142,6 +147,12 @@ class TurretState:
 	var flame_light: OmniLight3D  # over where the stream lands
 	var beam: MeshInstance3D
 	var beam_age := 0.0
+	var ground := 0.0  # the hills' height under the muzzle, read at ground_at in GroundHeight.version() ground_v
+	var ground_at := Vector2.INF
+	var ground_v := -1
+	var target_ground := 0.0  # and under the target (or where a flame lands)
+	var target_at := Vector2.INF
+	var target_v := -1
 	var fired := 0  # shots drawn (for the UI test)
 	var heard := 0.0  # _clock at its last `ts`
 
@@ -512,7 +523,7 @@ func _update_effects(st: TurretState, delta: float) -> void:
 		var on := st.light_energy > 0.01
 		st.light.visible = on
 		if on:
-			st.light.global_position = st.muzzle
+			st.light.global_position = st.muzzle + Vector3(0.0, _muzzle_ground(st), 0.0)
 			st.light.light_energy = st.light_energy
 	if st.beam_left > 0.0:
 		st.beam_left -= delta
@@ -543,8 +554,9 @@ func _draw_beam(st: TurretState) -> void:
 		add_child(st.beam)
 	var spec: Array = BEAMS[st.beam_kind]
 	st.beam.material_override = mat
-	var from := st.muzzle
-	var to := st.target
+	var ends := beam_ends(st)
+	var from: Vector3 = ends[0]
+	var to: Vector3 = ends[1]
 	var along := to - from
 	var length := along.length()
 	if length < 0.05:
@@ -564,6 +576,33 @@ func _draw_beam(st: TurretState) -> void:
 	var fade := clampf(st.beam_left / 0.08, 0.0, 1.0)
 	st.beam.set_instance_shader_parameter("strength", 1.4 * fade)
 	_flash(st, spec[8], 1.2 * fade)
+
+
+## Where a beam runs, [from, to]: the muzzle to the target, each over the hills under it.
+func beam_ends(st: TurretState) -> Array:
+	return [st.muzzle + Vector3(0.0, _muzzle_ground(st), 0.0), st.target + Vector3(0.0, _ground_under(st, st.target), 0.0)]
+
+
+## The hills' height under the muzzle (see HILL_REREAD).
+func _muzzle_ground(st: TurretState) -> float:
+	var v := GroundHeight.version()
+	var p := Vector2(st.muzzle.x, st.muzzle.z)
+	if st.ground_v != v or p.distance_squared_to(st.ground_at) > HILL_REREAD * HILL_REREAD:
+		st.ground_v = v
+		st.ground_at = p
+		st.ground = GroundHeight.at(p.x, p.y)
+	return st.ground
+
+
+## The hills' height under the target or where the flame lands, `at` (see HILL_REREAD).
+func _ground_under(st: TurretState, at: Vector3) -> float:
+	var v := GroundHeight.version()
+	var p := Vector2(at.x, at.z)
+	if st.target_v != v or p.distance_squared_to(st.target_at) > HILL_REREAD * HILL_REREAD:
+		st.target_v = v
+		st.target_at = p
+		st.target_ground = GroundHeight.at(p.x, p.y)
+	return st.target_ground
 
 
 func _beam_material(kind: String) -> ShaderMaterial:
@@ -639,7 +678,7 @@ func _light_landing(st: TurretState) -> void:
 		st.flame_light.shadow_enabled = false
 		add_child(st.flame_light)
 	var at := st.target if _clock - st.target_seen < 1.5 else st.muzzle + st.forward * 10.0
-	st.flame_light.global_position = Vector3(at.x, FLAME_LANDING_HEIGHT, at.z)
+	st.flame_light.global_position = Vector3(at.x, FLAME_LANDING_HEIGHT + _ground_under(st, at), at.z)
 	st.flame_light.light_energy = FLAME_LANDING_ENERGY * _flicker(st, 1.7)
 	st.flame_light.visible = true
 

@@ -46,6 +46,10 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import rcon  # noqa: E402
 
+# A FAIL line can hold any character: on Windows, output to a file or pipe is in the system's code page,
+# and one character it lacks stopped the run with UnicodeEncodeError.
+sys.stdout.reconfigure(errors="backslashreplace")
+
 # Shared helpers, defined again in every command (each /c is its own chunk). `mk` creates an
 # entity owned by the character's force, raises built, and is remembered for --clear.
 PRELUDE = """

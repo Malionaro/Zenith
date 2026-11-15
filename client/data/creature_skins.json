@@ -1,0 +1,21 @@
+{
+  "big-biter": {"mode": "masks", "materials": ["chitin_big"], "tiers": {"small-biter": [[0.4178, 0.2715, 0.2, 1.0], [0.4312, 0.2454, 0.0302, 0.7]], "medium-biter": [[0.2687, 0.1642, 0.2, 1.0], [0.4011, 0.0993, 0.097, 0.7]], "big-biter": [[0.1479, 0.122, 0.427, 1.0], [0.0247, 0.2454, 0.195, 0.7]], "behemoth-biter": [[0.0434, 0.0467, 0.0296, 1.0], [0.2149, 0.5948, 0.0091, 0.7]]}},
+  "big-spitter": {"mode": "masks", "materials": ["chitin_spitter"], "tiers": {"small-spitter": [[0.694, 0.1644, 0.0, 1.0], [0.2963, 0.3087, 0.1245, 0.8]], "medium-spitter": [[0.5149, 0.0319, 0.0675, 1.0], [0.3585, 0.2074, 0.2006, 0.8]], "big-spitter": [[0.0115, 0.128, 0.2937, 1.0], [0.192, 0.1654, 0.1599, 0.8]], "behemoth-spitter": [[0.0842, 0.0319, 0.0045, 1.0], [0.192, 0.4341, 0.0126, 0.75]]}},
+  "big-stomper-pentapod": {"mode": "colour"},
+  "big-stomper-shell": {"mode": "colour"},
+  "big-strafer-pentapod": {"mode": "colour"},
+  "big-worm-turret": {"mode": "mask", "materials": ["flesh_worm"], "tiers": {"small-worm-turret": [[0.5468, 0.9432, 0.0669, 1.0], [0.0, 0.0, 0.0, 0.5]], "medium-worm-turret": [[0.9611, 0.0185, 0.0669, 1.0], [0.0, 0.0, 0.0, 1.0]], "big-worm-turret": [[0.1155, 0.3962, 0.7191, 1.0], [0.0, 0.0, 0.0, 0.8]], "behemoth-worm-turret": [[0.0894, 0.9432, 0.0, 1.0], [0.0, 0.0, 0.0, 0.8]]}},
+  "big-wriggler-pentapod": {"mode": "mask", "materials": ["flesh_olive", "chitin_wriggler_leg"], "tiers": {"small-wriggler-pentapod": [[0.8748, 0.9319, 0.1226, 1.0], [0.0, 0.0, 0.0, 0.8016]], "small-wriggler-pentapod-premature": [[0.8748, 0.9319, 0.1226, 1.0], [0.0, 0.0, 0.0, 0.8016]], "medium-wriggler-pentapod": [[1.8754, 0.5572, 0.1087, 1.0], [0.0, 0.0, 0.0, 0.7024]], "medium-wriggler-pentapod-premature": [[1.8754, 0.5572, 0.1087, 1.0], [0.0, 0.0, 0.0, 0.7024]], "big-wriggler-pentapod": [[1.0084, 0.1852, 0.1421, 1.0], [0.0, 0.0, 0.0, 0.5039]], "big-wriggler-pentapod-premature": [[1.0084, 0.1852, 0.1421, 1.0], [0.0, 0.0, 0.0, 0.5039]]}},
+  "biter-spawner": {"mode": "mask", "materials": ["flesh_spawner_dome"], "tiers": {"biter-spawner": [[1.0857, 0.2332, 0.0, 1.0], [0.0, 0.0, 0.0, 0.5]], "spitter-spawner": [[1.2822, 0.0079, 0.0073, 1.0], [0.0, 0.0, 0.0, 1.0]]}},
+  "demolisher-head": {"mode": "colour"},
+  "demolisher-segment": {"mode": "colour"},
+  "demolisher-tail": {"mode": "colour"},
+  "gleba-spawner-corpse": {"mode": "colour"},
+  "gleba-spawner-small": {"mode": "colour"},
+  "medium-stomper-pentapod": {"mode": "colour"},
+  "medium-stomper-shell": {"mode": "colour"},
+  "medium-strafer-pentapod": {"mode": "colour"},
+  "small-stomper-pentapod": {"mode": "colour"},
+  "small-stomper-shell": {"mode": "colour"},
+  "small-strafer-pentapod": {"mode": "colour"}
+}

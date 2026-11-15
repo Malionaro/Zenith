@@ -3,8 +3,9 @@ extends VBoxContainer
 ## quickbar rows Factorio shows by default, each 10 slot buttons, and left of them the page
 ## buttons (quick_bar_page_button) with each row's page number. The top row is the page in use, as
 ## in Factorio ("the top quickbar", core.cfg's next-active-quick-bar): number keys 1-0
-## (factorio_ui.gd) select its slots' items for building; clicking a slot does the same, or pins the
-## held item when the slot is empty or holds something else; right click clears it. The second row,
+## (factorio_ui.gd) select its slots' items for building, or put the hand back when it holds that item;
+## clicking a slot does the same, or pins the held item when the slot is empty (a pinned slot is never
+## overwritten by a click, as in Factorio by default); right click clears it. The second row,
 ## below it, shows another page (the next one until X swaps the rows or the page chooser sets it;
 ## the mod keeps 10, while the client's own quickbar has one so it stays empty then). Inventory slots can be dragged onto both. Each slot shows its pinned item and
 ## how many the inventory has (faded when none). The HUD's mining progress and the character's

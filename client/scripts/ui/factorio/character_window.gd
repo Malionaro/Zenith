@@ -1,13 +1,16 @@
 extends Control
 ## Factorio's character window, centred on screen: the main inventory as a 10-wide slot grid on
 ## the left ("Character"; the armour, gun and ammo slots are on the tool bar, weapon_hud.gd, as in
-## Factorio 2.1), and on the right either hand-crafting ("Crafting", E) or the open machine's screen. Slots report clicks (inventory role
+## Factorio 2.1), and on the right either Factorio's Crafting and Logistics tabs (E) or the open
+## machine's screen. Slots report clicks (inventory role
 ## and 1-based slot) and hovers to factorio_ui.gd, which decides what they do, and inventory
 ## stacks can be dragged onto the quickbar. Over the inventory sit Factorio's colour picker and
 ## colour buttons; under its slot rows Factorio's faint empty rows fill the frame. The Logistics
-## part is Factorio's: "Personal logistics" and "Trash unrequested" with the network's status dot,
+## tab is Factorio's: "Personal logistics" and "Trash unrequested" with the network's status dot,
 ## the logistic sections (`clog.sec`, production_panels.gd; an older mod's requests as one "Main"
 ## section) with "Add section" under them, then the trash slots (ui_model.char_requests, network).
+## It shows only once the force has researched the character's logistics (J8: the bridge sends
+## `clog` only then); until then the right side is Crafting alone, under its title (J7).
 ## The Character tab is Factorio's character info: bonuses, distances and speeds (`cinfo`).
 ##
 ## Right click on armour with an equipment grid opens it as Factorio does: one window titled with
@@ -56,7 +59,6 @@ var armor_open := false
 
 var _grid := Kit.slot_grid()
 var _crafting_frame := Kit.panel("FFrameRight")
-var _logistics_frame := Kit.panel("FFrameMiddle")
 var _char_frame := Kit.panel("FFrameLeft")
 var _char_caption: Label
 ## "Character" over the inventory inside an entity's window (where the title is the entity's).
@@ -68,9 +70,16 @@ var _crafting_caption: Label
 var _crafting: CraftingPanel
 var _logistics := VBoxContainer.new()
 ## Holds _logistics: many logistic sections scroll in it instead of making the window taller than
-## the inventory beside it (_fit_logistics()).
+## the crafting tab it takes the place of (_fit_logistics()).
 var _logistics_scroll := ScrollContainer.new()
+## The Logistics tab: its frame, and its page (the sections' scroll and the trash slots).
+var _logistics_tab := Kit.panel("FShallowFrame")
+var _logistics_page := VBoxContainer.new()
+## Factorio's Crafting / Logistics tabs in the right half's title bar (shown while Logistics is
+## researched), and the Character details button: name -> Button.
 var _tab_buttons := {}
+var _tabs_row := HBoxContainer.new()
+var _tab := "Crafting"
 var _trash_box := VBoxContainer.new()
 var _trash_grid := Kit.slot_grid()
 var _logistics_sig := "-"
@@ -203,42 +212,10 @@ func _ready() -> void:
 	_stripes.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	inv_box.add_child(_stripes)
 
-	row.add_child(_logistics_frame)
-	var mid_box := VBoxContainer.new()
-	mid_box.add_theme_constant_override("separation", Kit.px(4))
-	_logistics_frame.add_child(mid_box)
-	mid_box.add_child(Kit.title_bar("Logistics", false))
-	var mid_shallow := Kit.panel("FShallowFrame")
-	mid_shallow.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	mid_box.add_child(mid_shallow)
-	var mid_pad := MarginContainer.new()
-	for side in ["left", "top", "right", "bottom"]:
-		mid_pad.add_theme_constant_override("margin_" + side, Kit.px(12))
-	mid_shallow.add_child(mid_pad)
-	var mid := VBoxContainer.new()
-	mid.add_theme_constant_override("separation", Kit.px(8))
-	mid_pad.add_child(mid)
-	_logistics.theme = EntityPanels.theme()
-	_logistics.add_theme_constant_override("separation", Kit.px(8))
-	_logistics.custom_minimum_size = Kit.pxv(Kit.SLOT * Kit.COLUMNS, Kit.SLOT * 4)
-	_logistics.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_logistics_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	_logistics_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	_logistics_scroll.add_child(_logistics)
-	_logistics.resized.connect(_fit_logistics)
-	mid.add_child(_logistics_scroll)
-	_trash_box.add_theme_constant_override("separation", Kit.px(2))
-	_trash_box.add_child(Kit.label("Trash slots", "FHeading"))
-	var trash_frame := Kit.panel("FDeepFrame")
-	trash_frame.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
-	trash_frame.add_child(_trash_grid)
-	_trash_box.add_child(trash_frame)
-	_trash_box.visible = false
-	mid.add_child(_trash_box)
-	# Space Age: the planet the character is on and its surface properties.
+	# Space Age: the planet the character is on and its surface properties, under the inventory.
 	var planet := PlanetInfo.new()
 	planet.model = model
-	mid.add_child(planet)
+	left_box.add_child(planet)
 
 	row.add_child(_crafting_frame)
 	var right_box := VBoxContainer.new()
@@ -247,6 +224,25 @@ func _ready() -> void:
 	var bar := Kit.title_bar("Crafting", true)
 	_crafting_caption = bar.get_child(0)
 	(bar.get_child(bar.get_child_count() - 1) as Button).pressed.connect(func() -> void: close_requested.emit())
+	# J7: Factorio's Crafting / Logistics tabs in the title's place once Logistics is researched (J8).
+	_tabs_row.add_theme_constant_override("separation", 0)
+	for t in ["Crafting", "Logistics"]:
+		var b := Button.new()
+		b.text = t
+		b.name = t + "Tab"
+		b.theme_type_variation = "FTab"
+		b.toggle_mode = true
+		b.button_pressed = t == "Crafting"
+		b.focus_mode = Control.FOCUS_NONE
+		b.custom_minimum_size = Kit.pxv(110, 28)
+		b.add_theme_font_override("font", Kit.font("bold"))
+		var tab_name: String = t
+		b.pressed.connect(func() -> void: show_tab(tab_name))
+		_tabs_row.add_child(b)
+		_tab_buttons[t] = b
+	_tabs_row.visible = false
+	bar.add_child(_tabs_row)
+	bar.move_child(_tabs_row, 1)
 	# Factorio's title buttons: search, then close. The character's details (not part of
 	# Factorio's screen) are behind the button before them.
 	var info_button := Kit.close_button()
@@ -256,6 +252,7 @@ func _ready() -> void:
 		info_button.icon = portrait
 	info_button.toggle_mode = true
 	info_button.toggled.connect(func(on: bool) -> void: show_tab("Character" if on else "Crafting"))
+	info_button.name = "CharacterTab"
 	bar.add_child(info_button)
 	bar.move_child(info_button, bar.get_child_count() - 2)
 	_tab_buttons["Character"] = info_button
@@ -287,6 +284,38 @@ func _ready() -> void:
 		if _info_stale and _info.is_visible_in_tree():
 			_refresh_info())
 	right_box.add_child(_info)
+	# The Logistics tab: the sections (scrolling past the crafting tab's height), then the trash slots.
+	_logistics_page.add_theme_constant_override("separation", Kit.px(8))
+	_logistics_page.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_logistics_page.visible = false
+	var lpad := MarginContainer.new()
+	# As wide as the Crafting tab (its grid and scroll bar), so switching tabs doesn't move the window.
+	for side_name in ["left", "top", "right", "bottom"]:
+		lpad.add_theme_constant_override("margin_" + side_name, Kit.px(6 if side_name == "left" or side_name == "right" else 12))
+	lpad.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_logistics_tab.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_logistics_tab.add_child(lpad)
+	lpad.add_child(_logistics_page)
+	_logistics_tab.visible = false
+	_logistics_tab.name = "LogisticsPage"
+	right_box.add_child(_logistics_tab)
+	_logistics.theme = EntityPanels.theme()
+	_logistics.add_theme_constant_override("separation", Kit.px(8))
+	_logistics.custom_minimum_size = Kit.pxv(Kit.SLOT * Kit.COLUMNS, Kit.SLOT * 4)
+	_logistics.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_logistics_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	_logistics_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_logistics_scroll.add_child(_logistics)
+	_logistics.resized.connect(_fit_logistics)
+	_logistics_page.add_child(_logistics_scroll)
+	_trash_box.add_theme_constant_override("separation", Kit.px(2))
+	_trash_box.add_child(Kit.label("Trash slots", "FHeading"))
+	var trash_frame := Kit.panel("FDeepFrame")
+	trash_frame.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
+	trash_frame.add_child(_trash_grid)
+	_trash_box.add_child(trash_frame)
+	_trash_box.visible = false
+	_logistics_page.add_child(_trash_box)
 
 	screen.size_flags_vertical = Control.SIZE_FILL
 	row.add_child(screen)
@@ -303,6 +332,7 @@ func _ready() -> void:
 			_refresh())
 	if model.has_signal("logistics_changed"):
 		model.connect("logistics_changed", _refresh_logistics)
+		model.connect("logistics_changed", _update_tabs)
 	_refresh()
 	_refresh_equipment()
 	_update_visibility()
@@ -556,19 +586,44 @@ static func _tiles(i: Dictionary, key: String) -> String:
 	return ("%.1f" % (int(i.get(key, 0)) / 10.0)).trim_suffix(".0")
 
 
-## "Crafting" or "Character" on the right.
+## Factorio's Logistics tab is there once the force has researched the character's logistics (J8).
+func logistics_tab_shown() -> bool:
+	return bool(model.get("char_logistics"))
+
+
+## "Crafting", "Logistics" (only while it is researched, else Crafting) or "Character" on the right.
 func show_tab(tab: String) -> void:
-	for t in _tab_buttons:
-		(_tab_buttons[t] as Button).set_pressed_no_signal(t == tab)
-	# Logistics has its own frame; "Character" swaps the crafting frame for the character's details.
-	_crafting.visible = tab != "Character"
-	_info.visible = tab == "Character"
-	if _crafting_caption != null:
-		_crafting_caption.text = "Character" if tab == "Character" else "Crafting"
+	if tab == "Logistics" and not logistics_tab_shown():
+		tab = "Crafting"
+	_tab = tab
+	_update_tabs()
 	_refresh_info()
-	if _logistics.visible:
+	if _logistics_page.visible:
 		_logistics_sig = "-"
 		_refresh_logistics()
+
+
+## The tab in view on the right ("Crafting", "Logistics" or "Character").
+func current_tab() -> String:
+	return _tab
+
+
+## The right half's title: the Crafting / Logistics tabs while Logistics is researched, else the
+## plain "Crafting" title as before it (and "Character" for the details); the pages to match.
+func _update_tabs() -> void:
+	if _tab == "Logistics" and not logistics_tab_shown():
+		_tab = "Crafting"
+	var tabs := logistics_tab_shown() and _tab != "Character"
+	_tabs_row.visible = tabs
+	for t in _tab_buttons:
+		(_tab_buttons[t] as Button).set_pressed_no_signal(t == _tab)
+	if _crafting_caption != null:
+		_crafting_caption.visible = not tabs
+		_crafting_caption.text = "Character" if _tab == "Character" else "Crafting"
+	_crafting.visible = _tab == "Crafting"
+	_info.visible = _tab == "Character"
+	_logistics_page.visible = _tab == "Logistics"
+	_logistics_tab.visible = _logistics_page.visible
 
 
 ## Ctrl+F: the crafting tab's search.
@@ -581,11 +636,14 @@ func focus_search() -> void:
 	_crafting.focus_search()
 
 
-## The logistics frame as tall as its sections up to the inventory's full height (and 60% of the
-## window), scrolling past that.
+## The Logistics tab as tall as its sections up to the crafting tab's height (the window keeps its
+## size switching tabs; at least four slot rows, at most 60% of the window), scrolling past that.
 func _fit_logistics() -> void:
 	var want := _logistics.get_combined_minimum_size()
-	var cap := float(Kit.px(Kit.SLOT * (MAX_ROWS + 1)))
+	var cap := maxf(float(Kit.px(Kit.SLOT * 4)), _crafting.get_combined_minimum_size().y - float(Kit.px(24)))
+	if _trash_box.visible:
+		cap -= _trash_box.get_combined_minimum_size().y + Kit.px(8)
+	cap = maxf(cap, float(Kit.px(Kit.SLOT * 2)))
 	var vp := get_viewport()
 	if vp != null:
 		cap = minf(cap, vp.get_visible_rect().size.y * 0.6)
@@ -733,9 +791,9 @@ func _update_visibility() -> void:
 	var alone := machine and not screen.shows_inventory()
 	_char_frame.visible = not alone
 	screen.set_alone(alone)
-	var was := _logistics_frame.visible
-	_logistics_frame.visible = crafting_open and not joined
-	if _logistics_frame.visible and not was:
+	var was := _logistics_page.is_visible_in_tree()
+	_update_tabs()
+	if _logistics_page.visible and _crafting_frame.visible and not was:
 		_logistics_sig = "-"
 		_refresh_logistics.call_deferred()
 	visible = crafting_open or joined

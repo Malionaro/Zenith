@@ -677,7 +677,17 @@ def write_rig_table(name, spec):
     if os.path.exists(RIGS_JSON):
         with open(RIGS_JSON, encoding="utf-8") as f:
             table = json.load(f)
-    table[name] = {"mode": spec.get("mode", "walk"), "rate": spec.get("rate", 1.0), "limbs": limb_table(spec)}
+    old = table.get(name, {})
+    entry = {"mode": spec.get("mode", "walk"), "rate": spec.get("rate", 1.0), "limbs": limb_table(spec)}
+    # creature_gait.py's knees and walk bend (fitted to the run sprites) stay with their limbs.
+    kept = {l["name"]: l for l in old.get("limbs", [])}
+    for limb in entry["limbs"]:
+        for key in ("knee", "reach", "bend"):
+            if key in kept.get(limb["name"], {}):
+                limb[key] = kept[limb["name"]][key]
+    if "body" in old:
+        entry["body"] = old["body"]
+    table[name] = entry
     _write_table(table)
 
 

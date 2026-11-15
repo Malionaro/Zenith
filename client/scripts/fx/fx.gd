@@ -32,9 +32,30 @@ const SCAN_INTERVAL := 0.25
 const HEARING := 40.0
 const SMOKE_RANGE := 45.0
 const MAX_EMITTERS := 24
-## Seconds between footsteps (Factorio's running animation takes two steps in about 0.6 s).
-const STEP_INTERVAL := 0.3
 const MINE_INTERVAL := 0.5
+## Factorio's utility sounds for a swing at something whose prototype has no mining_sound of its own
+## (J11): trees' wood, everything else the ore sound (2.1's changelog calls it the generic one).
+const MINE_SOUNDS := {"wood": "core/sound/mining-wood", "ore": "core/sound/axe-mining-ore"}
+## K13: what a repair pack mending something plays, Factorio's default_manual_repair (a drill, 3.3-3.6 s
+## a variation, at full volume), for what has no repair_sound of its own (stone walls and furnaces
+## hammer: base/sound/manual-repair-simple, at half volume). Each plays to its end, then the next.
+const REPAIR_SOUND := "core/sound/manual-repair-advanced"
+## Space Age tile names (a part of them) -> its step sounds, first match wins.
+const SPACE_AGE_STEPS := {
+	"frozen-concrete": "frozen-concrete", "ice-smooth": "smooth-ice", "brash-ice": "ice", "ice": "ice",
+	"snow": "icy-snow", "pumice": "rough-stone", "ash": "soft-stone", "volcanic": "hard-stone",
+	"fulgoran-dunes": "soft-sand", "fulgoran-sand": "soft-sand", "fulgoran-rock": "rocky-stone",
+	"fulgoran-walls": "hard-stone", "fulgoran-paving": "smooth-stone", "fulgoran-machinery": "scraps",
+	"fulgoran-conduit": "scraps", "wetland": "wetland", "lowland": "slime", "midland": "soft-bark",
+	"highland": "rocky-stone", "pit-rock": "semi-dry-rock",
+}
+## I25: machines whose working sound has accents (sound_accents), with the working animation the
+## accents' frames count in: [frame_count, animation_speed] from its prototype (the rocket silo's
+## "crafting" visualisation, rocket-silo-crafting-pictures.lua: 64 frames at 0.65 a tick, so its
+## weld and turn accents come round every 1.6 s while it builds a rocket).
+const ACCENT_ANIMS := {"rocket-silo": [64.0, 0.65]}
+## I21: a step by the timer when the run cycle gives none this long (the body not animated).
+const STEP_FALLBACK := 0.6
 const BUILD_RANGE := 16.0
 const REMNANT_SECONDS := 60.0
 const WIND := Vector3(0.35, 0.0, 0.12)  # tiles per second; Factorio's smoke drifts too
@@ -108,8 +129,16 @@ var _night := 0.0
 var _scan_timer := 0.0
 var _emitters := {}  # unit -> Emitter
 var _step_timer := 0.0
+var _footfalls := 0
+var _warmed := false
 var _mine_timer := 0.0
 var _mine_kind := ""
+var _mine_sound := ""
+## Entities' own mining sounds by prototype id, from `eprops` (`ms`, the bridge's data stage): J11.
+var _mining_sounds := {}
+## And their own repair sounds (`rsd`): K13.
+var _repair_sounds := {}
+var _repair_timer := 0.0
 var _mine_target := Vector2(INF, INF)
 var _last_mining_msec := -100000
 var _last_mining_at := Vector2.ZERO
@@ -119,6 +148,8 @@ var _biter_wait := 0.0
 var _burning := {}  # unit -> [remaining seconds, last position]
 var _tops := {}  # proto name -> height of the model's top
 var _states := {}  # unit -> working state last scan, for activate/deactivate sounds
+## Working machines near with sound accents: unit -> [Loop, position, animation frame, proto name].
+var _accents := {}
 
 
 func _ready() -> void:
@@ -184,6 +215,11 @@ func handle(msg: Dictionary) -> void:
 				_on_upd(msg.get("e"))
 		"del":
 			_on_del(msg)
+		"mnd":
+			# J20: the bridge's word that the character's mining took it, ahead of its `del` (world.gd takes the
+			# record away on this, so the `del` after finds nothing to sound again).
+			if int(msg.get("g", 0)) == 1 and int(msg.get("gi", 0)) == 0:
+				_on_del(msg)
 		"died":
 			_on_died(msg)
 		"afx":
@@ -200,6 +236,9 @@ func handle(msg: Dictionary) -> void:
 			var sel := int(msg.get("sel", 1)) - 1
 			if list is Array and sel >= 0 and sel < list.size() and list[sel] is Array and list[sel].size() > 0:
 				_gun = str(list[sel][0])
+		"eprops":
+			_mining_sounds = mining_sounds_of(msg)
+			_repair_sounds = mining_sounds_of(msg, "rsd")
 		"sky":
 			_night = clampf(int(msg.get("n", 0)) / 850.0, 0.0, 1.0)
 			sfx.ambience.darkness = int(msg.get("n", 0)) / 1000.0
@@ -221,8 +260,13 @@ func _process(delta: float) -> void:
 	if _scan_timer >= SCAN_INTERVAL:
 		_scan(_scan_timer)
 		_scan_timer = 0.0
+	if not _warmed:
+		_warmed = true
+		_warm_sounds()
 	_update_steps(delta)
 	_update_mining(delta)
+	_update_repair(delta)
+	_update_accents(delta)
 	_update_shots(delta)
 	sprites.visible = FxSettings.effects_enabled  # the Settings window can change it in the game
 	if FxSettings.effects_enabled:
@@ -239,6 +283,7 @@ func _scan(elapsed: float) -> void:
 	var emitters := {}
 	var protos := world.protos
 	var states := {}
+	var accents := {}
 	for unit in world.working_near(focus, SMOKE_RANGE):
 		var working := int(world.working.get(unit, 0)) == 1
 		var r: WorldMirror.Rec = world.entities.get(unit)
@@ -253,6 +298,11 @@ func _scan(elapsed: float) -> void:
 		if off.length() < HEARING:
 			_machine_sound(unit, r, proto, working, sources)
 			states[unit] = working
+			if working and ACCENT_ANIMS.has(proto.name):
+				var loop := SoundBank.working_sound(proto.name)
+				if loop != null and not loop.accents.is_empty():
+					var was: Array = _accents.get(unit, [])
+					accents[unit] = [loop, Vector3(r.pos.x, 1.0, r.pos.y), float(was[2]) if was.size() > 2 else 0.0, proto.name]
 		if not working:
 			continue
 		if EMITTERS.has(proto.name) and emitters.size() < MAX_EMITTERS:
@@ -262,6 +312,7 @@ func _scan(elapsed: float) -> void:
 			emitters[unit] = e
 	_emitters = emitters
 	_states = states
+	_accents = accents
 	# Vehicles, from their movement since the last scan.
 	var stale := Time.get_ticks_msec() - 1000
 	var biters: Array = []
@@ -316,6 +367,25 @@ func _machine_sound(unit, r: WorldMirror.Rec, proto: ProtoDB.EntityProto, workin
 	sources.append({"key": unit, "pos": at, "path": def.files[i], "volume": def.max_volumes[i], "reach": def.reach,
 		"curve": def.attenuation, "group": proto.name, "per_group": loop.max_per_prototype,
 		"fade_in": loop.fade_in, "fade_out": loop.fade_out})
+
+
+## I25: each working machine's sound accents as its working animation passes their frames, as
+## Factorio plays them (the frame is counted here from when it was first heard working; the game's
+## own animation frame isn't sent).
+func _update_accents(delta: float) -> void:
+	for unit in _accents:
+		var a: Array = _accents[unit]
+		var loop: SoundBank.Loop = a[0]
+		var anim: Array = ACCENT_ANIMS[a[3]]
+		var frames: float = anim[0]
+		var before: float = a[2]
+		var after := before + delta * 60.0 * float(anim[1])
+		for accent: Array in loop.accents:
+			var f := float(accent[1])
+			# Passed since the last frame, round the loop's end too.
+			if (before < f and after >= f) or (after >= frames and f < after - frames):
+				sfx.play_def(accent[0], a[1], "Environment")
+		a[2] = fmod(after, frames)
 
 
 func _make_emitter(r: WorldMirror.Rec, proto: ProtoDB.EntityProto) -> Emitter:
@@ -483,22 +553,52 @@ func _update_combat_fx(delta: float) -> void:
 # --- The character ----------------------------------------------------------------------------------
 
 func _update_steps(delta: float) -> void:
+	# I21: a step on each footfall of the character's run cycle (character_anim.gd), so the sound
+	# keeps the legs' beat at any speed, exoskeletons too; the old fixed 0.3 s timer restarted
+	# whenever `walking` flickered (an angled walk's zig-zag) and drifted off the feet.
+	var falls := avatar.footfalls()
+	var fell := falls != _footfalls
+	_footfalls = falls
 	if not avatar.walking or avatar.vehicle != 0:
-		_step_timer = STEP_INTERVAL * 0.5
+		_step_timer = 0.0
 		return
 	_step_timer += delta
-	if _step_timer < STEP_INTERVAL:
+	if not fell and _step_timer < STEP_FALLBACK:
 		return
-	_step_timer = 0.0
 	var ground := avatar.ground_position()
 	var surface := _ground_under(ground)
-	sfx.play_at(SoundBank.pick(surface[0]), avatar.position + Vector3(0, 0.1, 0), 0.5, 0.06, 1.0, "Walking")
+	var sound := _pick_ready(surface[0])
+	if sound == "":
+		return  # this ground's sounds are still being decoded (they all start now)
+	_step_timer = 0.0
+	sfx.play_at(sound, avatar.position + Vector3(0, 0.1, 0), 0.5, 0.06, 1.0, "Walking")
 	if FxSettings.effects_enabled and surface[1] is Color:
 		var tint: Color = surface[1]
 		var c := sprites.emit("dust", avatar.position + Vector3(randf_range(-0.15, 0.15), 0.15, randf_range(-0.15, 0.15)), 0.35, 0.7, Color(tint.r, tint.g, tint.b, 0.22))
 		if c != null:
 			c.size1 = 0.9
 			c.vel = Vector3(0, 0.25, 0)
+
+
+## A variation of `prefix` that is already decoded, or "" while none is. Every variation is asked
+## for at once: SoundBank.pick() handed out one whose decoding had only just been started, which
+## played nothing, so the first steps on a ground (and the first swing) were often silent.
+func _pick_ready(prefix: String) -> String:
+	var ready := PackedStringArray()
+	for p in SoundBank.variants(prefix):
+		if SoundBank.stream_soon(p) != null:
+			ready.append(p)
+	return ready[randi() % ready.size()] if ready.size() > 0 else ""
+
+
+## Starts decoding the character's commonest sounds once the world is there, so the first swing
+## and the first steps aren't lost to decoding.
+func _warm_sounds() -> void:
+	for prefix in MINE_SOUNDS.values():
+		_pick_ready(prefix)
+	for prefix in ["base/sound/walking/grass", "base/sound/walking/dirt-1", "base/sound/walking/sand",
+			"base/sound/walking/concrete", "core/sound/walking/transport-belt"]:
+		_pick_ready(prefix)
 
 
 ## [sound prefix, dust colour or null] for the ground at `p`: what the character stands on
@@ -526,6 +626,10 @@ func _ground_under(p: Vector2) -> Array:
 		return ["base/sound/walking/refined-concrete", null]
 	if "concrete" in tile or "stone-path" in tile:
 		return ["base/sound/walking/concrete", null]
+	# Space Age's grounds have their own steps (each tile's walking_sound): the nearest by name.
+	for k in SPACE_AGE_STEPS:
+		if k in tile:
+			return ["space-age/sound/walking/" + SPACE_AGE_STEPS[k], color]
 	if "sand" in tile or "desert" in tile:
 		return ["base/sound/walking/sand", color]
 	if "grass" in tile:
@@ -534,35 +638,39 @@ func _ground_under(p: Vector2) -> Array:
 
 
 func _update_mining(delta: float) -> void:
-	if avatar.mining < 0:
-		_mine_timer = 0.15  # the first swing lands shortly after the button goes down
+	# I20: the swing starts on the click (avatar.mine_hint), as in Factorio, not once the bridge's
+	# first mining progress has come back a round trip and a tick or two later.
+	var at := avatar.mining_for_sound()
+	if at.x == INF:
+		_mine_timer = 0.0  # the first swing's sound plays the frame the button goes down
 		_mine_target = Vector2(INF, INF)
 		_last_mining_progress = -1
 		return
 	_last_mining_msec = Time.get_ticks_msec()
-	_last_mining_at = avatar.mining_at
-	if avatar.mining_at != _mine_target:
-		_mine_target = avatar.mining_at
-		_mine_kind = _mining_kind(avatar.mining_at)
+	_last_mining_at = at
+	# The bridge's place and the click's differ by a little (an entity's position, the mouse's):
+	# the same target, no new first swing.
+	if at.distance_to(_mine_target) > 0.6:
+		_mine_target = at
+		_mine_kind = _mining_kind(at)
+		_mine_sound = _mining_sound(at)
 	# A resource is mined over and over: each time the bar comes round, an item came out.
-	if _mine_kind == "ore" and _last_mining_progress > avatar.mining + 30:
-		sfx.play_at(SoundBank.pick("core/sound/picked-up-item"), avatar.position, 0.35, 0.05)
-	_last_mining_progress = avatar.mining
+	if avatar.mining >= 0:
+		if _mine_kind == "ore" and _last_mining_progress > avatar.mining + 30:
+			sfx.play_at(SoundBank.pick("core/sound/picked-up-item"), avatar.position, 0.35, 0.05)
+		_last_mining_progress = avatar.mining
 	_mine_timer -= delta
 	if _mine_timer > 0.0:
 		return
+	var sound := _pick_ready(_mine_sound)
+	if sound == "":
+		return  # not decoded yet: try again next frame rather than lose the first swing
 	_mine_timer = MINE_INTERVAL
-	var target := Vector3(avatar.mining_at.x, 0.0, avatar.mining_at.y)
+	var target := Vector3(at.x, 0.0, at.y)
 	var toward := (avatar.position - target)
 	toward.y = 0.0
 	var hit := target + toward.normalized() * minf(0.5, toward.length()) + Vector3(0, 0.45, 0)
-	match _mine_kind:
-		"wood":
-			sfx.play_at(SoundBank.pick("core/sound/mining-wood"), hit, 0.6, 0.06)
-		"stone":
-			sfx.play_at(SoundBank.pick("core/sound/axe-mining-stone"), hit, 0.6, 0.06)
-		_:
-			sfx.play_at(SoundBank.pick("core/sound/axe-mining-ore"), hit, 0.6, 0.06)
+	sfx.play_at(sound, hit, 0.6, 0.06)
 	if not FxSettings.effects_enabled:
 		return
 	if _mine_kind == "wood":
@@ -581,7 +689,72 @@ func _update_mining(delta: float) -> void:
 			c.vel = Vector3(0, 0.4, 0)
 
 
-## "wood" (trees), "stone" (rocks), "ore" (resources) or "other" (buildings).
+## `eprops`' entities' own mining sounds (`key` "ms"), or repair sounds ("rsd"): prototype id -> sound
+## (its variations' prefix).
+static func mining_sounds_of(msg: Dictionary, key := "ms") -> Dictionary:
+	var out := {}
+	var list = msg.get("l")
+	if not (list is Array):
+		return out
+	for rec in list:
+		if rec is Array and rec.size() >= 5 and rec[4] is Dictionary and str(rec[4].get(key, "")) != "":
+			out[int(rec[0])] = str(rec[4][key])
+	return out
+
+
+## K13: while the character repairs (`me` `rp`), the mended thing's repair sound at it, one after another.
+func _update_repair(delta: float) -> void:
+	if not avatar.repairing:
+		_repair_timer = 0.0  # the next repair's sound starts at once
+		return
+	_repair_timer -= delta
+	if _repair_timer > 0.0:
+		return
+	var prefix := repair_sound_for(_repair_proto(avatar.repair_at), _repair_sounds)
+	var sound := _pick_ready(prefix)
+	if sound == "":
+		return  # not decoded yet: next frame
+	var stream := SoundBank.stream_soon(sound)
+	_repair_timer = maxf(0.2, stream.get_length() if stream != null else 1.0)
+	var at := avatar.repair_at
+	sfx.play_at(sound, Vector3(at.x, 0.5, at.y), 0.6 if prefix == REPAIR_SOUND else 0.3, 0.04)
+
+
+func _repair_proto(at: Vector2) -> ProtoDB.EntityProto:
+	var r := world.pick(at)
+	return world.protos.entity(r.proto_id) if r != null else null
+
+
+## The repair sound for `proto` with the entities' own sounds `own`: its own where the player's install
+## has the files, else Factorio's default_manual_repair.
+static func repair_sound_for(proto: ProtoDB.EntityProto, own: Dictionary) -> String:
+	var mine := str(own.get(proto.id, "")) if proto != null else ""
+	if mine != "" and not SoundBank.variants(mine).is_empty():
+		return mine
+	return REPAIR_SOUND
+
+
+## The swing's sound at `at`, as Factorio picks it (J11): the prototype's own mining_sound (rocks'
+## stone, the stone patch's, Space Age's plants and ice), else trees' wood and the ore sound for
+## everything else.
+func _mining_sound(at: Vector2) -> String:
+	var r := world.pick(at)
+	var proto: ProtoDB.EntityProto = world.protos.entity(r.proto_id) if r != null else null
+	if proto == null:
+		return MINE_SOUNDS["ore"]
+	return sound_for(proto, _mining_sounds)
+
+
+## The swing's sound for `proto` with the entities' own sounds `own` (mining_sounds_of): its own
+## where the player's install has the files, else Factorio's default for it.
+static func sound_for(proto: ProtoDB.EntityProto, own: Dictionary) -> String:
+	var mine := str(own.get(proto.id, ""))
+	if mine != "" and not SoundBank.variants(mine).is_empty():
+		return mine
+	return MINE_SOUNDS["wood"] if proto.type == "tree" else MINE_SOUNDS["ore"]
+
+
+## "wood" (trees), "stone" (rocks), "ore" (resources) or "other" (buildings): the swing's dust and sparks.
 func _mining_kind(at: Vector2) -> String:
 	var r := world.pick(at)
 	var proto: ProtoDB.EntityProto = world.protos.entity(r.proto_id) if r != null else null

@@ -43,6 +43,9 @@
 #ifdef MOVER
 #include "res://shaders/mover_records.gdshaderinc"
 #endif
+#ifdef LEAF_CUT
+#include "res://shaders/pollution.gdshaderinc"
+#endif
 
 uniform vec4 albedo : source_color = vec4(1.0);
 uniform float roughness : hint_range(0.0, 1.0) = 0.6;
@@ -57,6 +60,14 @@ uniform float view_data = 1.0;
 // tier and creature tints, which recolour the material).
 uniform float part_data = 0.0;
 uniform bool part_colors = true;
+// A creature's tinted skin (tools/models/creature_skin.py, creature_models.gd): its part colours are
+// Factorio's mask layers per vertex, coloured by the tier's tints as Factorio draws them. skin_mode
+// 1: (mask 1, mask 2, mask 2's cover) under albedo (tint 1) and skin_tint2; 2: one mask (its shade
+// and cover in COLOR) over the part colour, tinted by albedo, skin_tint2.a its alpha. 0: the part
+// colour as it is. In a merged table: row flags 16 and 32, tint 2 in the emission slot and its
+// alpha in row 5's w.
+uniform int skin_mode = 0;
+uniform vec4 skin_tint2 : source_color = vec4(1.0);
 // Cliffs: lifted by the low ground (ground_height.gdshaderinc), so the rock sits at the foot of
 // the terrace its cliff makes instead of riding up it.
 uniform bool ground_low = false;
@@ -123,6 +134,9 @@ uniform vec3 dust_color : source_color = vec3(0.5, 0.46, 0.38);
 uniform float desaturate = 0.15;
 uniform float value = 0.9;
 uniform float grain = 0.08;
+// Grain from the model's own Factorio picture (bark, rock: scripts/world/nature_looks.gd): 0 none,
+// else its layer of f3d_nature_grain + 1 plus how much of it shows (0-1): layer 2 at 0.8 is 3.8.
+uniform float nature_grain = 0.0;
 
 // The sprite projection: unused since the "sprite" model look was removed (sprite_cells = 0: none).
 uniform int sprite_cells = 0;
@@ -196,6 +210,21 @@ uniform vec3 rig_joint[12];
 uniform vec3 rig_swing[12];
 uniform vec3 rig_lift[12];
 uniform vec4 rig_gait[12];
+// Walking legs fold at a knee too (tools/models/creature_gait.py, fitted to Factorio's run sheets):
+// rig_knee is the knee in model space (xyz) and the leg's reach from the joint (w; 0: no knee), the
+// part from 0.45 to 0.57 of the reach out folding about the lift axis (creature_pose.py's PoseRig).
+// rig_bend: the walk's rest knee, its flex while the leg is lifted, and the rest lift (radians).
+uniform vec4 rig_knee[12];
+uniform vec4 rig_bend[12];
+// The body at rest on its bent legs: raised (x, tiles) and pitched (y, radians) about z up.
+uniform vec3 rig_body = vec3(0.0);
+// Poses the walking model blends into (creature_poses.json, the attack and corpse models' own,
+// fitted to the sprites): RIG_POSES poses of 12 limbs, each (swing, lift, knee). A posed instance
+// (creatures.gd: biting, spitting, dying) says which and how far in INSTANCE_CUSTOM.a: 2 + pose +
+// amount * RIG_POSE_SCALE; 1 (walking) is none. Its body is turned on the CPU.
+#define RIG_POSES 5
+const float RIG_POSE_SCALE = 0.999;
+uniform vec4 rig_pose[60];
 // rig_mode 3: a skeleton posed on the CPU (the character, character_pose.gd). UV.x is bone a +
 // 16 * bone b, UV.y a's weight; each bone's matrix is three rows (rotation | translation).
 uniform vec4 rig_bone[48];
@@ -203,6 +232,10 @@ uniform vec4 rig_bone[48];
 // tear: the neck follows more the higher it is. INSTANCE_CUSTOM.a (anim.gd): 0 folded into its
 // hole, 1 prepared (standing, swaying), up to 2 attacking (lunging forwards, -Z).
 uniform float worm_height = 1.0;
+// Factorio's alternative idle: 1 / prepared_alternative_speed (0.014) ticks long, at
+// prepared_alternative_chance (0.2).
+const float WORM_ALT_SECONDS = 1.0 / 0.014 / 60.0;
+const float WORM_ALT_CHANCE = 0.2;
 uniform float belt_speed = 0.0;
 // A textured belt surface: UV change per tile along the belt (model_library.gd _belt_uv_scroll).
 uniform vec2 belt_uv_scroll = vec2(0.0);
@@ -246,7 +279,7 @@ const float BELT_SMEAR_TO = 0.2;
 //   2  roughness, metallic, edge_metallic, ground_grime_height
 //   3  part_data (0 without part_colors), glow_flicker, glow_pulse, glow_rate
 //   4  ao_strength, streaks, desaturate, value
-//   5  grain, part_light, -
+//   5  grain, part_light, nature_grain (a skinned creature's second tint's alpha instead)
 //   6  part_weathering
 //   7-10  grime_color, edge_color, rust_color, dust_color (linear), and grime, edge_wear, rust, dust
 // One row's vec4s lie together (a cache line or two), and are read after the noise, which keeps
@@ -280,6 +313,29 @@ varying vec2 depth_uv;
 varying float depth_here;
 varying float depth_slack;
 varying vec4 part_col;
+#ifdef LEAF_CUT
+// How far this tree is dying of pollution: 0 healthy, then grey, thinner leaves, 1 bare.
+varying flat float leaf_dying;
+// The dark inside of a crown (tools/models/nature/trees.py SHADOWS, materials "leaf-shadow-..."),
+// drawn with the leaf cards' shader but not cut into leaves: it shows through the gaps between the
+// cards, so it goes as they fall, or a dying crown is left as black blocks (seen on the owner's base).
+// Merged with the cards into one surface (model_library.gd merge_materials) the cores' UV (-1) says
+// so instead, and solid leaves (UV -2) fall the same way (fragment(), leaf_kind).
+uniform bool leaf_core = false;
+// Factorio's own leaves on the cards (scripts/world/nature_looks.gd): an atlas of cells x cells patches
+// of the tree's leaves picture from the player's install, each texel its colour over the crown's mean
+// (gamma-space contrast, a mean of 1 over the leaves kept), halved; its alpha cut to a spray. 0 cells:
+// none (no Factorio install, or not read yet), and the leaves are cut procedurally (leaf_cut).
+uniform sampler2D leaf_atlas : filter_linear_mipmap, repeat_disable;
+uniform float leaf_atlas_cells = 0.0;
+uniform float leaf_atlas_texels = 36.0;  // a patch's width in texels
+// How much of the picture's own light and shade shows (1: all of it, 0: a flat colour).
+uniform float leaf_detail = 0.8;
+// The prototype's leaf colours over their mean: Factorio tints each tree with one of them at random.
+uniform vec3 leaf_tints[16];
+uniform int leaf_tint_count = 0;
+varying flat vec3 leaf_tint;
+#endif
 float hash13(vec3 p) {
 	p = mod(p, 4096.0);
 	p = fract(p * 0.1031);
@@ -329,14 +385,20 @@ float chips_mean(float edge) {
 // inside the spray's circle are kept, whole. Returns the leaf's shade (each leaf a little lighter
 // or darker, darker at its rim, like the sprites' leaves); discards between leaves. Far away,
 // where a leaf would be under a pixel and shimmer, the spray turns into a solid, ragged disk.
+// `dying` (pollution, leaf_dying): that share of the leaves has fallen, each leaf by its own hash so
+// the crown thins evenly, the far disk shrinks with it, and a dead tree (1) has none left.
 const float LEAF_CELLS = 5.0;
 
-float leaf_cut(vec2 uv, float seed, bool in_shadow) {
+float leaf_cut(vec2 uv, float seed, bool in_shadow, float dying) {
+	if (dying >= 0.98) {
+		discard;
+	}
+	float fallen = dying * 0.95;
 	vec2 g = uv * LEAF_CELLS;
 	vec2 cell = floor(g);
 	vec2 off = vec2(seed * 61.0, seed * 37.0);
 	vec2 q = uv * 2.0 - 1.0;
-	float disk = 0.78 + 0.18 * hash12(floor(g * 2.0) + off) - length(q);
+	float disk = 0.78 + 0.18 * hash12(floor(g * 2.0) + off) - length(q) - 0.6 * fallen;
 	// A crown's shadow doesn't show its leaves' small holes: the solid disk, without the 3x3 search.
 	if (in_shadow) {
 		if (disk <= 0.0) {
@@ -354,7 +416,8 @@ float leaf_cut(vec2 uv, float seed, bool in_shadow) {
 			float h3 = hash12(c + off + 41.7);
 			vec2 centre = c + 0.15 + 0.7 * vec2(h1, h2);
 			vec2 at = centre / LEAF_CELLS * 2.0 - 1.0;
-			if (dot(at, at) > 0.72 + 0.2 * h3) {
+			// The fallen leaf's hash only where pollution has taken some: nine of them a pixel otherwise.
+			if (dot(at, at) > 0.72 + 0.2 * h3 || (fallen > 0.0 && hash12(c + off + 71.3) < fallen)) {
 				continue;
 			}
 			float a = h3 * 6.2831853;
@@ -377,6 +440,49 @@ float leaf_cut(vec2 uv, float seed, bool in_shadow) {
 		discard;
 	}
 	return mix(shade * (0.7 + 0.3 * sqrt(clamp(cover, 0.0, 1.0))), 0.95, far_away);
+}
+
+// leaf_cut's average shade over a spray: the atlas's leaves are drawn as bright on the whole.
+const float LEAF_MEAN = 0.85;
+
+// leaf_cut with Factorio's leaves (leaf_atlas): the card wears one of the atlas's patches, picked
+// and turned a quarter at a time by its seed, cut where the patch has no leaf. One texture read
+// where leaf_cut searches nine cells. Returns the leaves' colour factor. Far away, where a leaf
+// would be a pixel or two, the same solid ragged spray as leaf_cut's; in the shadow pass that
+// spray alone.
+// `lod`: the atlas's mip a pixel takes (worked out at the top of fragment(), before any discard).
+vec3 leaf_atlas_cut(vec2 uv, float seed, bool in_shadow, float dying, float lod) {
+	if (dying >= 0.98) {
+		discard;
+	}
+	float fallen = dying * 0.95;
+	vec2 off = vec2(seed * 61.0, seed * 37.0);
+	float disk = 0.78 + 0.18 * hash12(floor(uv * 10.0) + off) - length(uv * 2.0 - 1.0) - 0.6 * fallen;
+	if (in_shadow) {
+		if (disk <= 0.0) {
+			discard;
+		}
+		return vec3(1.0);
+	}
+	float n = leaf_atlas_cells;
+	float k = floor(fract(seed * 7.137) * n * n);
+	float turn = floor(fract(seed * 3.71) * 4.0);
+	vec2 t = uv - 0.5;
+	t = turn < 0.5 ? t : (turn < 1.5 ? vec2(t.y, -t.x) : (turn < 2.5 ? -t : vec2(-t.y, t.x)));
+	t = clamp(t + 0.5, 0.5 / leaf_atlas_texels, 1.0 - 0.5 / leaf_atlas_texels);
+	vec2 auv = (vec2(mod(k, n), floor(k / n)) + t) / n;
+	// Coarser mips would shrink the cut (their alpha averages leaves with gaps): the far spray
+	// takes over instead.
+	vec4 s = textureLod(leaf_atlas, auv, clamp(lod, 0.0, 1.5));
+	// Leaves fallen to pollution: clumps of three texels, each by its own hash.
+	if (fallen > 0.0 && hash12(floor(auv * n * leaf_atlas_texels / 3.0) + 7.1) < fallen) {
+		discard;
+	}
+	float far_away = clamp((lod - 1.0) * 0.8, 0.0, 1.0);
+	if (mix(s.a - 0.5, disk, far_away) <= 0.0) {
+		discard;
+	}
+	return LEAF_MEAN * mix(vec3(1.0), mix(vec3(1.0), s.rgb * 2.0, leaf_detail), 1.0 - far_away);
 }
 #endif
 
@@ -457,6 +563,35 @@ global uniform float f3d_look_model_fill;
 global uniform float f3d_look_roughness_min;  // looks.gd "roughness_min": no surface shinier (a look's choice)
 // Seconds the last frame took (belt_blur.gd): how far a belt's surface moves between two frames.
 global uniform float f3d_frame_dt;
+// The grain layers (nature_looks.gd): each a tile of a bark's or rock's picture at Factorio's own 64
+// texels a tile, its colour over its own light a few texels round, halved; on once they are made.
+global uniform sampler2DArray f3d_nature_grain;
+global uniform float f3d_nature_grain_on;
+
+// A layer's grain read from the three sides the surface faces most (model space, mirrored every
+// tile so it never shows a seam), as a colour factor round 1.
+vec3 nature_grain_at(float code, vec3 p, vec3 n, vec3 dx, vec3 dy) {
+	float layer = floor(code) - 1.0;
+	float strength = fract(code);
+	vec3 w = n * n;
+	w *= w;
+	w /= max(w.x + w.y + w.z, 1e-5);
+	vec3 sum = vec3(0.0);
+	float used = 0.0;
+	// x-facing: (z, down); up-facing: (x, z); z-facing: (x, down). Bark's streaks run up the trunk.
+	vec2 q[3] = vec2[3](vec2(p.z, -p.y), p.xz, vec2(p.x, -p.y));
+	vec2 qx[3] = vec2[3](vec2(dx.z, -dx.y), dx.xz, vec2(dx.x, -dx.y));
+	vec2 qy[3] = vec2[3](vec2(dy.z, -dy.y), dy.xz, vec2(dy.x, -dy.y));
+	for (int i = 0; i < 3; i++) {
+		if (w[i] > 0.02) {
+			vec2 m = 1.0 - abs(fract(q[i] * 0.5) * 2.0 - 1.0);
+			sum += w[i] * textureGrad(f3d_nature_grain, vec3(m, layer), qx[i], qy[i]).rgb;
+			used += w[i];
+		}
+	}
+	vec3 g = sum / max(used, 1e-5) * 2.0;
+	return mix(vec3(1.0), g, strength);
+}
 uniform int anim_mode = 0;
 uniform int anim_wave = 0;
 uniform float anim_rate = 0.0;
@@ -690,6 +825,13 @@ void anim_vertex(inout vec3 v, inout vec3 n, vec4 c) {
 	}
 }
 
+// A point turned about a unit axis through the origin (Rodrigues).
+vec3 rig_turn(vec3 p, vec3 a, float angle) {
+	float c = cos(angle);
+	float s = sin(angle);
+	return p * c + cross(a, p) * s + a * dot(a, p) * (1.0 - c);
+}
+
 void vertex() {
 	vec4 icustom = INSTANCE_CUSTOM;
 #ifdef MOVER
@@ -760,6 +902,16 @@ void vertex() {
 #ifdef MOVER
 	if (mover) {
 		inst_seed = fract(ms.kind.x * 0.1591549 + 0.37);  // its own, not where it happens to be
+	}
+#endif
+#ifdef LEAF_CUT
+	// Pollution where the tree stands (scripts/world/pollution.gd), each tree a little ahead of or
+	// behind its neighbours, as Factorio's trees in one chunk don't all lose their leaves at once.
+	leaf_dying = clamp(pollution_at(origin).x * 1.3 - 0.3 * inst_seed, 0.0, 1.0);
+	// One of the prototype's colours per tree, by where it stands (not tied to its pollution lag).
+	leaf_tint = vec3(1.0);
+	if (leaf_tint_count > 0) {
+		leaf_tint = leaf_tints[clamp(int(fract(inst_seed * 13.37 + 0.21) * float(leaf_tint_count)), 0, leaf_tint_count - 1)];
 	}
 #endif
 	activity = glows && rig_mode != 4 ? clamp(f3d_glow >= 0.0 ? f3d_glow
@@ -850,8 +1002,20 @@ void vertex() {
 		float t = smoothstep(0.06 * h, 0.9 * h, VERTEX.y) * (1.0 - smoothstep(0.3 * h, 0.55 * h, length(VERTEX.xz)));
 		// Factorio's prepared loop: 9 frames forward then back, each way 1 / 0.024 ticks (0.7 Hz).
 		float phase = TIME * 0.72 * 6.2831853 + inst_seed * 6.2831853;
+		// Factorio's alternative idle (prepared_alternative_animation: 17 frames at 0.014, on a fifth of
+		// its loops): the head thrown back, horns spread and the mouth wide, then back. Here each worm's
+		// time runs in slots of that length, a fifth of them (by the slot and the worm) playing it.
+		float slot = (TIME + inst_seed * 37.0) / WORM_ALT_SECONDS;
+		float alt_on = step(fract(sin(floor(slot) * 12.9898 + inst_seed * 78.233) * 43758.5453), WORM_ALT_CHANCE);
+		float alt = alt_on * sin(fract(slot) * 3.14159265) * raised * (1.0 - attack);
+		// The head (horns round the mouth): closed over it folded, opening as it rises (Factorio's
+		// preparing frames), spread further in the alternative idle and while it spits.
+		float crown = smoothstep(0.78 * h, 0.98 * h, VERTEX.y);
+		float open = mix(0.78, 1.0, raised) + 0.22 * alt + 0.1 * attack;
 		// Folded: the neck sinks into the hole, leaving the head's crown above the ground.
 		vec3 p = VERTEX;
+		p.xz *= 1.0 + crown * (open - 1.0);
+		p.y += crown * alt * 0.04 * h;
 		p.y -= (1.0 - raised) * t * (p.y - 0.05 * h) * 0.82;
 		p.xz *= 1.0 + (1.0 - raised) * t * 0.25;
 		// Swaying while prepared. Attacking, it strikes forward over the starting attack and holds
@@ -859,7 +1023,7 @@ void vertex() {
 		// Factorio's lunge (worm-attack, last frames) bends it over until the mouth faces the
 		// target, the head about a third of its height off the ground: about a radian at the top.
 		float spit = sin(TIME * 15.0 + inst_seed * 6.2831853);
-		float bend = raised * (0.07 * sin(phase) * (1.0 - attack) + attack * (0.95 + 0.04 * spit));
+		float bend = raised * (0.07 * sin(phase) * (1.0 - attack) + attack * (0.95 + 0.04 * spit)) - 0.12 * alt;
 		float side = raised * 0.06 * sin(phase * 0.71 + 1.3);
 		float a = bend * t * t;
 		float b = side * t * t;
@@ -883,24 +1047,61 @@ void vertex() {
 		vec3 nb = vec3(dot(rig_bone[b], n), dot(rig_bone[b + 1], n), dot(rig_bone[b + 2], n));
 		VERTEX = mix(pb, pa, UV.y);
 		NORMAL = normalize(mix(nb, na, UV.y));
-	} else if (rig_mode > 0 && UV.x > 0.5 && UV.y > 0.0) {
-		int i = clamp(int(UV.x + 0.5) - 1, 0, 11);
-		float phase = rig_mode == 1 ? icustom.r : TIME * rig_rate * 6.2831853 + inst_seed * 6.2831853;
-		float gait = rig_mode == 1 ? clamp(icustom.g, 0.0, 1.0) : 1.0;
-		vec4 g = rig_gait[i];
-		float s = sin(phase + g.x);
-		float swing = g.y * s * gait * UV.y;
-		float lift = g.z * max(0.0, cos(phase + g.x)) * gait * UV.y;
-		vec3 p = VERTEX - rig_joint[i];
-		vec3 nn = NORMAL;
-		vec3 a = rig_lift[i];
-		p = p * cos(lift) + cross(a, p) * sin(lift) + a * dot(a, p) * (1.0 - cos(lift));
-		nn = nn * cos(lift) + cross(a, nn) * sin(lift) + a * dot(a, nn) * (1.0 - cos(lift));
-		a = rig_swing[i];
-		p = p * cos(swing) + cross(a, p) * sin(swing) + a * dot(a, p) * (1.0 - cos(swing));
-		nn = nn * cos(swing) + cross(a, nn) * sin(swing) + a * dot(a, nn) * (1.0 - cos(swing));
-		VERTEX = rig_joint[i] + p * (1.0 + g.w * (0.5 + 0.5 * s) * UV.y);
-		NORMAL = nn;
+	} else if (rig_mode > 0) {
+		// A walker biting, spitting or dying blends its legs into that pose (rig_pose) and leaves
+		// its walk's rest bend.
+		int pose = -1;
+		float pose_k = 0.0;
+		if (rig_mode == 1 && icustom.a > 1.5) {
+			float code = icustom.a - 2.0;
+			pose = clamp(int(floor(code)), 0, RIG_POSES - 1);
+			pose_k = clamp(fract(code) / RIG_POSE_SCALE, 0.0, 1.0);
+		}
+		if (UV.x > 0.5 && UV.y > 0.0) {
+			int i = clamp(int(UV.x + 0.5) - 1, 0, 11);
+			float phase = rig_mode == 1 ? icustom.r : TIME * rig_rate * 6.2831853 + inst_seed * 6.2831853;
+			float gait = rig_mode == 1 ? clamp(icustom.g, 0.0, 1.0) : 1.0;
+			vec4 g = rig_gait[i];
+			vec4 bend = rig_bend[i];
+			float s = sin(phase + g.x);
+			float up = max(0.0, cos(phase + g.x));
+			// Swung forward and back; lifted and folded at the knee while it steps.
+			float swing = g.y * s * gait;
+			float lift = bend.z + g.z * up * gait;
+			float knee = bend.x + bend.y * up * gait;
+			if (pose >= 0) {
+				vec4 at = rig_pose[pose * 12 + i];
+				swing = mix(swing, at.x, pose_k);
+				lift = mix(lift, at.y, pose_k);
+				knee = mix(knee, at.z, pose_k);
+			}
+			vec3 p = VERTEX - rig_joint[i];
+			vec3 nn = NORMAL;
+			vec3 a = rig_lift[i];
+			vec4 kp = rig_knee[i];
+			if (kp.w > 0.0 && knee != 0.0) {
+				vec3 k = kp.xyz - rig_joint[i];
+				float fold = knee * smoothstep(0.45 * kp.w, 0.57 * kp.w, length(p));
+				p = k + rig_turn(p - k, a, fold);
+				nn = rig_turn(nn, a, fold);
+			}
+			p = rig_turn(p, a, lift * UV.y);
+			nn = rig_turn(nn, a, lift * UV.y);
+			a = rig_swing[i];
+			p = rig_turn(p, a, swing * UV.y);
+			nn = rig_turn(nn, a, swing * UV.y);
+			VERTEX = rig_joint[i] + p * (1.0 + g.w * (0.5 + 0.5 * s) * UV.y);
+			NORMAL = nn;
+		}
+		if (rig_mode == 1 && rig_body != vec3(0.0)) {
+			// Standing on its bent legs: the whole model raised and pitched as creature_gait.py fitted
+			// it, gone in a pose (whose body creatures.gd turns).
+			float k = 1.0 - pose_k;
+			vec3 pivot = vec3(0.0, rig_body.z, 0.0);
+			VERTEX = pivot + rig_turn(VERTEX - pivot, vec3(1.0, 0.0, 0.0), rig_body.y * k);
+			NORMAL = rig_turn(NORMAL, vec3(1.0, 0.0, 0.0), rig_body.y * k);
+			VERTEX.y += rig_body.x * k;
+		}
 	}
 	// Machines' moving parts, also after the sprite was projected from the rest pose.
 	if (anim_mode == 8 && timed) {
@@ -941,6 +1142,13 @@ void fragment() {
 	// leave neighbouring pixels' derivatives undefined).
 	vec3 obj_step = fwidth(obj_pos);
 	float pixel = max(obj_step.x, max(obj_step.y, obj_step.z));
+	// The bark's and rock's grain is read along the three axes (nature_grain): their derivatives too.
+	vec3 obj_dx = dFdx(obj_pos);
+	vec3 obj_dy = dFdy(obj_pos);
+#ifdef LEAF_CUT
+	vec2 leaf_tx = UV * leaf_atlas_texels;
+	float leaf_lod = log2(max(max(length(dFdx(leaf_tx)), length(dFdy(leaf_tx))), 1e-4));
+#endif
 	// A level of detail cross-fading (f3d_lod_fade): a 4x4 Bayer screen door. Shadows stay whole
 	// (the level fading out casts none).
 	if (f3d_lod_fade != 1.0 && !IN_SHADOW_PASS) {
@@ -954,7 +1162,35 @@ void fragment() {
 		}
 	}
 #ifdef LEAF_CUT
-	float leaf_shade = leaf_cut(UV, UV2.y, IN_SHADOW_PASS);
+	float leaf_shade = 1.0;
+	vec3 leaf_rgb = vec3(1.0);
+	// What this surface is: a crown's dark core (leaf_core, or UV -1 where the cores share the
+	// cards' merged surface), solid leaves (UV -2: tree-06's strands) or leaf cards (UV 0-1; the
+	// models' layout, tools/models/nature/plain_geo.py).
+	float leaf_kind = leaf_core ? 1.0 : (UV.x < -1.5 ? 2.0 : (UV.x < -0.5 ? 1.0 : 0.0));
+	if (leaf_kind > 0.5) {
+		// Thins out with the leaves round it, a 4x4 screen door (as the levels' cross-fade): a core
+		// is gone before the crown is bare, solid leaves as the last leaves fall; their shadow goes
+		// at once half way.
+		float gone = leaf_kind > 1.5 ? smoothstep(0.05, 0.95, leaf_dying) : smoothstep(0.1, 0.6, leaf_dying);
+		if (IN_SHADOW_PASS) {
+			if (gone >= 0.5) {
+				discard;
+			}
+		} else if (gone > 0.0) {
+			int cx = int(FRAGCOORD.x) & 3;
+			int cy = int(FRAGCOORD.y) & 3;
+			int ca = cx ^ cy;
+			int cb = ((ca & 1) << 3) | ((cy & 1) << 2) | (ca & 2) | ((cy & 2) >> 1);
+			if ((float(cb) + 0.5) / 16.0 < gone) {
+				discard;
+			}
+		}
+	} else if (leaf_atlas_cells > 0.0) {
+		leaf_rgb = leaf_atlas_cut(UV, UV2.y, IN_SHADOW_PASS, leaf_dying, leaf_lod);
+	} else {
+		leaf_shade = leaf_cut(UV, UV2.y, IN_SHADOW_PASS, leaf_dying);
+	}
 	// Both sides are drawn and lit by the crown's normal the card carries (Godot flips it on the
 	// back side: flipped back).
 	if (!FRONT_FACING) {
@@ -1002,16 +1238,24 @@ void fragment() {
 	float m_desat = desaturate;
 	float m_value = value;
 	float m_grain = grain;
+	float m_nature = nature_grain;
 	vec2 m_light = part_light;
 	vec4 m_grime = vec4(grime_color, grime);
 	vec4 m_edge = vec4(edge_color, edge_wear);
 	vec4 m_rust = vec4(rust_color, rust);
 	vec4 m_dust = vec4(dust_color, dust);
+	int m_skin = skin_mode;
+	vec4 m_tint2 = skin_tint2;
 	if (merged) {
 		int r = mat_row * MATERIAL_ROW;
 		m_albedo = material_table[r];
 		vec4 e = material_table[r + 1];
 		m_emission = e.rgb;
+		m_skin = row_flag(e.w, 16.0) ? 1 : (row_flag(e.w, 32.0) ? 2 : 0);
+		if (m_skin > 0) {
+			m_tint2 = vec4(m_skin == 1 ? e.rgb : vec3(0.0), material_table[r + 5].w);
+			m_emission = vec3(0.0);
+		}
 		m_glow = row_flag(e.w, 1.0);
 		m_fades = row_flag(e.w, 2.0);
 		m_belt = m_belt && row_flag(e.w, 4.0);
@@ -1033,6 +1277,7 @@ void fragment() {
 		m_value = t.w;
 		vec4 l = material_table[r + 5];
 		m_grain = l.x;
+		m_nature = m_skin > 0 ? 0.0 : l.w;  // 5.w is a skinned creature's tint alpha instead
 		m_light = l.yz;
 		m_wear = material_table[r + 6];
 		m_grime = material_table[r + 7];
@@ -1091,7 +1336,22 @@ void fragment() {
 		discard;
 	}
 #endif
+	if (m_skin == 1) {
+		// Factorio's two mask layers: the first (all of the carapace) tinted by tint 1, the second
+		// over it where it covers (times tint 2's alpha) tinted by tint 2.
+		part_rgb = mix(part_rgb.r * m_albedo.rgb, part_rgb.g * m_tint2.rgb, clamp(part_rgb.b * m_tint2.a, 0.0, 1.0));
+	} else if (m_skin == 2) {
+		// One mask over the part's own colour: its shade (COLOR.r = sqrt(shade / 4)) tinted by tint 1,
+		// covering COLOR.g of it (times the tint's alpha, in skin_tint2's). COLOR is the mask's data
+		// here, not a shading.
+		float shade = 4.0 * COLOR.r * COLOR.r;
+		part_rgb = mix(part_rgb, shade * m_albedo.rgb, clamp(COLOR.g * m_tint2.a, 0.0, 1.0));
+		tint = vec3(1.0);
+	}
 	vec3 col = mix(m_albedo.rgb, part_rgb, pc) * tint * model_tint;
+	if (m_nature > 0.5 && f3d_nature_grain_on > 0.5) {
+		col *= nature_grain_at(m_nature, obj_pos, n, obj_dx, obj_dy);
+	}
 	vec4 wear = mix(vec4(1.0), m_wear, pc);
 	// Part colours are the sprite's paint as it looks, metal and all: drawn mostly as diffuse paint
 	// (as the projected sprite is), or the sky's reflection would grey them.
@@ -1285,7 +1545,13 @@ void fragment() {
 	ALBEDO = col * mix(1.0, shade, 0.65);
 	ALBEDO *= mix(vec3(1.0), f3d_paint * 1.4, 0.6 * step(dot(f3d_paint, vec3(1.0)), 2.99) * step(f3d_paint_from, obj_pos.y));
 #ifdef LEAF_CUT
-	ALBEDO *= leaf_shade;
+	ALBEDO *= leaf_shade * leaf_rgb * leaf_tint;
+	// Polluted trees as Factorio draws them: first greyed, then the grey-brown of dead leaves.
+	if (leaf_dying > 0.0) {
+		float lum = dot(ALBEDO, vec3(0.3, 0.59, 0.11));
+		vec3 grey = mix(ALBEDO, vec3(lum), smoothstep(0.0, 0.45, leaf_dying));
+		ALBEDO = mix(grey, lum * vec3(1.2, 0.98, 0.66), smoothstep(0.3, 0.8, leaf_dying));
+	}
 #endif
 	float up = clamp((INV_VIEW_MATRIX * vec4(NORMAL, 0.0)).y, 0.0, 1.0);
 	ALBEDO *= mix(1.0, mix(m_light.x, m_light.y, up), pc * (1.0 - sprite_w));

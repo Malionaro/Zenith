@@ -15,6 +15,8 @@ extends SceneTree
 ## --cam=x,z the camera leads it (view_priority.gd: an add-on's camera, first person, the remote view):
 ## a camera 12 tiles above (x, z + 10) looking north and down, drifting 0.1 tile east a job, so the cap
 ## is worked out again as it moves (tools/belt_draw_diff.py checks both records paths agree).
+## --view=x,z,w,h: the camera's ground view the records are planned for (else everything is in view), moved
+## --view-drift=dx tiles east a job, so items park and are planned again as it goes (--belt-draw-view).
 ## --dump writes, for the first compared update at or after TICK, every game item on a simulated lane
 ## and every simulated item as {"game": {uid: [lane, pos]}, "sim": {uid: [lane, pos]}}.
 ## --view-dump=<out.jsonl> (tools/belt_view_check.py): a line per compared update (every
@@ -47,7 +49,7 @@ class DiagJob extends BeltItems.Job:
 		# job, State.later, with what happens to that item after it.)
 		var now := floori(fold_tick)
 		var held := {}
-		for e: Array in state.later:
+		for e: Array in state.later_entries():
 			if int(e[2]) > now or held.has(e[1]):
 				held[e[1]] = true
 			elif int(e[0]) == 0:
@@ -121,6 +123,7 @@ func _initialize() -> void:
 	# compared. Without it a job per update, at its tick.
 	var every_tick := false
 	var lag := -1
+	var job_every := 1  # --job-every=N (with --every-tick): a job every N ticks instead
 	# --oracle-at=TICK: at the first recorded tick at or after it, every recorded lane is read (its items as
 	# the recording has them, as `sl`), so the simulation starts from the game's state there. --reads-after=
 	# none: after that tick no lane reads (`sl`, nor answers to `bre`) are applied: the simulation alone.
@@ -142,13 +145,24 @@ func _initialize() -> void:
 	# Off by default: a live capture already holds the bridge's answers to the live client's asks, so
 	# answering again from the recording read lanes the live client never got.
 	var replay_bre := false
+	# --ie-late=N: the inserters' events (`ie`) reach the job with the update N after the one they followed
+	# in the capture (0: with that one, as captured): events late on the wire, the reads they explain first.
+	var ie_late := 0
+	# --ie-wire=T: each `ie` message reaches the job with the first update sent T ticks or more after it (0: the
+	# update of its own tick or the next one, which is when a client that works an update out as it comes has
+	# it; the capture's own order hands an event to the update before it, up to a period early).
+	var ie_wire := -1
 	# --sim-dump=<file> (scratchpad attribution): a line per compared tick, "tick uid,key,pos ..." of every
 	# simulated item. --drop-dump=<file>: belt_sim.gd's drop_log ("tick uid key why" a line: each item a read
 	# took off), forcing belt_sim.gd and --read-probe.
 	var sim_dump: FileAccess = null
+	var sim_dump_near := false  # --sim-dump-near (with --sim-dump)
+	var fronts_trace := PackedInt64Array()  # --fronts-trace=K1,K2,...: each job, lane_fronts of these lanes (both modes)
 	var drop_dump := ""
 	var cap := -1
 	var cam: Camera3D = null
+	var view_rect := Rect2()  # (--view) the camera's ground view the records are planned for, drifting view_drift a job
+	var view_drift := 0.0
 	for a in OS.get_cmdline_user_args():
 		if a.begins_with("--stream="):
 			stream = a.substr(9)
@@ -176,6 +190,11 @@ func _initialize() -> void:
 			view_dump = a.substr(12)
 		elif a.begins_with("--view-every="):
 			view_every = maxi(1, int(a.substr(13)))
+		elif a == "--sim-dump-near":
+			sim_dump_near = true
+		elif a.begins_with("--fronts-trace="):
+			for x in a.substr(15).split(","):
+				fronts_trace.append(int(x))
 		elif a.begins_with("--sim-dump="):
 			sim_dump = FileAccess.open(a.substr(11), FileAccess.WRITE)
 		elif a.begins_with("--drop-dump="):
@@ -201,16 +220,27 @@ func _initialize() -> void:
 			hold_emu = true
 		elif a == "--replay-bre":
 			replay_bre = true
+		elif a.begins_with("--ie-late="):
+			ie_late = int(a.substr(10))
+		elif a.begins_with("--ie-wire="):
+			ie_wire = int(a.substr(10))
 		elif a.begins_with("--confirm-emu="):
 			confirm_emu = a.substr(14)
 		elif a.begins_with("--cap="):
 			cap = int(a.substr(6))
+		elif a.begins_with("--view="):
+			var vr := a.substr(7).split(",")
+			view_rect = Rect2(float(vr[0]), float(vr[1]), float(vr[2]), float(vr[3]))
+		elif a.begins_with("--view-drift="):
+			view_drift = float(a.substr(13))
 		elif a.begins_with("--cam="):
 			var ca := a.substr(6).split(",")
 			cam = Camera3D.new()
 			cam.fov = 50.0
 			root.add_child(cam)
 			cam.global_transform = Transform3D(Basis(Vector3.RIGHT, -deg_to_rad(50.0)), Vector3(float(ca[0]), 12.0, float(ca[1]) + 10.0))
+		elif a.begins_with("--job-every="):
+			job_every = maxi(1, int(a.substr(12)))
 		elif a == "--every-tick" or a.begins_with("--every-tick="):
 			every_tick = true
 			if a.length() > 13:
@@ -263,6 +293,8 @@ func _initialize() -> void:
 	# The stream's updates, parts together.
 	var updates: Array = []
 	var cur: Array = []
+	var late: Array = []  # (--ie-late) [update index, `ie` message]
+	var wire: Array = []  # (--ie-wire) [the tick it reaches the client, `ie` message]
 	var cur_k := -1
 	var f := FileAccess.open(stream, FileAccess.READ)
 	while not f.eof_reached():
@@ -270,6 +302,16 @@ func _initialize() -> void:
 		if line.is_empty():
 			continue
 		var msg = JSON.parse_string(line)
+		if msg is Dictionary and msg.get("t") == "ie" and not cur.is_empty():
+			# (--inserter-handoff: the hands' events with the update before them; --ie-late=N: with the
+			# update N after it, as events that reach the client after the reads they explain.)
+			if ie_wire >= 0:
+				wire.append([int(msg.get("k", 0)) + ie_wire, msg])
+			elif ie_late > 0:
+				late.append([updates.size() + ie_late, msg])
+			else:
+				cur.append(msg)
+			continue
 		if not (msg is Dictionary) or msg.get("t") != "bs":
 			continue
 		var k := int(msg.get("k", 0))
@@ -280,6 +322,16 @@ func _initialize() -> void:
 		cur.append(msg)
 	if not cur.is_empty():
 		updates.append(cur)
+	for e: Array in late:
+		if int(e[0]) < updates.size():
+			(updates[int(e[0])] as Array).append(e[1])
+	# (--ie-wire) Each event message with the first update sent on or after the tick it reached the client.
+	var wi := 0
+	for e: Array in wire:
+		while wi < updates.size() and int(updates[wi][0].get("k", 0)) < int(e[0]):
+			wi += 1
+		if wi < updates.size():
+			(updates[wi] as Array).append(e[1])
 	print("stream: %d updates" % updates.size())
 	var vf: FileAccess = null
 	var view_last := ""  # the last compared update's line, written at the end unless written already
@@ -319,12 +371,15 @@ func _initialize() -> void:
 			at.append(uk - (lag if lag >= 0 else int(u2[0].get("p", 1)) + 3))
 		var last_t: int = maxi(int(ks.back()), int(game.keys().max()))
 		var ni := 0
+		var us: Array = []
 		for t in range(int(at[0]), last_t + 1):
-			var us: Array = []
 			while ni < ks.size() and int(at[ni]) <= t:
 				us.append(ni)
 				ni += 1
-			steps.append([t, us])
+			# (--job-every=N: a job every N ticks, as a busy client's, with the updates since the last.)
+			if job_every <= 1 or (t - int(at[0])) % job_every == 0 or t == last_t:
+				steps.append([t, us])
+				us = []
 		cmp_until = int(at.back()) + int(updates.back()[0].get("p", 1))
 		if cmp_until < int(game.keys().max()):
 			print("every tick: the capture ends before the recording: compared up to tick %d" % cmp_until)
@@ -338,6 +393,9 @@ func _initialize() -> void:
 	var full := false
 	var last_ui := 0
 	var cost := [0, 0, 0, 0, 0, 0]  # jobs on recorded ticks: count, usec, records written, renewed, changes, records usec
+	var near_ticks: Array = game.keys()  # (--sim-dump-near)
+	near_ticks.sort()
+	var near_i := 0
 	var last_ct := -1  # the tick compared last (the simulation standing at the newest update isn't compared twice)
 	var prev_st: Array = []  # the simulation's items as the job before left it, at tick prev_t
 	var prev_t := -1
@@ -478,6 +536,10 @@ func _initialize() -> void:
 				print("oracle: %d recorded lanes closed (all they lead on into recorded)" % closed.size())
 		if read_probe and state.sim is BeltSim:
 			state.sim.probe_reads = k >= probe_from
+		if view_rect.size.x > 0.0:
+			view_rect.position.x += view_drift
+			job.view = view_rect
+			job.view_all = false
 		job.fold_tick = float(k)
 		job.now_msec = k * 16
 		job.run()
@@ -501,6 +563,25 @@ func _initialize() -> void:
 		# it), and (--drawn-check) at the end, the simulation's tick now, with the simulation now.
 		var now_st: Array = state.sim.items_state()
 		var now_t := int(state.sim.tick)
+		if not fronts_trace.is_empty():
+			var f0t: PackedInt32Array = state.sim.lane_fronts(fronts_trace, 0)
+			var f1t: PackedInt32Array = state.sim.lane_fronts(fronts_trace, 1)
+			for qt in fronts_trace.size():
+				print("fronts %d %d front %d v0 %d v1 %d n %d" % [now_t, fronts_trace[qt], f0t[qt * 3], f0t[qt * 3 + 1], f1t[qt * 3 + 1], f0t[qt * 3 + 2]])
+		# (--sim-dump-near: the simulation's items at its first tick at or after each recorded tick, as
+		# "tick uid,key,pos ...": a recording made every N ticks seldom has the simulation's own ticks.)
+		if sim_dump != null and sim_dump_near:
+			while near_i < near_ticks.size() and int(near_ticks[near_i]) <= now_t:
+				if now_t - int(near_ticks[near_i]) <= 6:
+					var parts0 := PackedStringArray()
+					parts0.append(str(now_t))
+					var su0: PackedInt64Array = now_st[0]
+					var sk0: PackedInt64Array = now_st[1]
+					var sp0: PackedInt32Array = now_st[2]
+					for i0 in su0.size():
+						parts0.append("%d,%d,%d" % [su0[i0], sk0[i0], sp0[i0]])
+					sim_dump.store_line(" ".join(parts0))
+				near_i += 1
 		var st: Array = now_st
 		# (The simulation stepped past k, ahead of the drawn clock (--belt-sim-ahead), and not at k after the
 		# job before either: compared at its own tick, where the recording has it.)

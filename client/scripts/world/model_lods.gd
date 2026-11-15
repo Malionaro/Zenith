@@ -75,6 +75,8 @@ const ARRAYS_META := &"f3d_arrays"
 ## Meta on a model's merged material: its rows' materials (material_rows.gd).
 const ROWS_META := &"f3d_rows"
 const ROW_EDITED_META := &"f3d_row_edited"
+## The leaf cards' shader (model_library.gd): a tree's crown, which casts its own stand-in (crown_arrays).
+const LeafShader := preload("res://shaders/factorio_material_leaf.gdshader")
 
 
 ## A surface's arrays, from the CPU copy when the mesh has one: a deep copy, safe to change (the
@@ -144,13 +146,28 @@ class Job:
 	var levels_done := false
 	## A model with its own textures: its surfaces simplified with their UVs (see the header).
 	var textured := false
+	## A tree's crown (its surfaces in the leaf cards' shader, by index in `surfaces`; their own
+	## leaf_core flag): cast by the stand-in's second surface, which drops what pollution took
+	## (crown_arrays, shadow_stand_in_leaf.gdshader). Welded in with the wood, a bare tree cast its
+	## whole crown's shadow.
+	var crown: Dictionary = {}
+	var crown_vertices := PackedVector3Array()
+	var crown_uvs := PackedVector2Array()
 
 	func run() -> void:
 		if not proxy:
 			for s in surfaces:
 				surface_lods.append(ModelLodsMath.surface_lods(s[0], s[1], s[2], s[3]))
 			return
-		var welded := ModelLodsMath.weld(surfaces)
+		var wood: Array = []
+		for i in surfaces.size():
+			if crown.has(i):
+				crown_arrays(surfaces[i][4], bool(crown[i]), crown_vertices, crown_uvs)
+			else:
+				wood.append(surfaces[i])
+		if wood.is_empty():
+			return
+		var welded := ModelLodsMath.weld(wood)
 		vertices = welded[0]
 		indices = welded[1]
 		var sign := 1.0
@@ -172,6 +189,55 @@ class Job:
 	func run_levels() -> void:
 		levels = ModelLodsMath.levels(surfaces, surface_lods, textured)
 		levels_done = true
+
+	## How much of a leaf card's square its shadow covers: the round spray leaf_cut casts
+	## (factorio_material.gdshaderinc, in the shadow pass: radius 0.78-0.96 of the half side, about
+	## 0.59 of the square's area) as a square of the same area.
+	const CARD_SHADOW := 0.77
+
+	## A crown surface's triangles for its shadow stand-in (Job.run, on a worker): their positions, a
+	## card's corners drawn in to CARD_SHADOW of the way from its middle, and per vertex (the card's
+	## seed, its kind) for shadow_stand_in_leaf.gdshader: 0 a leaf card, 1 a crown's core (UV -1, or a
+	## surface whose material says leaf_core: `all_core`), 2 solid leaves (UV -2: tree-06's strands).
+	static func crown_arrays(arrays: Array, all_core: bool, out_v: PackedVector3Array, out_uv: PackedVector2Array) -> void:
+		var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+		var uvs := PackedVector2Array()
+		if arrays[Mesh.ARRAY_TEX_UV] != null:
+			uvs = arrays[Mesh.ARRAY_TEX_UV]
+		var seeds := PackedVector2Array()
+		if arrays[Mesh.ARRAY_TEX_UV2] != null:
+			seeds = arrays[Mesh.ARRAY_TEX_UV2]
+		var index := PackedInt32Array()
+		if arrays[Mesh.ARRAY_INDEX] != null:
+			index = arrays[Mesh.ARRAY_INDEX]
+		else:
+			for i in verts.size():
+				index.append(i)
+		for t in range(0, index.size() - 2, 3):
+			var k := [index[t], index[t + 1], index[t + 2]]
+			var kind := 1.0 if all_core else 0.0
+			if not all_core and uvs.size() == verts.size():
+				var u0: float = uvs[k[0]].x
+				kind = 2.0 if u0 < -1.5 else (1.0 if u0 < -0.5 else 0.0)
+			var seed: float = seeds[k[0]].y if seeds.size() == verts.size() else 0.0
+			var p := [verts[k[0]], verts[k[1]], verts[k[2]]]
+			if kind == 0.0 and uvs.size() == verts.size():
+				# The card's middle from the triangle's map of UV to position (p = middle + (u - 0.5) X + (v - 0.5) Y).
+				var e1: Vector3 = p[1] - p[0]
+				var e2: Vector3 = p[2] - p[0]
+				var d1: Vector2 = uvs[k[1]] - uvs[k[0]]
+				var d2: Vector2 = uvs[k[2]] - uvs[k[0]]
+				var det := d1.x * d2.y - d1.y * d2.x
+				if absf(det) > 1e-8:
+					var ax := (e1 * d2.y - e2 * d1.y) / det
+					var ay := (e2 * d1.x - e1 * d2.x) / det
+					var uv0: Vector2 = uvs[k[0]]
+					var middle: Vector3 = p[0] - ax * (uv0.x - 0.5) - ay * (uv0.y - 0.5)
+					for c in 3:
+						p[c] = middle + (p[c] - middle) * CARD_SHADOW
+			for c in 3:
+				out_v.append(p[c])
+				out_uv.append(Vector2(seed, kind))
 
 
 ## The arithmetic, apart so the jobs above read plainly. Static: it runs on worker threads.
@@ -788,6 +854,7 @@ static var lod_models := 0
 ## Main-thread time spent here (for --stutter-probe).
 static var main_usec := 0
 static var _material: ShaderMaterial
+static var _leaf_material: ShaderMaterial
 ## The stand-ins' GeometryInstance3D.lod_bias away from the character (Level of detail setting,
 ## QUALITY's second value). Godot picks their LOD in the shadow pass by the main camera's distance, in
 ## screen pixels: the error allowed is mesh_lod_threshold / lod_bias pixels. It was 0.25 and 0.15
@@ -812,7 +879,8 @@ static var view_lods := true
 ## The stand-ins' bias gives their shadows' error on screen: High 1 px, Medium 2 px, Low 8 px (the
 ## view's threshold over the bias). Their shadows are drawn once a frame and the error still grows with
 ## distance in tiles, so far chunks and long zooms stay cheap; the Shadows setting decides the rest.
-const QUALITY := {"high": [1.0, 1.0], "medium": [4.0, 2.0], "low": [4.0, 0.5]}
+## The third value is max_lines.
+const QUALITY := {"high": [1.0, 1.0, 1440.0], "medium": [4.0, 2.0, 1440.0], "low": [4.0, 0.5, 1080.0]}
 ## Before that (--legacy-render, the stutter probe's "legacy render").
 const LEGACY_THRESHOLDS := {"high": 1.0, "medium": 2.0, "low": 4.0}
 static var _legacy := "--legacy-render" in OS.get_cmdline_user_args()
@@ -889,6 +957,26 @@ static func material() -> ShaderMaterial:
 	return _material
 
 
+## A tree crown's stand-in material: as material(), dropping the leaves and cores pollution took
+## (shaders/shadow_stand_in_leaf.gdshader), as the crown itself drops them.
+static func leaf_material() -> ShaderMaterial:
+	if _leaf_material == null:
+		_leaf_material = ShaderMaterial.new()
+		_leaf_material.shader = preload("res://shaders/shadow_stand_in_leaf.gdshader")
+	return _leaf_material
+
+
+## Whether a material draws leaf cards (a merged one: any of its rows).
+static func _has_cards(sm: ShaderMaterial) -> bool:
+	if sm.resource_name.begins_with("leafcard"):
+		return true
+	if sm.has_meta(ROWS_META):
+		for row: Material in sm.get_meta(ROWS_META):
+			if row != null and row.resource_name.begins_with("leafcard"):
+				return true
+	return false
+
+
 static func _job_for(mesh: ArrayMesh) -> Job:
 	if mesh == null:
 		return null
@@ -904,9 +992,11 @@ static func _job_for(mesh: ArrayMesh) -> Job:
 		# A tree's crown is many separate leaf cards, which simplifying merges into other shapes, so
 		# each LOD switch as the camera moved relit whole crowns (flicker). Trees keep their own
 		# mesh in view; their shadow stand-in still simplifies.
-		if sm != null and sm.resource_name.begins_with("leafcard"):
+		if sm != null and _has_cards(sm):
 			job.view_lods = false
 			job.proxy_lods = false
+		if sm != null and sm.shader == LeafShader:
+			job.crown[job.surfaces.size()] = sm.get_shader_parameter("leaf_core") == true
 		if mesh.surface_get_primitive_type(i) != Mesh.PRIMITIVE_TRIANGLES:
 			return null
 		var arrays := arrays_of(mesh, i)
@@ -952,14 +1042,22 @@ static func poll() -> bool:
 		var job: Job = entry[1]
 		var proxy: ArrayMesh = entry[2]
 		var kind := ""
-		if proxy != null and job.indices.size() >= 3:
-			var arrays := []
-			arrays.resize(Mesh.ARRAY_MAX)
-			arrays[Mesh.ARRAY_VERTEX] = job.vertices
-			arrays[Mesh.ARRAY_NORMAL] = job.normals
-			arrays[Mesh.ARRAY_INDEX] = job.indices
-			proxy.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays, [], job.lods)
-			proxy.surface_set_material(0, material())
+		if proxy != null and (job.indices.size() >= 3 or job.crown_vertices.size() >= 3):
+			if job.indices.size() >= 3:
+				var arrays := []
+				arrays.resize(Mesh.ARRAY_MAX)
+				arrays[Mesh.ARRAY_VERTEX] = job.vertices
+				arrays[Mesh.ARRAY_NORMAL] = job.normals
+				arrays[Mesh.ARRAY_INDEX] = job.indices
+				proxy.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays, [], job.lods)
+				proxy.surface_set_material(proxy.get_surface_count() - 1, material())
+			if job.crown_vertices.size() >= 3:
+				var crown := []
+				crown.resize(Mesh.ARRAY_MAX)
+				crown[Mesh.ARRAY_VERTEX] = job.crown_vertices
+				crown[Mesh.ARRAY_TEX_UV] = job.crown_uvs
+				proxy.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, crown)
+				proxy.surface_set_material(proxy.get_surface_count() - 1, leaf_material())
 			_ready[proxy] = true
 			done = true
 			kind = "proxy"
@@ -1052,9 +1150,43 @@ static func finish_all() -> void:
 ## Settings > Graphics > Level of detail.
 static func apply_quality(quality: String, viewport: Viewport) -> void:
 	var q: Array = QUALITY.get(quality, QUALITY["high"])
-	if viewport != null:
-		viewport.mesh_lod_threshold = float(LEGACY_THRESHOLDS.get(quality, 1.0)) if _legacy else q[0]
-		if full_detail:
-			viewport.mesh_lod_threshold = 0.0
 	lod_bias = q[1]
 	lod_threshold = q[0]
+	max_lines = float(q[2])
+	for arg in OS.get_cmdline_user_args():
+		if arg.begins_with("--lod-lines="):
+			max_lines = maxf(float(arg.get_slice("=", 1)), 0.0)
+	_quality = quality
+	fit_lines(viewport)
+
+
+## The most lines a picture is counted as when pixels of error become tiles (world.gd _update_lods,
+## the shadow stand-ins through Viewport.mesh_lod_threshold) and when ao_zoom.gd measures tiles a
+## pixel: a taller one is counted as this tall, so a model switches at the size on screen it does at
+## 1440p and 4K doesn't keep detail twice as far (belt_lods.gd's MAX_LINES does the same for belts).
+## At 4K the owner's base drew 4.4-4.9 million triangles in a 45-tile view: a pixel of error there is
+## half a 1080p one. By Level of detail (QUALITY's third value): High and Medium 1440, Low 1080.
+## --lod-lines=<n> sets it whatever the setting (0: every real line, as before 0.2.1).
+static var max_lines := 1440.0
+static var _quality := "medium"
+
+
+## `lines` as the levels of detail count them (max_lines), at least 1.
+static func counted_lines(lines: float) -> float:
+	return maxf(minf(lines, max_lines) if max_lines > 0.0 else lines, 1.0)
+
+
+## Viewport.mesh_lod_threshold for the Level of detail setting and the window's height: Godot measures
+## its error in the viewport's real pixels, so on a picture taller than max_lines it is allowed that
+## many times more of them. main.gd calls it again when the window changes size.
+static func fit_lines(viewport: Viewport) -> void:
+	if viewport == null:
+		return
+	var q: Array = QUALITY.get(_quality, QUALITY["high"])
+	if full_detail:
+		viewport.mesh_lod_threshold = 0.0
+	elif _legacy:
+		viewport.mesh_lod_threshold = float(LEGACY_THRESHOLDS.get(_quality, 1.0))
+	else:
+		var lines := float((viewport as Window).size.y) if viewport is Window else viewport.get_visible_rect().size.y
+		viewport.mesh_lod_threshold = float(q[0]) * maxf(lines, 1.0) / counted_lines(lines)

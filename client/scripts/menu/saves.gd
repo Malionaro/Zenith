@@ -1,28 +1,32 @@
 extends RefCounted
-## The saves the world selection lists: the server's (server/saves/*.zip) and Factorio's own
-## (%APPDATA%\Factorio\saves, loaded as a copy so the original is never touched). Factorio's
-## saves carry a preview.jpg inside the zip; the headless server's don't.
+## The saves the world selection lists: the server's (server/saves/*.zip), in a checkout also those
+## of Zenith's downloads in the user folder (Paths.download_saves_dir()), and Factorio's own
+## (%APPDATA%\Factorio\saves). Saves from outside the server's folder are loaded as a copy, so the
+## original is never touched. Factorio's saves carry a preview.jpg inside the zip; the headless
+## server's don't.
 
 const Paths := preload("res://scripts/menu/paths.gd")
 
 
-## Each save as {"path", "name", "modified" (unix time), "size", "source": "server" or "factorio"},
-## newest first.
+## Each save as {"path", "name", "modified" (unix time), "size", "source": "server", "zenith"
+## (a download's, from a checkout) or "factorio"}, newest first.
 static func list() -> Array:
 	var out: Array = []
-	_scan(Paths.saves_dir(), "server", out)
-	var own := Paths.factorio_saves_dir()
-	if own != "":
-		_scan(own, "factorio", out)
+	for root: Array in roots():
+		_scan(str(root[1]), str(root[0]), out)
 	var newer := func(a: Dictionary, b: Dictionary) -> bool:
 		return int(a["modified"]) > int(b["modified"])
 	out.sort_custom(newer)
 	return out
 
 
-## The folders the load screen starts in, as [source, dir]: the server's saves, then Factorio's own.
+## The folders the load screen starts in, as [source, dir]: the server's saves, a download's (from a
+## checkout), then Factorio's own.
 static func roots() -> Array:
 	var out: Array = [["server", Paths.saves_dir()]]
+	var downloads := Paths.download_saves_dir()
+	if downloads != "":
+		out.append(["zenith", downloads])
 	var own := Paths.factorio_saves_dir()
 	if own != "":
 		out.append(["factorio", own])
@@ -120,9 +124,14 @@ static func free_path(name: String) -> String:
 	return path
 
 
-## Copies one of Factorio's saves into the server's saves; the copy's path, or "" on failure.
+## Copies a save from outside the server's folder (Factorio's, a download's) into the server's
+## saves; the copy's path, or "" on failure. A copy of the same name that is still the same file
+## (not played since) is used again instead of making "name (2)".
 static func copy_to_server(path: String) -> String:
 	DirAccess.make_dir_recursive_absolute(Paths.saves_dir())
+	var same := Paths.saves_dir().path_join(path.get_file())
+	if FileAccess.file_exists(same) and _size(same) == _size(path) and FileAccess.get_md5(same) == FileAccess.get_md5(path):
+		return same
 	var target := free_path(path.get_file().get_basename())
 	return target if DirAccess.copy_absolute(path, target) == OK else ""
 

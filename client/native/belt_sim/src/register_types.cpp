@@ -1,6 +1,7 @@
 #include "belt_draw_native.h"
 #include "belt_lattice_native.h"
 #include "belt_sim_native.h"
+#include "udp_socket_native.h"
 
 #include <gdextension_interface.h>
 #include <godot_cpp/core/class_db.hpp>
@@ -16,6 +17,7 @@ static void initialize_belt_sim(ModuleInitializationLevel p_level) {
 	GDREGISTER_CLASS(BeltSimNative);
 	GDREGISTER_CLASS(BeltDrawNative);
 	GDREGISTER_CLASS(BeltLatticeNative);
+	GDREGISTER_CLASS(UdpSocketNative);
 }
 
 static void uninitialize_belt_sim(ModuleInitializationLevel p_level) {

@@ -15,9 +15,16 @@
 --
 -- Everything here runs from events and on_tick, and what it keeps (storage.f3d.altw) only from
 -- the records the client is sent, so it stays the same on every peer.
+--
+-- Also the chests' contents (J6, at the end): Factorio's Alt-mode draws over a container what is in
+-- it. Nothing tells a mod when that changes, so they are read in rounds, only while the client has
+-- Alt-mode on. The same rounds read the modules in machines and the science packs in labs (K1, K2),
+-- which robots and inserters change without an event too.
 
 local transport = require("scripts.transport")
 local budget = require("scripts.budget")
+local rate = require("scripts.rate")
+local perf = require("scripts.perf")
 
 local M = {}
 
@@ -98,14 +105,43 @@ local function requested_names(e, n)
   return names
 end
 
+-- The recipe a crafting machine shows: its own, or for a furnace with none (it picks its recipe from
+-- what is put in, and drops it whenever the input runs out between crafts) the last one it made.
+-- Factorio's Alt-mode keeps that icon until the furnace takes another recipe (owner's J2; its
+-- changelog: "Fixed that furnace alt-mode didn't show the last recipe, same as map view "Recipe
+-- Icons" option"). 2.x: previous_recipe is {name, quality}, each a prototype or its name.
+local function shown_recipe(e)
+  local ok, recipe = pcall(function() return e.get_recipe() end)
+  if ok and recipe then
+    return recipe
+  end
+  if e.type ~= "furnace" then
+    return nil
+  end
+  local ok_p, prev = pcall(function() return e.previous_recipe end)
+  if not (ok_p and type(prev) == "table") then
+    return nil
+  end
+  local name = prev.name
+  if type(name) ~= "string" then
+    local ok_n, n = pcall(function() return name.name end)
+    name = ok_n and n or nil
+  end
+  if type(name) ~= "string" then
+    return nil
+  end
+  local ok_r, r = pcall(function() return e.force.recipes[name] end)
+  return ok_r and r or nil
+end
+M.shown_recipe = shown_recipe
+
 -- [icon type, name, more?] for an entity's Alt-mode icon (more: the other filters' item names),
 -- or nil.
 function M.icon(e)
   local t = e.type
   if t == "assembling-machine" or t == "furnace" or t == "rocket-silo" then
-    local ok, recipe = pcall(function() return e.get_recipe() end)
-    -- An idle furnace's previous_recipe isn't shown: with no recipe Factorio shows nothing.
-    if ok and recipe then
+    local recipe = shown_recipe(e)
+    if recipe then
       return { "recipe", recipe.name }
     end
   elseif t == "inserter" or t == "loader" or t == "loader-1x1" then
@@ -150,8 +186,8 @@ function M.arrows(e)
   if not CRAFTERS[e.type] then
     return nil
   end
-  local ok, recipe = pcall(function() return e.get_recipe() end)
-  if not (ok and recipe) then
+  local recipe = shown_recipe(e)
+  if not recipe then
     return nil
   end
   local mask = 0
@@ -243,10 +279,462 @@ function M.check(e, known)
   return v
 end
 
+---------------------------------------------------------------------------------------------
+-- Where Alt-mode puts a prototype's icons (K1, K2), for `eprops` (ui_actions.lua): Factorio 2.1
+-- draws an entity's own icon by its icon_draw_specification (a shift from its centre and a scale),
+-- and the contents of some of its inventories as rows of small icons by its icons_positioning, one
+-- IconSequencePositioning per inventory: the modules in a machine, a drill, a lab or a beacon, and
+-- the science packs in a lab. A machine with module slots and no icons_positioning gets Factorio's
+-- documented defaults for its modules (shift {0, 0.7}, scale 0.5, separation 1.1, first row of
+-- several -0.1, up to its selection box's width / 0.75 icons a row and width / 1.5 rows).
+-- Prototypes only, so the module-level caches are the same on every peer.
+
+local SEQUENCE_TYPES = { ["assembling-machine"] = true, furnace = true, ["rocket-silo"] = true,
+  ["mining-drill"] = true, lab = true, beacon = true }
+M.SEQUENCE_TYPES = SEQUENCE_TYPES
+-- The module inventory's defines.inventory name by type: crafter_modules is 2.1's, the rest 2.0's.
+local MODULE_INVENTORIES = {
+  ["assembling-machine"] = { "crafter_modules", "assembling_machine_modules" },
+  furnace = { "crafter_modules", "furnace_modules" },
+  ["rocket-silo"] = { "crafter_modules", "rocket_silo_modules", "assembling_machine_modules" },
+  ["mining-drill"] = { "mining_drill_modules" },
+  lab = { "lab_modules" },
+  beacon = { "beacon_modules" },
+}
+
+local function define_of(name)
+  local ok, v = pcall(function() return defines.inventory[name] end)
+  return ok and v or nil
+end
+
+local function num(v, default)
+  return type(v) == "number" and v or default
+end
+
+local function thousandths(v)
+  return math.floor(v * 1000 + 0.5) / 1000
+end
+
+-- A Vector ({x, y} or {x =, y =}) as two numbers, 0, 0 when it isn't one.
+local function vec_xy(v)
+  if type(v) ~= "table" then
+    return 0, 0
+  end
+  return num(v.x or v[1], 0), num(v.y or v[2], 0)
+end
+
+local function box_width(proto)
+  local ok, b = pcall(function() return proto.selection_box end)
+  if not (ok and type(b) == "table") then
+    return 0
+  end
+  local lt, rb = b.left_top or b[1], b.right_bottom or b[2]
+  if type(lt) ~= "table" or type(rb) ~= "table" then
+    return 0
+  end
+  return num(rb.x or rb[1], 0) - num(lt.x or lt[1], 0)
+end
+
+-- Those whose own Alt-mode icon the client draws (TYPES, containers' contents, machines'), the
+-- only ones whose icon_draw_specification it needs.
+local SPEC_TYPES = { container = true, ["infinity-container"] = true, ["linked-container"] = true }
+for t in pairs(TYPES) do
+  SPEC_TYPES[t] = true
+end
+for t in pairs(SEQUENCE_TYPES) do
+  SPEC_TYPES[t] = true
+end
+
+-- [shift x, shift y, scale] of the prototype's icon_draw_specification, nil when it is the default
+-- ({0, 0}, 1) or the client draws no icon of its own over it.
+function M.draw_spec(proto)
+  if not SPEC_TYPES[proto.type] then
+    return nil
+  end
+  local ok, s = pcall(function() return proto.icon_draw_specification end)
+  if not (ok and type(s) == "table") then
+    return nil
+  end
+  local sx, sy = vec_xy(s.shift)
+  local scale = num(s.scale, 1)
+  if sx == 0 and sy == 0 and scale == 1 then
+    return nil
+  end
+  return { thousandths(sx), thousandths(sy), thousandths(scale) }
+end
+
+local sequences_cache = {}
+
+-- [[kind, shift x, shift y, scale, icons a row, rows, separation, first row's lift], ...]: kind "m"
+-- the modules, "l" a lab's science packs; nil when Alt-mode shows neither.
+local function sequences(proto)
+  local t = proto.type
+  if not SEQUENCE_TYPES[t] then
+    return nil
+  end
+  local ok_m, slots = pcall(function() return proto.module_inventory_size end)
+  local has_modules = ok_m and type(slots) == "number" and slots > 0
+  if not has_modules and t ~= "lab" then
+    return nil
+  end
+  local modules = {}
+  for _, n in ipairs(MODULE_INVENTORIES[t]) do
+    local d = define_of(n)
+    if d then
+      modules[d] = true
+    end
+  end
+  local lab_input = t == "lab" and define_of("lab_input") or nil
+  local width = box_width(proto)
+  local function entry(kind, p)
+    local sx, sy = 0, 0.7
+    if p.shift ~= nil then
+      sx, sy = vec_xy(p.shift)
+    end
+    return { kind, thousandths(sx), thousandths(sy), thousandths(num(p.scale, 0.5)),
+      math.max(1, math.floor(num(p.max_icons_per_row, width / 0.75) + 1e-6)),
+      math.max(1, math.floor(num(p.max_icon_rows, width / 1.5) + 1e-6)),
+      thousandths(num(p.separation_multiplier, 1.1)), thousandths(num(p.multi_row_initial_height_modifier, -0.1)) }
+  end
+  local out = {}
+  local ok, list = pcall(function() return proto.icons_positioning end)
+  if ok and type(list) == "table" then
+    for _, p in ipairs(list) do
+      local index = type(p) == "table" and p.inventory_index or nil
+      if has_modules and index and modules[index] then
+        out[#out + 1] = entry("m", p)
+      elseif lab_input and index == lab_input then
+        out[#out + 1] = entry("l", p)
+      end
+    end
+  elseif has_modules then
+    out[1] = entry("m", {})
+  end
+  return #out > 0 and out or nil
+end
+
+function M.sequences(proto)
+  local v = sequences_cache[proto.name]
+  if v == nil then
+    v = sequences(proto) or false
+    sequences_cache[proto.name] = v
+  end
+  return v or nil
+end
+
+-- The items an inventory shows in Alt-mode, slot by slot (Factorio draws one icon a module, one a
+-- lab's pack slot, no counts): a name, or {name, quality} when not normal. `each`: one per item of
+-- a stack (a module slot holds one in the game). Up to 32.
+local function shown_items(inv, each)
+  local out = {}
+  if not inv or inv.is_empty() then
+    return out
+  end
+  for i = 1, #inv do
+    local stack = inv[i]
+    if stack.valid_for_read then
+      local q = stack.quality
+      q = type(q) == "string" and q or (q and q.name)
+      local item = (q and q ~= "normal") and { stack.name, q } or stack.name
+      for _ = 1, each and math.min(stack.count, 32) or 1 do
+        out[#out + 1] = item
+      end
+      if #out >= 32 then
+        break
+      end
+    end
+  end
+  return out
+end
+
+-- What Alt-mode shows in a machine (K1, K2): its modules and a lab's science packs, each a list as
+-- shown_items makes it (empty for none), or nil, nil for an entity without such icons.
+function M.machine_icons(e)
+  local seq = M.sequences(e.prototype)
+  if not seq then
+    return nil, nil
+  end
+  local want_m, want_l
+  for _, s in ipairs(seq) do
+    want_m = want_m or s[1] == "m"
+    want_l = want_l or s[1] == "l"
+  end
+  local ok, m, l = pcall(function()
+    local mods = want_m and shown_items(e.get_module_inventory(), true) or {}
+    local packs = want_l and shown_items(e.get_inventory(defines.inventory.lab_input), false) or {}
+    return mods, packs
+  end)
+  if not ok then
+    return {}, {}
+  end
+  return m, l
+end
+
+local function items_sig(list)
+  local parts = {}
+  for i, it in ipairs(list) do
+    parts[i] = type(it) == "table" and (it[1] .. "@" .. it[2]) or it
+  end
+  return table.concat(parts, ",")
+end
+
+---------------------------------------------------------------------------------------------
+-- Chests' contents (J6). Factorio's Alt-mode shows "additional information about built entities
+-- such as recipes in assembling machines and container contents" (its show-info control's words):
+-- over a chest the icons of what is in it, up to four kinds in the one icon's room. Here the kinds
+-- it holds most of, most first; no counts, as Factorio draws none.
+--
+-- While the client says Alt-mode is on (`altc` {on 1, g}), the chests in its focus square are read
+-- in rounds under the work budget, a round at most every CONTENTS_ROUND ticks (stretched by the
+-- update rate, rate.lua's `ac`), and `ac` {g, l} carries the chests whose icons changed: [unit,
+-- item, more items?], or [unit] when it shows none now (emptied, gone, out of the square or of the
+-- client's chunks). storage.f3d.altc = {g, sent = {unit -> the names sent}, msent = {unit -> the
+-- machine's icons sent}, due, round}; nil while off. Set from the client's command and on_tick,
+-- like `focus`.
+--
+-- The machines (K1, K2; `/f3d-perf alt_machines`): those in the focus square whose prototype has
+-- module slots, and labs, are read in the same rounds, `am` {g, l} carrying those whose icons
+-- changed: [unit, modules, packs?] (each a list of items, a name or [name, quality]; modules 0
+-- when there are none but packs), or [unit] when it shows none now.
+
+local CONTAINER_TYPES = { "container", "logistic-container", "infinity-container", "linked-container" }
+local CONTAINER_SET = {}
+for _, t in ipairs(CONTAINER_TYPES) do
+  CONTAINER_SET[t] = true
+end
+local CONTENTS_SHOWN = 4
+local CONTENTS_PER_TICK = 32
+-- A chest's read: its inventory's contents, about a record's worth (budget.lua's units).
+local CONTENTS_PRICE = 2
+-- A machine's: its module inventory slot by slot, a lab's packs too.
+local MACHINE_PRICE = 3
+-- The search of the focus square for chests (and for machines), at the start of a round.
+local CONTENTS_FIND_PRICE = 20
+local CONTENTS_ROUND = 60
+local container_types
+local machine_names
+
+local function present_container_types()
+  if not container_types then
+    local present = {}
+    for _, proto in pairs(prototypes.entity) do
+      present[proto.type] = true
+    end
+    container_types = {}
+    for _, t in ipairs(CONTAINER_TYPES) do
+      if present[t] then
+        container_types[#container_types + 1] = t
+      end
+    end
+  end
+  return container_types
+end
+
+-- The names of the prototypes whose Alt-mode shows modules or science packs.
+local function present_machine_names()
+  if not machine_names then
+    machine_names = {}
+    for name, proto in pairs(prototypes.entity) do
+      if SEQUENCE_TYPES[proto.type] and M.sequences(proto) then
+        machine_names[#machine_names + 1] = name
+      end
+    end
+    table.sort(machine_names)
+  end
+  return machine_names
+end
+
+-- The names of the kinds the chest holds most of (qualities together), most first, ties by name;
+-- nil when it is empty.
+function M.contents(e)
+  local ok, inv = pcall(function() return e.get_inventory(defines.inventory.chest) end)
+  if not (ok and inv) then
+    return nil
+  end
+  local ok_c, list = pcall(function() return inv.get_contents() end)
+  if not (ok_c and type(list) == "table") then
+    return nil
+  end
+  local counts, names = {}, {}
+  for _, it in pairs(list) do
+    local name = it.name
+    if type(name) ~= "string" then
+      local ok_n, n = pcall(function() return name.name end)
+      name = ok_n and n or nil
+    end
+    if type(name) == "string" and (it.count or 0) > 0 then
+      if not counts[name] then
+        names[#names + 1] = name
+        counts[name] = 0
+      end
+      counts[name] = counts[name] + it.count
+    end
+  end
+  if #names == 0 then
+    return nil
+  end
+  table.sort(names, function(a, b)
+    if counts[a] ~= counts[b] then
+      return counts[a] > counts[b]
+    end
+    return a < b
+  end)
+  for i = #names, CONTENTS_SHOWN + 1, -1 do
+    names[i] = nil
+  end
+  return names
+end
+
+-- {on, g}: the client's Alt-mode on (1) or off (0); g, its count of turnings on, comes back in each
+-- `ac` so it can tell a late answer to an earlier one. On again starts over: every chest is sent.
+function M.contents_cmd(cmd)
+  local s = storage.f3d
+  if tonumber(cmd.on) == 1 then
+    s.altc = { g = math.floor(tonumber(cmd.g) or 0), sent = {}, msent = {}, due = game.tick }
+  else
+    s.altc = nil
+  end
+end
+
+-- The client's world was dropped (a resync, another surface): everything is sent again.
+function M.contents_forget()
+  local c = storage.f3d.altc
+  if c then
+    c.sent, c.msent, c.round, c.due = {}, {}, nil, game.tick
+  end
+end
+
+local function machine_row(unit, modules, packs)
+  if #modules == 0 and #packs == 0 then
+    return { unit }
+  end
+  local row = { unit, #modules > 0 and modules or 0 }
+  if #packs > 0 then
+    row[3] = packs
+  end
+  return row
+end
+
+local function contents_row(unit, names)
+  if not names then
+    return { unit }
+  end
+  local row = { unit, names[1] }
+  if #names > 1 then
+    local more = {}
+    for i = 2, #names do
+      more[#more + 1] = names[i]
+    end
+    row[3] = more
+  end
+  return row
+end
+
+local function contents_tick()
+  local s = storage.f3d
+  local c = s.altc
+  if not c then
+    return
+  end
+  local round = c.round
+  if not round then
+    if game.tick < (c.due or 0) then
+      return
+    end
+    local surface = game.get_surface(s.surface_index)
+    local types = present_container_types()
+    if not (surface and surface.valid and #types > 0 and s.focus) then
+      return
+    end
+    local machines = perf.on("alt_machines") and present_machine_names() or {}
+    local price = CONTENTS_FIND_PRICE * (#machines > 0 and 2 or 1)
+    if not budget.can(price, "altc", 0.1) then
+      return
+    end
+    budget.spend(price, "altc")
+    local f = s.focus
+    local area = { { f.x - f.r, f.y - f.r }, { f.x + f.r, f.y + f.r } }
+    round = { i = 1, seen = {}, list = surface.find_entities_filtered({ area = area, type = types }) }
+    if #machines > 0 then
+      -- After the chests, in the same round.
+      for _, e in ipairs(surface.find_entities_filtered({ area = area, name = machines })) do
+        round.list[#round.list + 1] = e
+      end
+    end
+    c.round = round
+  end
+  c.msent = c.msent or {}
+  local out, mout
+  for _ = 1, CONTENTS_PER_TICK do
+    local e = round.list[round.i]
+    if e == nil then
+      -- The round is over: chests and machines not in it any more lose their icons.
+      for unit in pairs(c.sent) do
+        if not round.seen[unit] then
+          c.sent[unit] = nil
+          out = out or {}
+          out[#out + 1] = { unit }
+        end
+      end
+      for unit in pairs(c.msent) do
+        if not round.seen[unit] then
+          c.msent[unit] = nil
+          mout = mout or {}
+          mout[#mout + 1] = { unit }
+        end
+      end
+      c.round = nil
+      c.due = game.tick + CONTENTS_ROUND * rate.factor("ac")
+      break
+    end
+    local chest = not e.valid or CONTAINER_SET[e.type]
+    local price = chest and CONTENTS_PRICE or MACHINE_PRICE
+    if not budget.can(price, "altc", 0.1) then
+      break
+    end
+    budget.spend(price, "altc")
+    round.i = round.i + 1
+    local unit = e.valid and e.unit_number
+    if unit and s.subs[chunk_key(e.position)] then
+      if chest then
+        local names = M.contents(e)
+        local sig = names and table.concat(names, ",") or nil
+        if sig then
+          round.seen[unit] = true
+        end
+        if sig ~= c.sent[unit] then
+          c.sent[unit] = sig
+          out = out or {}
+          out[#out + 1] = contents_row(unit, names)
+        end
+      else
+        local modules, packs = M.machine_icons(e)
+        local sig
+        if modules and (#modules > 0 or #packs > 0) then
+          sig = items_sig(modules) .. "|" .. items_sig(packs)
+          round.seen[unit] = true
+        end
+        if sig ~= c.msent[unit] then
+          c.msent[unit] = sig
+          mout = mout or {}
+          mout[#mout + 1] = machine_row(unit, modules or {}, packs or {})
+        end
+      end
+    end
+  end
+  if out then
+    transport.send_reliable({ t = "ac", g = c.g, l = out })
+  end
+  if mout then
+    transport.send_reliable({ t = "am", g = c.g, l = mout })
+  end
+end
+
 -- A few watched machines a tick, a round at most every ROUND_TICKS: those whose icon changed are
 -- sent in one `aiu`. Entries gone or no longer streamed are dropped when the round ends (clearing
 -- keys behind the cursor while it walks would break `next`).
 function M.tick()
+  contents_tick()
   local s = storage.f3d
   local w = s.altw
   if not w or game.tick < (s.altw_due or 0) then

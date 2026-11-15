@@ -9,6 +9,7 @@ local alt_mode = require("scripts.alt_mode")
 local belt_switch = require("scripts.belt_switch")
 local entity_ui = require("scripts.entity_ui")
 local photo = require("scripts.photo")
+local perf = require("scripts.perf")
 
 local M = {}
 
@@ -16,6 +17,7 @@ local CHUNK = 32
 local ENTITIES_PER_MESSAGE = 120
 local MAX_SUBSCRIPTIONS = 10201 -- a 101x101 chunk square, 3232x3232 tiles (the client's view distance 50)
 local MAX_BACKLOG = 64        -- don't read more chunks while this many messages wait to be sent
+local ROOM_STARTS = 4         -- chunks started a tick while the work budget has room (I18; f3d-chunks-per-tick the least)
 local REFRESH_INTERVAL = 300  -- ticks between re-sending one subscribed chunk
 local COUNT_NEAR = 121        -- the nearest this many subscribed chunks (11x11) are counted in turn
 local DECORATIVES_PER_MESSAGE = 1000 -- 4 numbers each
@@ -168,8 +170,7 @@ end
 local PAINTED = { locomotive = true, ["cargo-wagon"] = true, ["fluid-wagon"] = true, ["artillery-wagon"] = true,
   ["train-stop"] = true }
 
-local function extra_of_type(entity)
-  local t = entity.type
+local function extra_of_type(entity, t)
   if registry.is_pipe(t) then
     local ok, mask = pcall(pipe_mask, entity)
     return ok and { pc = mask } or nil
@@ -278,13 +279,13 @@ local function all_extras(entity, has_unit)
 end
 
 -- What a record carries beyond its id, place and direction; painted things add their colour.
-local function extra(entity)
-  local x = extra_of_type(entity)
-  if PAINTED[entity.type] then
+local function extra(entity, t)
+  local x = extra_of_type(entity, t)
+  if PAINTED[t] then
     -- The colour the player gave it (H21: trains and stops were drawn in their models' grey).
     local ok, c = pcall(function()
       -- A stop nobody painted still wears its prototype's red, as Factorio draws it.
-      return entity.color or (entity.type == "train-stop" and entity.prototype.color) or nil
+      return entity.color or (t == "train-stop" and entity.prototype.color) or nil
     end)
     if ok and c then
       x = x or {}
@@ -314,15 +315,61 @@ local function stock_ghost(entity, rec)
   end
 end
 
+-- records_by_prototype (perf.lua): what a record needs of its entity's prototype, read once a name
+-- ({type, id, natural}; from prototypes alone, so module-local is fine), not entity.type five or six
+-- times a record. Natural entities (trees, rocks, ore, cliffs, fish: most of a chunk away from a base)
+-- have no quality, upgrade or wires to read: only their deconstruction mark.
+local NATURAL = { tree = true, ["simple-entity"] = true, resource = true, cliff = true, fish = true }
+local proto_info = {}
+
+local function info_of(entity)
+  local name = entity.name
+  local info = proto_info[name]
+  if not info then
+    local t = entity.type
+    info = { t, registry.entity_id(name), NATURAL[t] or false }
+    proto_info[name] = info
+  end
+  return info
+end
+
+local function natural_record(entity, info)
+  local p = entity.position
+  local t = info[1]
+  local rec = { entity.unit_number or 0, info[2], M.fixed(p.x), M.fixed(p.y), entity.direction or 0 }
+  local x = extra_of_type(entity, t)
+  local ok, marked = pcall(entity.to_be_deconstructed)
+  if ok and marked then
+    x = x or {}
+    x.d = 1
+  end
+  if x then
+    rec[6] = x
+  end
+  return rec
+end
+
 -- [unit_number or 0, prototype id, x, y, direction, extra?]
 -- Entities without a unit number (trees, rocks, ore) are identified by prototype + position.
+local record_of
 function M.record(entity)
+  if perf.on("records_by_prototype") then
+    local info = info_of(entity)
+    if info[3] then
+      return natural_record(entity, info)
+    end
+    return record_of(entity, info[1], info[2])
+  end
+  return record_of(entity, entity.type, registry.entity_id(entity.name))
+end
+
+record_of = function(entity, t, id)
   local p = entity.position
-  local rec = { entity.unit_number or 0, registry.entity_id(entity.name), M.fixed(p.x), M.fixed(p.y), entity.direction or 0 }
-  if entity.type == "entity-ghost" and STOCK[entity.ghost_type] then
+  local rec = { entity.unit_number or 0, id, M.fixed(p.x), M.fixed(p.y), entity.direction or 0 }
+  if t == "entity-ghost" and STOCK[entity.ghost_type] then
     stock_ghost(entity, rec)
   end
-  local x = extra(entity)
+  local x = extra(entity, t)
   -- Quality, marks and wires (2.x API) in one protected call: a record is made for every entity
   -- in a chunk snapshot, so this is the bridge's busiest path. If it fails, each is tried alone
   -- so one missing API doesn't lose the others.
@@ -346,7 +393,7 @@ function M.record(entity)
   end
   -- Alt-mode's icon (issue #9): with the record, so every loaded machine has it, no scanning.
   -- and its machine or pump arrows (part 2, extra.fa).
-  if rec[1] ~= 0 and alt_mode.TYPES[entity.type] then
+  if rec[1] ~= 0 and alt_mode.TYPES[t] then
     local icon, arrows = alt_mode.state(entity)
     if icon then
       x = x or {}
@@ -358,7 +405,7 @@ function M.record(entity)
     end
     alt_mode.recorded(entity, icon, x, arrows)
   end
-  if rec[1] ~= 0 and belt_switch.TYPES[entity.type] then
+  if rec[1] ~= 0 and belt_switch.TYPES[t] then
     belt_switch.recorded(entity, x)
   end
   if x then
@@ -367,9 +414,40 @@ function M.record(entity)
   return rec
 end
 
+-- A record as JSON text (chunk_text, perf.lua): its five numbers (integers all) by table.concat, its
+-- extras key by key (transport.json_object). Read by the client as what helpers.table_to_json wrote,
+-- at a tenth of the cost.
+local concat = table.concat
+function M.record_text(rec)
+  local x = rec[6]
+  if x then
+    return "[" .. concat(rec, ",", 1, 5) .. "," .. transport.json_object(x) .. "]"
+  end
+  return "[" .. concat(rec, ",", 1, 5) .. "]"
+end
+
 -- A chunk's place in the client's order, nearest the character first. A list subscription (`c`)
 -- gives each chunk its place in `s.rank`; a square one (`w`) orders by squared distance from its
 -- middle, then row by row, as the client's ring_order does (world.gd), worked out from the chunk.
+-- With the client's view direction (`sub` f, I18) a chunk behind it counts as further away: up to
+-- twice its distance straight behind (BEHIND), as the client's prio_order, so what the camera looks
+-- at and where the character walks comes first. Integers all the way (the most, 101x101 chunks with
+-- f, is under 1e14, exact in a double): the same order on every peer.
+local BEHIND = 3
+local DIST_SCALE = 65536
+
+local function distance_of(s, dx, dy)
+  local d = (dx * dx + dy * dy) * DIST_SCALE
+  local f = s.sub_f
+  if f then
+    local dot = dx * f[1] + dy * f[2]
+    if dot < 0 then
+      d = d + BEHIND * dot * dot
+    end
+  end
+  return d
+end
+
 local function rank_of(s, k)
   local o = s.sub_o
   if o then
@@ -379,24 +457,61 @@ local function rank_of(s, k)
     end
     local side = 2 * s.sub_r + 1
     local dx, dy = c[1] - o[1], c[2] - o[2]
-    return (dx * dx + dy * dy) * side * side + (dy + s.sub_r) * side + dx + s.sub_r
+    return distance_of(s, dx, dy) * side * side + (dy + s.sub_r) * side + dx + s.sub_r
   end
   return s.rank and s.rank[k] or math.huge
 end
 
--- The queue is kept in the client's order (nearest the character first, rank_of), whatever
--- queued a chunk: a new subscription, a chunk Factorio has just generated, a resend. Otherwise,
--- after a jump, chunks queued for the old place and land generated in Factorio's own order went
--- first, and the ground under the character came last.
-local function enqueue(k)
-  local s = storage.f3d
-  if s.queued[k] then
-    return
+-- The queue (s.queue) holds chunk keys from its head, q.h (1 when absent), on: a chunk sent moves the
+-- head on and stays in the list until COMPACT_AT have gathered before it. table.remove(q, 1) shifted the
+-- whole queue for each chunk: 60 us with 10,201 queued, up to four times a tick. The head is a field
+-- of the list itself, so a list made anew starts at 1 (and a save without it too). The same for the
+-- chunks told as kept (s.kept).
+local COMPACT_AT = 1024
+
+local function qhead(q)
+  return q.h or 1
+end
+
+-- How many are waiting in a list with a head.
+local function qlen(q)
+  return #q - (q.h or 1) + 1
+end
+
+-- Takes the first of list `q` (s[field]); returns it, or nil when it is empty.
+local function qpop(s, field)
+  local q = s[field]
+  local h = q.h or 1
+  local k = q[h]
+  if k == nil then
+    return nil
   end
-  s.queued[k] = true
-  local rank = rank_of(s, k)
-  local q = s.queue
-  local lo, hi = 1, #q + 1
+  if h >= #q then
+    s[field] = {}
+  elseif h >= COMPACT_AT then
+    local rest = {}
+    for i = h + 1, #q do
+      rest[#rest + 1] = q[i]
+    end
+    s[field] = rest
+  else
+    q.h = h + 1
+  end
+  return k
+end
+
+-- What is queued, from the head, as a new list (h 1).
+local function qlist(q)
+  local out = {}
+  for i = q.h or 1, #q do
+    out[#out + 1] = q[i]
+  end
+  return out
+end
+
+-- Where rank `rank` goes in list `q` (from its head), by rank_of.
+local function qplace(s, q, rank)
+  local lo, hi = q.h or 1, #q + 1
   while lo < hi do
     local mid = math.floor((lo + hi) / 2)
     local r = rank_of(s, q[mid])
@@ -406,7 +521,79 @@ local function enqueue(k)
       hi = mid
     end
   end
-  table.insert(q, lo, k)
+  return lo
+end
+
+-- A chunk's bucket in a requeue (requeue_now, the job): its squared distance with the view direction.
+local function bucket_of(s, r)
+  local side = 2 * s.sub_r + 1
+  return math.floor(math.floor(r / (side * side)) / DIST_SCALE)
+end
+
+-- requeue_slices (perf.lua): a long square queue put in a new order (the view turned, the middle moved)
+-- by a job over the ticks after (s.rq) instead of at once in the packet handler, where it took several
+-- ms with 10,000 queued each time the camera turned during a join. Phase 1 deals the queue's chunks into
+-- buckets by their squared distance (with the view direction), REQUEUE_PER_TICK a tick, while chunks are
+-- still taken from the queue in its old order; phase 2 makes the queue anew from the buckets in order,
+-- each sorted on its own (ranks are unique), as requeue_now does at once, skipping what was taken or
+-- dropped meanwhile. A queue of up to REQUEUE_NOW is still ordered at once. rq: {phase, src (the list
+-- dealt), i, buckets (d -> keys), top, d (the next bucket read out), tail (no rank), rank (key -> rank,
+-- while dealt and not yet read out), n (dealt), out (read out)}. In storage, from packets and ticks.
+local REQUEUE_NOW = 512
+local REQUEUE_PER_TICK = 1024
+
+-- Puts chunk k, of rank `rank`, in the job's buckets.
+local function rq_put(s, rq, k, rank)
+  rq.n = rq.n + 1
+  if rank == math.huge then
+    rq.rank[k] = -1  -- (a mark: no infinity kept in storage)
+    rq.tail[#rq.tail + 1] = k
+    return
+  end
+  rq.rank[k] = rank
+  local d = bucket_of(s, rank)
+  local b = rq.buckets[d]
+  if not b then
+    b = {}
+    rq.buckets[d] = b
+    if d > rq.top then
+      rq.top = d
+    end
+  end
+  b[#b + 1] = k
+end
+
+-- Deals chunk k into the job's buckets, once.
+local function rq_deal(s, rq, k)
+  if s.queued[k] and rq.rank[k] == nil then
+    rq_put(s, rq, k, rank_of(s, k))
+  end
+end
+
+-- The queue is kept in the client's order (nearest the character first, rank_of), whatever
+-- queued a chunk: a new subscription, a chunk Factorio has just generated, a resend. Otherwise,
+-- after a jump, chunks queued for the old place and land generated in Factorio's own order went
+-- first, and the ground under the character came last.
+-- (While a requeue job runs, s.rq: a chunk queued meanwhile goes into its buckets too, or, once they are
+-- being read out, into the new queue by its rank if its bucket was read out already.)
+local function enqueue(k)
+  local s = storage.f3d
+  if s.queued[k] then
+    return
+  end
+  s.queued[k] = true
+  local rank = rank_of(s, k)
+  local rq = s.rq
+  if rq then
+    if rq.phase == 1 then
+      rq_put(s, rq, k, rank)  -- (and in the old queue below, so it can still be taken meanwhile)
+    elseif rank == math.huge or bucket_of(s, rank) >= rq.d then
+      rq_put(s, rq, k, rank)
+      return
+    end
+  end
+  local q = s.queue
+  table.insert(q, qplace(s, q, rank), k)
 end
 
 M.enqueue = enqueue
@@ -435,8 +622,25 @@ local function take_have(s, have)
   end
 end
 
+-- Chunks the client keeps after they leave its square (`kept`, I18): when a chunk is dropped, its
+-- change count then is noted, and a few ticks later (kept_step, under the work budget) the client is
+-- told the counts its copy matches, if nothing changed there meanwhile and its entities still number
+-- what the bridge last knew the client has. The client's copy then carries those counts, so coming
+-- back to it is answered `same` even when things were built there while it was in view (its copy got
+-- them as `add` and `del`). For a client whose hello says `lv`.
+local MAX_KEPT = 2048     -- noted and not yet told at most (the rest are not told: a snapshot later)
+local KEPT_PER_TICK = 16  -- counted a tick at most
+
 -- A chunk the client no longer wants.
 local function drop_sub(s, k)
+  local c = s.subs[k]
+  if c and s.client and s.client.lv and not s.queued[k] and not (s.snap and s.snap.k == k) then
+    -- Sent and not to be sent again: the client's copy is as the bridge last told it.
+    s.kept = s.kept or {}
+    if qlen(s.kept) < MAX_KEPT then
+      s.kept[#s.kept + 1] = { k, c[1], c[2], s.surface_index, M.rev(s.surface_index, k) }
+    end
+  end
   s.subs[k] = nil
   -- The client forgets a chunk's far belt lanes with it (belt_items.lua): sent again if it comes back.
   if s.far then
@@ -447,27 +651,118 @@ local function drop_sub(s, k)
   end
 end
 
--- The queue put in the client's order again (rank_of). A long one (a resend of a whole square) is
--- dealt into buckets by squared distance, each sorted on its own, instead of one sort of thousands.
-local function requeue(s)
+-- A requeue job stopped: what it holds goes back into the queue (in no order: a new order follows).
+local function rq_stop(s)
+  local rq = s.rq
+  if not rq then
+    return
+  end
+  s.rq = nil
+  if rq.phase == 2 then
+    -- (Phase 1 leaves the old queue whole; phase 2 has the chunks not read out yet in its buckets.)
+    local q = s.queue
+    for d = rq.d, rq.top do
+      for _, k in ipairs(rq.buckets[d] or {}) do
+        if s.queued[k] and rq.rank[k] then
+          rq.rank[k] = nil
+          q[#q + 1] = k
+        end
+      end
+    end
+    for _, k in ipairs(rq.tail) do
+      if s.queued[k] and rq.rank[k] then
+        rq.rank[k] = nil
+        q[#q + 1] = k
+      end
+    end
+  end
+end
+
+-- One tick of the requeue job, up to `limit` chunks; returns how many it went through.
+local function rq_step(s, limit)
+  local rq = s.rq
+  if not rq then
+    return 0
+  end
+  local n = 0
+  if rq.phase == 1 then
+    local src = rq.src
+    while rq.i <= #src and n < limit do
+      rq_deal(s, rq, src[rq.i])
+      rq.i = rq.i + 1
+      n = n + 1
+    end
+    if rq.i <= #src then
+      return n
+    end
+    -- Every chunk queued is in the buckets: the queue is made anew from them.
+    rq.phase, rq.src, rq.d = 2, nil, 0
+    s.queue = {}
+  end
   local q = s.queue
+  local queued, ranks = s.queued, rq.rank
+  local by_rank = function(a, b) return ranks[a] < ranks[b] end
+  while rq.d <= rq.top and n < limit do
+    local b = rq.buckets[rq.d]
+    if b then
+      rq.buckets[rq.d] = nil
+      if #b > 1 then
+        table.sort(b, by_rank)
+      end
+      for _, k in ipairs(b) do
+        if queued[k] and ranks[k] then
+          q[#q + 1] = k
+          rq.out = rq.out + 1
+        end
+        ranks[k] = nil
+      end
+      n = n + #b
+    end
+    rq.d = rq.d + 1
+    n = n + 0.0625 -- (most distances have no chunk)
+  end
+  if rq.d > rq.top then
+    for _, k in ipairs(rq.tail) do
+      if queued[k] and ranks[k] then
+        q[#q + 1] = k
+      end
+    end
+    s.rq = nil
+  end
+  return n
+end
+
+-- Chunks a requeue job holds that aren't in the queue yet (phase 2), for queue_length.
+local function rq_waiting(s)
+  local rq = s.rq
+  if not (rq and rq.phase == 2) then
+    return 0
+  end
+  return math.max(0, rq.n - rq.out)
+end
+
+-- The queue put in the client's order again (rank_of). A long one (a resend of a whole square) is
+-- dealt into buckets by squared distance, each sorted on its own, instead of one sort of thousands;
+-- with requeue_slices over the ticks after (the job above).
+local function requeue_now(s)
+  local q = qlist(s.queue)
+  s.queue = q
   local rank = {}
   for _, k in ipairs(q) do
     rank[k] = rank_of(s, k)
   end
   local by_rank = function(a, b) return rank[a] < rank[b] end
-  if #q <= 512 or not s.sub_o then
+  if #q <= REQUEUE_NOW or not s.sub_o then
     table.sort(q, by_rank)
     return
   end
-  local side = 2 * s.sub_r + 1
   local buckets, tail = {}, {}
   for _, k in ipairs(q) do
     local r = rank[k]
     if r == math.huge then
       tail[#tail + 1] = k
     else
-      local d = math.floor(r / (side * side))
+      local d = bucket_of(s, r)
       local b = buckets[d]
       if not b then
         b = {}
@@ -476,14 +771,18 @@ local function requeue(s)
       b[#b + 1] = k
     end
   end
+  -- The buckets' own distances in order (a view direction stretches them past 2 r^2).
+  local ds = {}
+  for d in pairs(buckets) do
+    ds[#ds + 1] = d
+  end
+  table.sort(ds)
   local out = {}
-  for d = 0, 2 * s.sub_r * s.sub_r do
+  for _, d in ipairs(ds) do
     local b = buckets[d]
-    if b then
-      table.sort(b, by_rank)
-      for _, k in ipairs(b) do
-        out[#out + 1] = k
-      end
+    table.sort(b, by_rank)
+    for _, k in ipairs(b) do
+      out[#out + 1] = k
     end
   end
   for _, k in ipairs(tail) do
@@ -492,11 +791,24 @@ local function requeue(s)
   s.queue = out
 end
 
+local function requeue(s)
+  rq_stop(s)
+  if s.sub_o and qlen(s.queue) > REQUEUE_NOW and perf.on("requeue_slices") then
+    local q = s.queue
+    s.rq = { phase = 1, src = q, i = qhead(q), buckets = {}, top = 0, d = 0, tail = {}, rank = {}, n = 0, out = 0 }
+    return
+  end
+  requeue_now(s)
+end
+M.requeue_step = rq_step  -- (tests)
+
 -- Replace the subscription set. `list` is ordered nearest first, which is the order chunks
 -- are sent in.
 function M.subscribe(list, have)
   local s = storage.f3d
-  s.sub_o, s.sub_r, s.sub_rows, s.sub_n = nil, nil, nil, nil
+  -- (A requeue job's chunks are still `queued`: in the new queue below.)
+  s.rq = nil
+  s.sub_o, s.sub_r, s.sub_rows, s.sub_n, s.sub_f = nil, nil, nil, nil, nil
   local want, order = {}, {}
   for _, c in pairs(list) do
     local cx, cy = type(c) == "table" and M.chunk_in(c[1]), type(c) == "table" and M.chunk_in(c[2])
@@ -641,7 +953,25 @@ local function nearest_order(s)
 end
 
 -- A square subscription (handlers.sub with `o`, `r`, `w`): see M.MAX_RADIUS. False if malformed.
-function M.subscribe_square(o, r, w, have)
+-- `f`, optional: the client's view direction, [fx, fy] with a length of about 256 (I18); the queue
+-- puts chunks behind it later (rank_of).
+local function view_dir_in(f)
+  if type(f) ~= "table" then
+    return nil
+  end
+  local fx, fy = tonumber(f[1]), tonumber(f[2])
+  if not (fx and fy and fx == fx and fy == fy) then
+    return nil
+  end
+  fx = math.max(-256, math.min(256, math.floor(fx)))
+  fy = math.max(-256, math.min(256, math.floor(fy)))
+  if fx == 0 and fy == 0 then
+    return nil
+  end
+  return { fx, fy }
+end
+
+function M.subscribe_square(o, r, w, have, f)
   local s = storage.f3d
   local ox = type(o) == "table" and M.chunk_in(o[1])
   local oy = type(o) == "table" and M.chunk_in(o[2])
@@ -649,6 +979,7 @@ function M.subscribe_square(o, r, w, have)
   if not (ox and oy and r and r == r and type(w) == "table") then
     return false
   end
+  f = view_dir_in(f)
   r = math.max(0, math.min(M.MAX_RADIUS, math.floor(r)))
   local rows = {}
   for _, row in pairs(w) do
@@ -701,8 +1032,11 @@ function M.subscribe_square(o, r, w, have)
       end
     end
   end
-  local moved = not old_o or old_o[1] ~= ox or old_o[2] ~= oy or old_r ~= r
-  s.sub_rows, s.sub_o, s.sub_r, s.rank = rows, { ox, oy }, r, nil
+  -- A new view direction orders the queue again, as a new middle does.
+  local old_f = s.sub_f
+  local turned = (old_f == nil) ~= (f == nil) or (f ~= nil and (old_f[1] ~= f[1] or old_f[2] ~= f[2]))
+  local moved = not old_o or old_o[1] ~= ox or old_o[2] ~= oy or old_r ~= r or turned
+  s.sub_rows, s.sub_o, s.sub_r, s.rank, s.sub_f = rows, { ox, oy }, r, nil, f
   local n = 0
   for cy = oy - r, oy + r do
     local runs = rows[cy]
@@ -715,7 +1049,7 @@ function M.subscribe_square(o, r, w, have)
   s.sub_n = n
   if dropped then
     local queue = {}
-    for _, k in ipairs(s.queue) do
+    for _, k in ipairs(qlist(s.queue)) do
       if s.subs[k] then
         queue[#queue + 1] = k
       else
@@ -741,6 +1075,9 @@ function M.subscribe_square(o, r, w, have)
   if moved or #added > 0 or dropped or not s.order then
     s.order = nearest_order(s)
   end
+  if moved then
+    M.dec_in_range()
+  end
   take_have(s, have)
   return true
 end
@@ -765,6 +1102,7 @@ end
 -- of each was quadratic, 0.1 s for a 101x101 square).
 function M.resend_all()
   local s = storage.f3d
+  s.rq = nil
   s.queue, s.queued = {}, {}
   local in_order = not s.sub_o and s.order
   if in_order then
@@ -793,8 +1131,10 @@ function M.clear()
   local s = storage.f3d
   s.subs, s.queue, s.queued, s.dec_dirty, s.rank, s.have = {}, {}, {}, {}, {}, {}
   s.order, s.counted = {}, {}
-  s.sub_o, s.sub_r, s.sub_rows, s.sub_n = nil, nil, nil, nil
-  s.refresh_cursor, s.snap, s.count_cursor = nil, nil, nil
+  s.sub_o, s.sub_r, s.sub_rows, s.sub_n, s.sub_f = nil, nil, nil, nil, nil
+  s.refresh_cursor, s.snap, s.count_cursor, s.kept, s.rq = nil, nil, nil, nil, nil
+  s.dec_held, s.dec_sent = nil, nil
+  alt_mode.contents_forget() -- the chests' Alt-mode icons are sent again with the new world
 end
 
 local function read_tiles(surface, x0, y0)
@@ -823,10 +1163,53 @@ end
 -- The chunk's decoratives for a client that asked for them (`dc` in its hello), always sent (an
 -- empty list clears the chunk): [decorative id, x, y, amount, ...], x and y the tile within the
 -- chunk (0-31).
+-- dec_distance (perf.lua): a client whose hello says how far it draws decoratives (`dd`, tiles) gets a chunk's
+-- `dec` only while the chunk's middle is within dd + DEC_MARGIN of its square's middle (else of the focus); a
+-- chunk left out is held (s.dec_held) and sent once the square's middle brings it inside (dec_in_range) or the
+-- distance grows. At view distance 50, 94% of chunks lie past the 256-320 tiles the client draws them at, and
+-- decoratives are a fifth to a third of a snapshot's work. s.dec_sent: the chunks whose decoratives the client
+-- was sent (a `same` answer for one it hasn't sends them). Without dd every chunk's, as before.
+local DEC_MARGIN = 64
+
+local function dec_middle(s)
+  local o = s.sub_o
+  if o then
+    return o[1] * CHUNK + 16, o[2] * CHUNK + 16
+  end
+  return s.focus.x, s.focus.y
+end
+
+local function dec_near(s, cx, cy)
+  local dd = s.client and s.client.dd
+  if not dd or not perf.on("dec_distance") then
+    return true
+  end
+  local mx, my = dec_middle(s)
+  local dx, dy = cx * CHUNK + 16 - mx, cy * CHUNK + 16 - my
+  local reach = dd + DEC_MARGIN
+  return dx * dx + dy * dy <= reach * reach
+end
+
 local function send_decoratives(surface, cx, cy)
   local s = storage.f3d
   if not (s.client and s.client.dc) then
     return
+  end
+  local k = key(cx, cy)
+  if not dec_near(s, cx, cy) then
+    s.dec_held = s.dec_held or {}
+    s.dec_held[k] = true
+    if s.dec_sent then
+      s.dec_sent[k] = nil
+    end
+    return
+  end
+  if s.dec_held then
+    s.dec_held[k] = nil
+  end
+  if s.client.dd then
+    s.dec_sent = s.dec_sent or {}
+    s.dec_sent[k] = true
   end
   local x0, y0 = cx * CHUNK, cy * CHUNK
   local ok, found = pcall(surface.find_decoratives_filtered, { area = { { x0, y0 }, { x0 + CHUNK, y0 + CHUNK } } })
@@ -844,6 +1227,14 @@ local function send_decoratives(surface, cx, cy)
   end
   local per = DECORATIVES_PER_MESSAGE * 4
   local parts = math.max(1, math.ceil(m / per))
+  if perf.on("chunk_text") then
+    -- (As text: the numbers are integers, which table.concat writes as JSON does.)
+    for part = 1, parts do
+      transport.send_reliable_text("dec", ',"cx":' .. cx .. ',"cy":' .. cy .. ',"part":' .. part .. ',"parts":' .. parts
+        .. ',"l":[' .. concat(flat, ",", (part - 1) * per + 1, math.min(part * per, m)) .. "]")
+    end
+    return
+  end
   for part = 1, parts do
     local slice = {}
     for i = (part - 1) * per + 1, math.min(part * per, m) do
@@ -879,6 +1270,41 @@ function M.decoratives_changed_in(surface, box)
   end
 end
 
+-- (dec_distance) The held chunks now within reach (the square's middle moved, the distance grew): sent with
+-- the next decoratives' round. Looks at the chunks round the middle only, not every held one.
+function M.dec_in_range()
+  local s = storage.f3d
+  local held = s.dec_held
+  if not (held and next(held) and s.client) then
+    return
+  end
+  if not s.client.dd or not perf.on("dec_distance") then
+    -- (No distance any more, or the switch turned off: every chunk held comes.)
+    s.dec_dirty = s.dec_dirty or {}
+    for k in pairs(held) do
+      if s.subs[k] then
+        s.dec_dirty[k] = true
+      end
+    end
+    s.dec_held = {}
+    return
+  end
+  local mx, my = dec_middle(s)
+  local reach = s.client.dd + DEC_MARGIN
+  local r = math.ceil(reach / CHUNK)
+  local ox, oy = math.floor(mx / CHUNK), math.floor(my / CHUNK)
+  for cy = oy - r, oy + r do
+    for cx = ox - r, ox + r do
+      local k = key(cx, cy)
+      if held[k] and s.subs[k] and dec_near(s, cx, cy) then
+        held[k] = nil
+        s.dec_dirty = s.dec_dirty or {}
+        s.dec_dirty[k] = true
+      end
+    end
+  end
+end
+
 local function send_dirty_decoratives(surface)
   local s = storage.f3d
   local dirty = s.dec_dirty
@@ -903,6 +1329,7 @@ end
 -- in the chunk meanwhile (tracker.lua tells M.touched) queues it again once it is sent, as a strip
 -- already read wouldn't have it.
 local WORLD_SHARE = 0.7
+local REQUEUE_UNITS = 40  -- chunks a requeue job deals or reads out for a work unit
 -- Priced from /f3d-profile trace on the owner's save: a record (quality, marks, wires) costs about
 -- twice a chart's entity, a chunk's 1024 tiles about 100 units, its decoratives up to 100.
 local RECORD_PRICE = 2
@@ -932,6 +1359,17 @@ end
 local function send_snapshot(job)
   local records = job.records
   local parts = math.max(1, math.ceil(#records / ENTITIES_PER_MESSAGE))
+  if job.text then
+    -- (chunk_text: the tiles and records are text already, made in the job's slices.)
+    local at = ',"cx":' .. job.cx .. ',"cy":' .. job.cy
+    transport.send_reliable_text("chunk", at .. ',"tiles":[' .. job.tiles .. '],"parts":' .. parts .. ',"rs":' .. job.si
+      .. ',"rv":' .. job.rev .. ',"n":' .. job.count)
+    for part = 1, parts do
+      transport.send_reliable_text("ents", at .. ',"part":' .. part .. ',"parts":' .. parts .. ',"e":['
+        .. concat(records, ",", (part - 1) * ENTITIES_PER_MESSAGE + 1, math.min(part * ENTITIES_PER_MESSAGE, #records)) .. "]")
+    end
+    return
+  end
   transport.send_reliable({ t = "chunk", cx = job.cx, cy = job.cy, tiles = job.tiles, parts = parts,
     rs = job.si, rv = job.rev, n = job.count })
   for part = 1, parts do
@@ -956,7 +1394,11 @@ local function snapshot_step(surface, s)
   local x0, y0 = cx * CHUNK, cy * CHUNK
   if job.step < 0 then
     if not surface.is_chunk_generated({ cx, cy }) then
-      transport.send_reliable({ t = "chunk", cx = cx, cy = cy, none = true })
+      if job.text then
+        transport.send_reliable_text("chunk", ',"cx":' .. cx .. ',"cy":' .. cy .. ',"none":true')
+      else
+        transport.send_reliable({ t = "chunk", cx = cx, cy = cy, none = true })
+      end
       surface.request_to_generate_chunks({ cx * CHUNK + 16, cy * CHUNK + 16 }, 0)
       s.snap = nil
       return
@@ -972,7 +1414,15 @@ local function snapshot_step(surface, s)
       s.have[job.k] = nil
       if h.si == job.si and h.rv == job.rev and h.n == job.count then
         counted(s)[job.k] = job.count
-        transport.send_reliable({ t = "chunk", cx = cx, cy = cy, rs = job.si, same = job.rev })
+        if job.text then
+          transport.send_reliable_text("chunk", ',"cx":' .. cx .. ',"cy":' .. cy .. ',"rs":' .. job.si .. ',"same":' .. job.rev)
+        else
+          transport.send_reliable({ t = "chunk", cx = cx, cy = cy, rs = job.si, same = job.rev })
+        end
+        -- (dec_distance: the client's copy may have been made while the chunk was too far for its decoratives.)
+        if s.client and s.client.dd and s.client.dc and not (s.dec_sent and s.dec_sent[job.k]) then
+          send_decoratives(surface, cx, cy)
+        end
         s.snap = nil
         return
       end
@@ -984,6 +1434,9 @@ local function snapshot_step(surface, s)
   end
   if job.step == 0 then
     job.tiles = read_tiles(surface, x0, y0)
+    if job.text then
+      job.tiles = concat(job.tiles, ",")
+    end
     job.step = 1
     return
   end
@@ -1001,11 +1454,15 @@ local function snapshot_step(surface, s)
       end
     end
     -- An entity overlapping several chunks (or strips) belongs to the one containing its centre.
-    local records = job.records
+    local records, text = job.records, job.text
     for _, e in pairs(found) do
       local p = e.position
       if p.x >= x0 and p.x < x0 + CHUNK and p.y >= ya and p.y < yb then
-        records[#records + 1] = M.record(e)
+        if text then
+          records[#records + 1] = M.record_text(M.record(e))
+        else
+          records[#records + 1] = M.record(e)
+        end
       end
     end
     job.step = job.step + 1
@@ -1035,10 +1492,26 @@ function M.touched(entity)
   end
 end
 
+-- The next chunk queued, taken off the queue (nil when it is empty).
+function M.take_next()
+  local s = storage.f3d
+  local k = qpop(s, "queue")
+  if k ~= nil then
+    s.queued[k] = nil
+  end
+  return k
+end
+
+-- Chunks queued (/f3d-status).
+function M.queued_count()
+  local s = storage.f3d
+  return (s.queue and qlen(s.queue) or 0) + rq_waiting(s)
+end
+
 -- Chunks waiting to be sent (the one being read counts).
 function M.queue_length()
   local s = storage.f3d
-  return #(s.queue or {}) + (s.snap and 1 or 0)
+  return (s.queue and qlen(s.queue) or 0) + rq_waiting(s) + (s.snap and 1 or 0) + (s.kept and qlen(s.kept) or 0)
 end
 budget.register_queue("chunks", M.queue_length)
 
@@ -1090,6 +1563,45 @@ local function count_check(surface, s)
   end
 end
 
+-- The chunks the client dropped, told as kept (see MAX_KEPT): KEPT_PER_TICK counted a tick, under the
+-- chunks' share of the work budget, in one `kept` message.
+local function kept_step(surface, s)
+  local q = s.kept
+  if not q or qlen(q) == 0 then
+    return
+  end
+  local out = {}
+  local seen = counted(s)
+  local taken = 0
+  while taken < KEPT_PER_TICK and qlen(s.kept) > 0 do
+    if not budget.can(2, "chunks", WORLD_SHARE) then
+      break
+    end
+    local e = qpop(s, "kept")
+    taken = taken + 1
+    local k = e[1]
+    -- Asked for again meanwhile (its snapshot or `same` tells it), another surface, or changed since.
+    if not s.subs[k] and e[4] == surface.index and M.rev(surface.index, k) == e[5] then
+      local x0, y0 = e[2] * CHUNK, e[3] * CHUNK
+      local n = surface.count_entities_filtered({
+        area = { { x0, y0 }, { x0 + CHUNK, y0 + CHUNK } }, type = registry.excluded_types(), invert = true,
+      })
+      budget.spend(2, "chunks")
+      -- Counted since its last event, and not as many now: something changed unseen, not told.
+      local before = seen[k]
+      if before == nil or before == n then
+        out[#out + 1] = e[2]
+        out[#out + 1] = e[3]
+        out[#out + 1] = e[5]
+        out[#out + 1] = n
+      end
+    end
+  end
+  if #out > 0 then
+    transport.send_reliable({ t = "kept", rs = surface.index, l = out })
+  end
+end
+
 function M.tick()
   local s = storage.f3d
   if game.tick % REFRESH_INTERVAL == 0 then
@@ -1099,6 +1611,7 @@ function M.tick()
   if M.count_interval > 0 and game.tick % M.count_interval == 0 then
     count_check(surface, s)
   end
+  kept_step(surface, s)
   if game.tick % DECORATIVE_INTERVAL == 0 then
     send_dirty_decoratives(surface)
   end
@@ -1108,7 +1621,14 @@ function M.tick()
   -- back within a few ticks instead of a chunk a tick (a surface change and back, Factorissimo's
   -- buildings: 441 chunks took 7.4 s).
   -- A screenshot loading (photo.lua) reads more a tick, with more of the budget and a longer outbox.
-  local starts = settings.global["f3d-chunks-per-tick"].value
+  -- More than one start a tick (ROOM_STARTS, I18): each later chunk only while its slices fit what is
+  -- left of the chunks' share this tick (budget.can lets only a job's first slice of a tick past it),
+  -- so it costs nothing on a tick that is full anyway, and the UPS governor's budget bounds it all.
+  -- A requeue job (requeue_slices) first: the queue's new order, a slice a tick.
+  if s.rq and budget.can(REQUEUE_PER_TICK / REQUEUE_UNITS, "chunks", WORLD_SHARE) then
+    budget.spend(rq_step(s, REQUEUE_PER_TICK) / REQUEUE_UNITS, "chunks")
+  end
+  local starts = math.max(settings.global["f3d-chunks-per-tick"].value, ROOM_STARTS)
   local share, backlog = WORLD_SHARE, MAX_BACKLOG
   if photo.on() then
     starts, share, backlog = math.max(starts, photo.STARTS), photo.SHARE, photo.BACKLOG
@@ -1118,14 +1638,14 @@ function M.tick()
       s.snap = nil -- no longer wanted
     end
     if not s.snap then
-      if starts <= 0 or #s.queue == 0 then
+      if starts <= 0 or qlen(s.queue) == 0 then
         return
       end
-      local k = table.remove(s.queue, 1)
-      s.queued[k] = nil
+      local k = M.take_next()
       local c = s.subs[k]
       if c then
-        s.snap = { k = k, cx = c[1], cy = c[2], step = -1 }
+        -- (text: written as JSON text in its slices, perf.lua chunk_text; a job keeps the way it began.)
+        s.snap = { k = k, cx = c[1], cy = c[2], step = -1, text = perf.on("chunk_text") or nil }
       end
     end
     if s.snap then

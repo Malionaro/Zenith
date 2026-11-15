@@ -11,7 +11,7 @@ config_version=5
 [application]
 
 config/name="Zenith"
-config/version="0.2.0"
+config/version="0.2.1"
 config/description="3D client for a running Factorio game, via the factorio-3d-bridge mod."
 run/main_scene="res://scenes/main.tscn"
 config/features=PackedStringArray("4.4", "Forward Plus")
@@ -42,6 +42,14 @@ limits/global_shader_variables/buffer_size=4194304
 
 [shader_globals]
 
+f3d_nature_grain={
+"type": "sampler2DArray",
+"value": ""
+}
+f3d_nature_grain_on={
+"type": "float",
+"value": 0.0
+}
 f3d_ground={
 "type": "sampler2D",
 "value": ""
@@ -117,6 +125,14 @@ f3d_look_model_fill={
 f3d_look_roughness_min={
 "type": "float",
 "value": 0.0
+}
+f3d_pollution={
+"type": "sampler2D",
+"value": ""
+}
+f3d_pollution_rect={
+"type": "vec4",
+"value": Vector4(0, 0, 32, 0)
 }
 
 [xr]

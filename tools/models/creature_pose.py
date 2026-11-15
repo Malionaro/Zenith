@@ -5,6 +5,7 @@ to Factorio's sprites.
     python tools/models/creature_pose.py --fit big-biter-corpse    # search the pose, write the .glb
     python tools/models/creature_pose.py big-biter-corpse          # write the .glb from the stored pose
     python tools/models/creature_pose.py                           # every posed model
+    python tools/models/creature_pose.py --table                   # only client/data/creature_poses.json
 
 Wube printed a biter attacking and dead, and a spitter dead, but those statues don't take the
 sprites' poses: Factorio's dead biter lies rolled on its side with its legs drawn up, about as big
@@ -15,7 +16,9 @@ rig_mode 1) and folded at a knee, the body rolled, pitched and turned about its 
 ground (what sinks in is pressed flat) and scaled. The numbers are found by searching for the pose
 whose silhouettes overlap the sprite's frame best over its directions (turntable_anim.py's point
 splats at half resolution), starting from a coarse grid of body rolls and pitches, and kept in
-creature_poses.py (numbers only). wube.py builds these models through `write_posed` after their
+creature_poses.py (numbers only). The client blends the walking model's legs into each pose (a bite,
+a spit, a fall into the corpse) in the shader, from the legs' angles in creature_poses.json, and
+turns its body there the way the pose's body moved (see write_fall). wube.py builds these models through `write_posed` after their
 source (recipes with `"posed"` in wube_recipes.py). The worm's corpse is the worm (worm.py) fallen
 over the same way, without legs. Each corpse's body move also goes to client/data/creature_poses.json
 for the client's dying animation.
@@ -45,6 +48,9 @@ FIT_DIRS = (0, 2, 4, 6, 8, 10, 12, 14)
 # four models, "-corpse" for directions 0, 4, 8, 12 and "-corpse-1" to "-corpse-3" for the others;
 # the client picks by the direction it died facing (creatures.gd).
 CORPSE_VARIANTS = 4
+# The wriggler's strike: the frame of its attack (19 frames) where it rears highest, the front legs up
+# (creatures.gd WRIGGLER_STRIKE_TOP says where in the attack that is).
+WRIGGLER_STRIKE = 3
 
 
 def corpse_model(base, variant):
@@ -60,6 +66,8 @@ def targets(raw):
     standing = [(0.0, p) for p in np.radians((-35, -20, -10, 0, 10, 20))]
     biter_attack = u["big-biter"]["attack_parameters"]["animation"]
     spitter_attack = u["big-spitter"]["attack_parameters"]["animation"]
+    wriggler_attack = u["big-wriggler-pentapod"]["attack_parameters"]["animation"]
+    wriggler_death = c["big-wriggler-pentapod-corpse"]["animation"]
     out = {}
     # A dead spitter lies burst open on its belly, its plates up (the silhouette alone would as
     # soon roll it on its side, which shows its legs instead): its roll is kept within 40 degrees.
@@ -83,6 +91,15 @@ def targets(raw):
         "big-spitter-attack": ("big-spitter", spitter_attack, 13,
                                {"coarse": standing + [(0.0, p) for p in np.radians((-50, -65))], "limit": 1.2,
                                 "scale": (0.9, 1.1)}),
+        # Gleba's wriggler (gleba.py, five legs on the walking rig): rearing on its back legs with the
+        # front two raised to strike (frame 3 of its 19), and dead on its belly with its legs flung out
+        # (the last of its 17 dying frames; one fall in every direction).
+        "big-wriggler-pentapod-attack": ("big-wriggler-pentapod", wriggler_attack, WRIGGLER_STRIKE,
+                                         {"coarse": standing + [(0.0, p) for p in np.radians((-35, -50, -65))],
+                                          "limit": 1.5, "scale": (0.9, 1.1)}),
+        "big-wriggler-pentapod-corpse": ("big-wriggler-pentapod", wriggler_death, cs.frame_count(wriggler_death) - 1,
+                                         {"coarse": [s for s in lying if abs(s[0]) <= belly], "roll": (-belly, belly),
+                                          "limit": 1.6, "scale": (0.85, 1.15)}),
     })
 
 
@@ -304,17 +321,63 @@ def write_posed(name, entry, palette, alpha, copyright_text, out_dir=tt.MODELS):
         at += len(v)
         groups.append((material, wube.shaded(mesh)))
     path = os.path.join(out_dir, name + ".glb")
+    # Materials the kit's palette doesn't have (Gleba's, gleba.py's own) come from the source model.
+    palette = dict(palette, **{k: v for k, v in _materials_of(os.path.join(out_dir, entry["source"] + ".glb")).items()
+                              if k not in palette})
     wube.write_glb(path, groups, palette, alpha, copyright_text)
-    if os.path.abspath(out_dir) == os.path.abspath(tt.MODELS) and "-corpse" in name:
+    if os.path.abspath(out_dir) == os.path.abspath(tt.MODELS):
         write_fall(name, rig, x, allv, alluv, posed, entry)
     return path, sum(len(m.faces) for _, m in groups)
 
 
+def _materials_of(path):
+    """{material name: (sRGB hex, roughness, metallic, emissive hex or None, strength)} of a .glb, in
+    the kit palette's form."""
+    import json
+    import struct
+
+    def hexed(lin):
+        out = ""
+        for c in lin[:3]:
+            c = max(0.0, min(1.0, float(c)))
+            s = c * 12.92 if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055
+            out += "%02x" % int(round(s * 255))
+        return out
+    data = open(path, "rb").read()
+    size = struct.unpack_from("<I", data, 12)[0]
+    doc = json.loads(data[20:20 + size])
+    out = {}
+    for m in doc.get("materials", []):
+        pbr = m.get("pbrMetallicRoughness", {})
+        emit = m.get("emissiveFactor")
+        strength = m.get("extensions", {}).get("KHR_materials_emissive_strength", {}).get("emissiveStrength", 1.0)
+        out[m.get("name", "")] = (hexed(pbr.get("baseColorFactor", [0.7, 0.7, 0.7])), pbr.get("roughnessFactor", 0.8),
+                                  pbr.get("metallicFactor", 0.0), hexed(emit) if emit and any(emit) else None, strength)
+    return out
+
+
+def write_table(name, entry):
+    """Only the client's table (write_fall) for a stored pose, the model left as it is."""
+    src = _read_glb(os.path.join(tt.MODELS, entry["source"] + ".glb"))
+    allv = np.concatenate([v for _, v, _, _ in src])
+    alluv = np.concatenate([u for _, _, _, u in src])
+    rig = PoseRig(entry["source"], allv, math.pi)
+    x = np.zeros(rig.n)
+    for k, n in enumerate(rig.param_names()):
+        x[k] = entry["pose"].get(n, 0.0)
+    posed = rig.pose(allv, alluv, x) * entry["scale"]
+    posed[:, 0] += entry["offset"][0]
+    posed[:, 2] += entry["offset"][1]
+    write_fall(name, rig, x, allv, alluv, posed, entry)
+
+
 def write_fall(name, rig, x, verts, uv, posed, entry):
-    """The body's move from the source's rest pose to this one, for the client's dying animation
-    (creatures.gd turns the live model this way over the corpse's dying time, then swaps in the
-    corpse): the body's middle at rest and posed, the turn as a quaternion (x, y, z, w; glTF and
-    Godot share axes) and the scale. Legs aside, it is exact."""
+    """The body's move from the source's rest pose to this one, for the client's dying and attack
+    animations (creatures.gd turns the live model this way over the corpse's dying time, then swaps
+    in the corpse; a biter rears into its bite and back): the body's middle at rest and posed, the
+    turn as a quaternion (x, y, z, w; glTF and Godot share axes) and the scale; and each leg's swing,
+    lift and knee (`legs`, the walking rig's limb order), which the shader blends the legs into. With
+    both it is exact, but for what PoseRig pressed flat on the ground."""
     import json
     pitch, roll, yaw = x[-4], x[-3], x[-2]
 
@@ -331,9 +394,13 @@ def write_fall(name, rig, x, verts, uv, posed, entry):
         if w > 1e-6 else list(_quat_any(r))
     path = os.path.join(tt.REPO, "client", "data", "creature_poses.json")
     table = json.load(open(path, encoding="utf-8")) if os.path.exists(path) else {}
+    legs = [[round(float(entry["pose"].get("%s.%s" % (l["name"], k), 0.0)), 4) for k in ("swing", "lift", "knee")]
+            for l in rig.limbs]
     table[name] = {"from": entry["source"], "at": [round(float(c), 4) for c in at],
                    "to": [round(float(c), 4) for c in to], "turn": [round(float(c), 5) for c in q],
                    "scale": entry["scale"]}
+    if legs:
+        table[name]["legs"] = legs
     with open(path, "w", encoding="utf-8") as f:
         f.write("{\n" + ",\n".join('  "%s": %s' % (k, json.dumps(table[k])) for k in sorted(table)) + "\n}\n")
 
@@ -359,6 +426,10 @@ def main(argv):
     palette, alpha = wube.load_palette()
     palette.update(wube_recipes.EXTRA_MATERIALS)
     for name in names:
+        if "--table" in argv:
+            write_table(name, poses[name])
+            print("%s: table written" % name)
+            continue
         if do_fit:
             found = fit(name, raw)
             poses = load_poses()  # another fit may have saved meanwhile: keep its entries

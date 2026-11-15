@@ -31,6 +31,7 @@ const LibraryWindow := preload("res://scripts/ui/factorio/library_window.gd")
 const BlueprintWindow := preload("res://scripts/ui/factorio/blueprint_window.gd")
 const PlannerWindow := preload("res://scripts/ui/factorio/planner_window.gd")
 const BookWindow := preload("res://scripts/ui/factorio/book_window.gd")
+const BlueprintPicture := preload("res://scripts/ui/factorio/blueprint_picture.gd")
 
 const PLANNER_ITEMS := ["blueprint", "blueprint-book", "deconstruction-planner", "upgrade-planner"]
 
@@ -48,7 +49,16 @@ var held_record := {}
 var held_slot := 0
 
 var _preview_of := {}
+## The prototypes _preview was made with: another game's (or a test's other world) makes it again.
+var _preview_protos: Object = null
 var _preview: Array = []
+var _preview_tiles: Array = []
+var _preview_shift := Vector2.ZERO
+## Goes up whenever held_preview's list is made again (blueprint_preview.gd lays it out again).
+var preview_version := 0
+## Inventory blueprints' records for their tooltips' pictures (K11), asked of the bridge as a
+## tooltip opens: slot -> [what the slot held then, the record ({} until it comes)].
+var _slot_records := {}
 
 var _string_box: Control
 var _string_text: TextEdit
@@ -284,8 +294,6 @@ func held_step(protos, dir: int) -> Vector2i:
 	return size
 
 
-## The held blueprint's (or book's active page's) entities for the cursor's ghosts, like the
-## clipboard's: [{"p": proto id, "at": offset from the middle (tiles), "d"}, ...], at most 400.
 ## A blueprint entity's direction (16-way). Rolling stock has an orientation instead (0-1,
 ## clockwise from north), so without this every train in a blueprint faced north (issue #13).
 static func entity_direction(e: Dictionary) -> int:
@@ -294,33 +302,132 @@ static func entity_direction(e: Dictionary) -> int:
 	return int(e.get("direction", 0))
 
 
+## The held blueprint's (or book's active page's) entities for the cursor's preview
+## (blueprint_preview.gd), as the clipboard's (ui_actions.lua send_clip): [{"p": proto id, "at":
+## offset from the middle of what it covers (tiles), "d", "x": the model's extra (an underground's
+## end), "f": Factorio's `mirror` on a machine}, ...], every entity. The middle is that of the
+## entities' footprints and the tiles together, where Factorio holds a blueprint at the cursor
+## (#21's clipboard measured in 2.1.23; tiles counted too, not measured).
 func held_preview(protos) -> Array:
 	var bp := held_blueprint()
 	if bp.is_empty():
 		return []
-	if is_same(bp, _preview_of) or bp == _preview_of:
+	if (is_same(bp, _preview_of) or bp == _preview_of) and is_same(protos, _preview_protos):
 		return _preview
 	_preview_of = bp
+	_preview_protos = protos
 	_preview = []
-	var ents := BpString._list(BpString.body(bp).get("entities"))
-	if ents.is_empty():
-		return _preview
+	_preview_tiles = []
+	_preview_shift = Vector2.ZERO
+	preview_version += 1
+	var b := BpString.body(bp)
+	var found: Array = []
 	var lo := Vector2(INF, INF)
 	var hi := -lo
-	for e in ents:
-		var at := Vector2(float(e["position"].get("x", 0)), float(e["position"].get("y", 0)))
-		lo = lo.min(at)
-		hi = hi.max(at)
-	var mid := ((lo + hi) * 0.5).round()
-	for e in ents:
+	var plo := lo  # the entities' positions alone: where the absolute snapping's middle was taken
+	var phi := hi
+	for e in BpString._list(b.get("entities")):
 		var proto = protos.entities_by_name.get(str(e.get("name", "")))
-		if proto == null:
+		var p = e.get("position")
+		if proto == null or not (p is Dictionary):
 			continue
-		var at := Vector2(float(e["position"].get("x", 0)), float(e["position"].get("y", 0)))
-		_preview.append({"p": proto.id, "at": at - mid, "d": entity_direction(e)})
-		if _preview.size() >= 400:
-			break
+		var at := Vector2(float(p.get("x", 0)), float(p.get("y", 0)))
+		var d := entity_direction(e)
+		var half := Vector2(proto.tile_size) * 0.5
+		if posmod(roundi(d / 4.0), 2) == 1:
+			half = Vector2(half.y, half.x)
+		lo = lo.min(at - half)
+		hi = hi.max(at + half)
+		plo = plo.min(at)
+		phi = phi.max(at)
+		found.append([proto, at, d, e])
+	var corners: Array = []
+	for t in BpString._list(b.get("tiles")):
+		var p = t.get("position")
+		if not (p is Dictionary):
+			continue
+		var at := Vector2(float(p.get("x", 0)), float(p.get("y", 0)))
+		lo = lo.min(at)
+		hi = hi.max(at + Vector2.ONE)
+		corners.append(at)
+	if lo.x == INF:
+		return _preview
+	var mid := (lo + hi) * 0.5
+	if plo.x != INF:
+		_preview_shift = mid - ((plo + phi) * 0.5).round()
+	for f in found:
+		var e: Dictionary = f[3]
+		var entry := {"p": f[0].id, "at": (f[1] as Vector2) - mid, "d": f[2]}
+		if f[0].type == "underground-belt" or f[0].type == "linked-belt":
+			entry["x"] = {"u": "o" if str(e.get("type", "input")) == "output" else "i"}
+		if bool(e.get("mirror", false)):
+			entry["f"] = true
+		_preview.append(entry)
+	for c in corners:
+		_preview_tiles.append((c as Vector2) - mid)
 	return _preview
+
+
+## The held blueprint's tiles for the preview: their corners, offsets from the middle (held_preview
+## first).
+func held_preview_tiles() -> Array:
+	return _preview_tiles
+
+
+## With absolute snapping (player_input.gd blueprint_preview_centre): how far the middle held_preview's
+## offsets are from lies from the one its anchor was worked out for (the entities' positions' middle,
+## rounded), so the preview stands where it stood before K11.
+func held_shift() -> Vector2:
+	return _preview_shift
+
+
+## A blueprint's or book's picture for an inventory or quickbar slot's tooltip (slot.gd
+## picture_for, K11): the inventory stack's record (a quickbar pin's: the first stack of its item),
+## drawn once the bridge has sent it; null for slots elsewhere (a chest's: no export for them).
+func tip_picture(s) -> Control:
+	var index := 0
+	if str(s.slot_role) == "main":
+		index = int(s.slot_index)
+	elif str(s.slot_role) == "":
+		index = _first_slot_of(str(s.item))
+	if index <= 0:
+		return null
+	var picture := BlueprintPicture.new()
+	picture.protos = ui._protos()
+	picture.source = func() -> Dictionary: return slot_record(index)
+	return picture
+
+
+## The record of the blueprint or book in main slot `index` (1-based), or {} until the bridge has
+## sent it: asked once per stack the slot holds (kept until the slot holds another, or the bridge
+## says it was written).
+func slot_record(index: int) -> Dictionary:
+	var slots: Array = ui.model.main_slots
+	if index < 1 or index > slots.size() or not (slots[index - 1] is Dictionary):
+		return {}
+	var stack: Dictionary = slots[index - 1]
+	if not PLANNER_ITEMS.has(str(stack.get("item", ""))):
+		return {}
+	if held_slot == index and not held_record.is_empty():
+		return held_record
+	var held_now := "%s|%s|%s" % [stack.get("item", ""), stack.get("count", 0), str(stack.get("icons", []))]
+	var got: Array = _slot_records.get(index, [])
+	if not got.is_empty() and str(got[0]) == held_now:
+		return got[1]
+	_slot_records[index] = [held_now, {}]
+	model.export_stack(index, func(r: Dictionary, _t: String, _info: Dictionary) -> void:
+		var now: Array = _slot_records.get(index, [])
+		if not now.is_empty() and str(now[0]) == held_now:
+			_slot_records[index] = [held_now, r])
+	return {}
+
+
+func _first_slot_of(item: String) -> int:
+	var slots: Array = ui.model.main_slots
+	for i in slots.size():
+		if slots[i] is Dictionary and str((slots[i] as Dictionary).get("item", "")) == item:
+			return i + 1
+	return 0
 
 
 # --- windows ----------------------------------------------------------------------------------
@@ -414,6 +521,7 @@ func _on_deleted(source: Dictionary) -> void:
 ## The mod wrote a stack. A fresh one (Alt+B's selection made a blueprint, or Select new contents
 ## filled one) opens its window.
 func _on_stack_written(_q: int, slot: int, item: String, fresh: bool) -> void:
+	_slot_records.erase(slot)
 	if fresh and slot != 0 and item == "blueprint":
 		if slot == _reselect_slot and not _reselect_source.is_empty():
 			var from := _reselect_source

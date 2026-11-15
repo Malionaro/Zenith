@@ -18,12 +18,12 @@ extends RefCounted
 ## What waits: movers, belt items (and their far icons, freshness, quality), inserter hands, items
 ## on the ground, shots, beams, fires and clouds, turrets, enemies' targets, demolishers, spider and
 ## pentapod feet, asteroids, collectors, cargo pods, lightning, trains, robots' cargo, health bars,
-## deaths and hits.
+## deaths and hits, and what F picks up (`pku`).
 const HELD_TYPES := {
-	"mv": true, "bi": true, "bf": true, "bq": true, "bfar": true, "ih": true, "gi": true,
+	"mv": true, "bi": true, "bf": true, "bq": true, "bfar": true, "ih": true, "ie": true, "gi": true,
 	"pj": true, "gf": true, "shot": true, "afx": true, "died": true, "ts": true, "tf": true, "en": true,
 	"seg": true, "legs": true, "ach": true, "acol": true, "cp": true, "lt": true, "tr": true, "rc": true,
-	"hp": true,
+	"hp": true, "pku": true,
 }
 
 static var on := false
@@ -33,7 +33,7 @@ static func begin() -> void:
 	if on:
 		return
 	on = true
-	Bridge.hold_types(HELD_TYPES)
+	_bridge_hold(HELD_TYPES)
 
 
 ## Time runs again; what the bridge sent meanwhile is handled over the next frames.
@@ -41,4 +41,14 @@ static func end() -> void:
 	if not on:
 		return
 	on = false
-	Bridge.hold_types({})
+	_bridge_hold({})
+
+
+## The Bridge autoload, looked up by path: named outright it is a compile error in a headless `-s` script
+## (tests/belt_bs_replay.gd and every test preloading belt_items.gd then ran with their statics unset:
+## the replay's `drawing:` line said ahead 0, read apply off, native draw off).
+static func _bridge_hold(types: Dictionary) -> void:
+	var tree := Engine.get_main_loop() as SceneTree
+	var bridge: Node = tree.root.get_node_or_null(^"Bridge") if tree != null and tree.root != null else null
+	if bridge != null and bridge.has_method("hold_types"):
+		bridge.hold_types(types)

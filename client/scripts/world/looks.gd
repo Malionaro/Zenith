@@ -367,9 +367,8 @@ func _apply_limiter(L: Dictionary) -> void:
 
 func _apply_taa(L: Dictionary) -> void:
 	Settings.look_taa = bool(L.get("taa", false))
-	var vp := get_viewport()
-	if vp != null:
-		vp.use_taa = Settings.taa_on()
+	# TAA on the viewport, and SMAA out while it is on (Settings.follow_taa).
+	Settings.follow_taa(get_viewport())
 
 
 ## How much of a sunset the look in use has, for its light and for its sky (sky.gd).
@@ -557,6 +556,12 @@ func _make_pass(spec: Dictionary, owner: String, base := 0) -> MeshInstance3D:
 	mi.material_override = m
 	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	mi.extra_cull_margin = 16384.0  # it covers the screen wherever it is
+	# First of whatever shares its priority: Godot sorts those by their distance from the camera, and
+	# the quad's is the world's origin. The flat ground clutter's lowest kinds share -128 with the first
+	# pass (decoratives.gd _flat_priority), and their chunks further away than the origin (most of them
+	# round the spawn) were drawn first and then covered: the pass writes the solid scene from the
+	# screen copy over the whole screen.
+	mi.sorting_offset = -100000.0
 	mi.name = "LookPass"
 	add_child(mi)
 	return mi

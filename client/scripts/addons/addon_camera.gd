@@ -87,7 +87,7 @@ func player_fov() -> float:
 ## back may want to end in the same projection.
 func player_orthographic() -> bool:
 	var rig = _host.rig()
-	return rig != null and rig.orthographic and not rig.first_person
+	return rig != null and rig.view_orthographic()
 
 
 func set_transform(t: Transform3D) -> void:

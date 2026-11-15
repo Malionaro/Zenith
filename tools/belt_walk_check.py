@@ -25,7 +25,9 @@ draw-dump reader and live timing. What differs from a belt_view_check run:
   recorded tick, placed as the shader places them, matched to the game's items one to one by place and
   item within 0.15 tile; phantoms, holes), but the bounds are the client's own ground view at the job
   that was on screen (the dump's `view`), clipped to what was recorded round the character, so the
-  bounds move with the character. Each lane's time in view is tracked sample by sample: a lane in view
+  bounds move with the character, and to the recording's whole area (run.json `area`, planned from the
+  route and --speed): a walk that goes further than planned has nothing recorded past it, and its drawn
+  items there would all count as phantoms (13-16% on two walks). Each lane's time in view is tracked sample by sample: a lane in view
   at the recording's first sample counts as steady; one that comes in later is aged from the sample it
   came in on. Buckets: under 1 s, 1-3 s, 3-10 s, 10 s and more (steady).
 - Images: side_walk_<shot>_<tick>.png (the client's screenshot on top, the game's items at the nearest
@@ -370,10 +372,12 @@ def char_at(truth):
     return f
 
 
-def score_walk(truth, dump, apply_path, cam, size, kinds, at=None, squares=()):
+def score_walk(truth, dump, apply_path, cam, size, kinds, at=None, squares=(), area=None):
     """The live draw against the game at every recorded sample, the bounds the client's own view at the
-    job on screen (clipped to what was recorded round the character), each lane aged by its time in
-    view. Returns the report's dict, or None when no sample was drawn."""
+    job on screen (clipped to what was recorded round the character, and to the recording's whole area
+    `area` (x0, y0, x1, y1): a walk that goes past it has nothing recorded to score the draw against
+    there), each lane aged by its time in view. Returns the report's dict, or None when no sample was
+    drawn."""
     applies = bvc.read_apply(apply_path)
     if not applies:
         return None
@@ -405,6 +409,7 @@ def score_walk(truth, dump, apply_path, cam, size, kinds, at=None, squares=()):
     first_sample = True
     offsets = []
     clipped = 0
+    past_area = 0
     for h, ids, recs, gone, paths in bvc.dump_frames(dump):
         hdrs.append(h)
         state.apply(ids, recs, gone, paths)
@@ -423,6 +428,11 @@ def score_walk(truth, dump, apply_path, cam, size, kinds, at=None, squares=()):
             nb = (max(b[0], rec_b[0]), max(b[1], rec_b[1]), min(b[2], rec_b[2]), min(b[3], rec_b[3]))
             if nb != b:
                 clipped += 1
+            if area:
+                ab = (max(nb[0], area[0]), max(nb[1], area[1]), min(nb[2], area[2]), min(nb[3], area[3]))
+                if ab != nb:
+                    past_area += 1
+                nb = ab
             b = nb
             # Lanes in view now: aged from the sample they came in on; the first sample's count as steady.
             now = {key for key, p in pts.items() if in_bounds(p, b)}
@@ -455,7 +465,7 @@ def score_walk(truth, dump, apply_path, cam, size, kinds, at=None, squares=()):
         return None
     rep = {"ticks": [per_tick[0]["tick"], per_tick[-1]["tick"]], "samples": len(per_tick), "counts": dict(total),
            "by_age": {k: dict(v) for k, v in by_age.items()}, "per_tick": per_tick,
-           "timing": bvc.live_timing(hdrs, applies), "clipped": clipped,
+           "timing": bvc.live_timing(hdrs, applies), "clipped": clipped, "past_area": past_area,
            "view_offset": [sum(o[0] for o in offsets) / len(offsets), sum(o[1] for o in offsets) / len(offsets)] if offsets else None,
            "not_scored": [t for t in ticks if t not in {p["tick"] for p in per_tick}]}
     rep["visible_pct"] = 100.0 * total["seen"] / max(1, total["game"])
@@ -488,6 +498,8 @@ def format_report(rep, run, info):
     if rep.get("view_offset"):
         L.append("   the client's view centre against the character at the sample's tick: %+.1f, %+.1f tiles (mean); bounds clipped to the recording %d times" % (
             rep["view_offset"][0], rep["view_offset"][1], rep["clipped"]))
+    if rep.get("past_area"):
+        L.append("   the view went past the recording's area (the walk went further than planned) at %d samples: scored only inside it" % rep["past_area"])
     c = collections.Counter(rep["counts"])
     L.append("")
     L.append("L. Live draw while %s (the client's records when the drawn clock showed each sample, in the client's own view)" % (
@@ -637,11 +649,11 @@ def live(a, wt, ports, out, lock):
     shutil.copyfile(save_src, save)
     bvc.sync_mod(wt)
     cfg = out / "settings.cfg"
-    bvc.settings_file(cfg, "automatic", a.hold60)
+    bvc.settings_file(cfg, "automatic", a.hold60, a.client_setting)
     stream, truth, dump, probe = out / "stream.jsonl", out / "truth.json", out / "draw.bin", out / "probe.json"
     for f in (stream, truth, dump, probe, pathlib.Path(str(dump) + ".apply.jsonl")):
         f.unlink(missing_ok=True)
-    cam = bvc.camera_arg("top", a.size)
+    cam = bvc.camera_arg(a.camera, a.size)
     routes = probe_routes(wt)
     legs = routes.get(a.route)
     if legs is None:
@@ -771,7 +783,7 @@ def analyze(out, info, a):
     dump = out / "draw.bin"
     kinds = kinds_from_stream(stream, truth)
     rep = score_walk(truth, dump, pathlib.Path(str(dump) + ".apply.jsonl"), info.get("camera"), float(info.get("size") or a.size), kinds,
-                     tuple(info.get("at") or a.at), stream_squares(stream))
+                     tuple(info.get("at") or a.at), stream_squares(stream), tuple(info["area"]) if info.get("area") else None)
     if rep is None:
         raise SystemExit("no recorded sample was drawn by the client (%s)" % dump)
     run = bvc.run_info(stream, out / "status.txt", out / "settings.cfg", tuple(rep["ticks"]))
@@ -812,6 +824,10 @@ def main():
     ap.add_argument("--shots-every", type=int, default=5)
     ap.add_argument("--tail-wait", type=float, default=40)
     ap.add_argument("--client-arg", action="append", default=[])
+    ap.add_argument("--client-setting", action="append", default=[], help="another line for the client's settings.cfg "
+                    "[graphics], key=value (as belt_view_check's; repeatable)")
+    ap.add_argument("--camera", default="top", help="as belt_view_check's: top (the default), or the client's "
+                    "<yaw>,<pitch>,<distance>[,ortho] (a perspective camera's recorded area is --size round the view, widened)")
     ap.add_argument("--bs", action="append", default=[], help="a bridge switch set once the server is up: name=value (/f3d-bs name value)")
     ap.add_argument("--godot", default="")
     ap.add_argument("--lock", default="")

@@ -7,8 +7,12 @@ extends Node3D
 ##
 ## The cards are additive and face the camera (fx_sprite_add); the model in front hides them
 ## where it should, so a fire shows through the mouth's opening only. One MultiMesh per sheet.
+## On an add-on's hills (ground_height.gd) the cards are lifted in their shader, as the models are;
+## the lights are placed here, so each is lifted by the height under it, read once per machine and
+## again only when the hills change.
 
 const ProtoDB := preload("res://scripts/world/protos.gd")
+const GroundHeight := preload("res://scripts/world/ground_height.gd")
 const SoundBank := preload("res://scripts/fx/sound_bank.gd")
 const ADD_SHADER := preload("res://shaders/fx_sprite_add.gdshader")
 
@@ -54,7 +58,9 @@ var _sheets := {}  # sheet -> [MultiMeshInstance3D, aspect, frames, fps]
 var _lights: Array[OmniLight3D] = []
 var radius := RADIUS
 var max_lights := MAX_LIGHTS
-var _shown := {}  # entity key -> [rec, MACHINES entry, level 0-1, seed, prototype name]
+## entity key -> [rec, MACHINES entry, level 0-1, seed, prototype name, the hills' height under its
+## light, GroundHeight.version() it was read at]
+var _shown := {}
 var _timer := 0.0
 var _clock := 0.0
 
@@ -129,6 +135,7 @@ func _process(delta: float) -> void:
 	var focus: Vector2 = world.focus()
 	var buffers := {}
 	var lit: Array = []
+	var hills := GroundHeight.version()
 	for key in _shown.keys():
 		var s: Array = _shown[key]
 		var on: bool = int(world.working.get(s[0].unit, 0)) == 1 and world.entities.has(key)
@@ -167,7 +174,10 @@ func _process(delta: float) -> void:
 			energy *= 0.6 + 0.4 * sin((_clock / LAB_LOOP + seed) * TAU)
 		else:
 			energy *= flicker
-		lit.append([Vector2(at.x, at.z).distance_squared_to(focus), at, entry[3], energy])
+		if int(s[6]) != hills:
+			s[5] = GroundHeight.at(at.x, at.z)
+			s[6] = hills
+		lit.append([Vector2(at.x, at.z).distance_squared_to(focus), at + Vector3(0.0, float(s[5]), 0.0), entry[3], energy])
 	for sheet in _sheets:
 		var mm: MultiMesh = (_sheets[sheet][0] as MultiMeshInstance3D).multimesh
 		var buf: PackedFloat32Array = buffers.get(sheet, PackedFloat32Array())
@@ -200,7 +210,7 @@ func _refresh() -> void:
 		var proto: ProtoDB.EntityProto = protos.entity(rec.proto_id)
 		if proto == null or not MACHINES.has(proto.name):
 			continue
-		_shown[unit] = [rec, MACHINES[proto.name], 0.0, fposmod(rec.pos.x * 0.37 + rec.pos.y * 0.71, 1.0), proto.name]
+		_shown[unit] = [rec, MACHINES[proto.name], 0.0, fposmod(rec.pos.x * 0.37 + rec.pos.y * 0.71, 1.0), proto.name, 0.0, -1]
 	for key in _shown.keys():
 		if (_shown[key][0].pos as Vector2).distance_to(focus) > radius + 8.0:
 			_shown.erase(key)

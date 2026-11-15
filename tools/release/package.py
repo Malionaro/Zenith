@@ -102,7 +102,9 @@ install to factorio.app/Contents/MacOS/factorio. The scripts in server/ are for 
 Zenith's menu starts Factorio by itself.
 """),
 }
-SERVER_FILES = ["server-settings.json", "run-server.ps1", "run-headless.sh", "download-headless.sh", "factorio-with-zenith.ps1"]
+# relay.py: the user guide's "The server on another PC" runs it from the download's server folder.
+SERVER_FILES = ["server-settings.json", "run-server.ps1", "run-headless.sh", "download-headless.sh", "factorio-with-zenith.ps1",
+                "relay.py"]
 # The models from Wube's printable release (CC BY-NC) and from FUE5 (CC BY-NC-SA) ship inside the game:
 # their per-model lists and licence terms go beside it, as the licences ask.
 DOCS = [("LICENSE", "LICENSE.txt"), ("LICENSING.md", "LICENSING.md"), ("CREDITS.md", "CREDITS.md"), ("docs/USER-GUIDE.md", "USER-GUIDE.md"),
@@ -176,9 +178,9 @@ USER-GUIDE.md has the controls and everything else. Bug reports are welcome on t
 issue tracker.
 """
 START_HERE_DEV = """
-This is a DEVELOPMENT BUILD, for testers: it has the testing tools the public
-downloads leave out, the main menu's Performance test (PERFORMANCE-TEST.md) and the debug menu
-(Ctrl+F12 in a game). Please don't pass it on.
+This is the development build, the same Zenith as the main download plus the testing tools that
+one leaves out: the main menu's Performance test (PERFORMANCE-TEST.md) and the debug menu (Ctrl+F12
+in a game).
 """
 
 

@@ -752,6 +752,15 @@ def dump_frames(path):
                 base = float(h.get("base", 0.0))
                 recs[:, 3] += base
                 recs[:, 7] += base
+                # (--inserter-handoff: an item record's texel 3 w is the tick a hand took it, from base too;
+                # a lattice slot's is its period.)
+                hide = (recs[:, 13] < 0.5) & (recs[:, 14] <= 0.5) & (recs[:, 15] > 0.0)
+                recs[hide, 15] += base
+                show = (recs[:, 13] < 0.5) & (recs[:, 14] <= 0.5) & (recs[:, 15] < 0.0)
+                recs[show, 15] -= base  # (negative: minus the put's tick, from base too)
+                # (A lattice slot's texel 3 x: the hole a take left, belt_lattice.gd hole.)
+                hole = (recs[:, 13] < 0.5) & (recs[:, 14] > 0.5) & (recs[:, 12] > 0.0)
+                recs[hole, 12] += base
                 o += ni * REC_FLOATS * 4
             if ng:
                 gone = np.frombuffer(data, dtype=np.int64, count=ng, offset=o)
@@ -821,7 +830,16 @@ class DrawState:
         if wrap.any():
             q = (t - t0[wrap]) / period[wrap]
             g[wrap] = q - np.floor(q)
+        holed = lattice & (r[:, 12] > 0.0) & (t >= r[:, 12])
+        if holed.any():
+            per = np.where(period > 0.0, period, 1.0)
+            same = (period <= 0.0) | (np.floor((t - t0) / per) == np.floor((r[:, 12] - t0) / per))
+            holed &= same
         shown = code > -0.5
+        # (--inserter-handoff) An item a hand took isn't drawn from the take's tick (texel 3 w), as the shader.
+        shown &= ~(~lattice & (r[:, 13] < 0.5) & (r[:, 15] > 0.0) & (t >= r[:, 15]))
+        shown &= ~(~lattice & (r[:, 13] < 0.5) & (r[:, 15] < 0.0) & (t < -r[:, 15]))
+        shown &= ~holed
         straight = code < 0.5
         x = r[:, 0] + r[:, 4] * g
         z = r[:, 2] + r[:, 6] * g

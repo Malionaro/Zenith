@@ -36,7 +36,7 @@ M.ORIENTED = {
 }
 
 -- Machines whose working state drives client-side animation. A working lamp is one with power;
--- the client lights it only when it is dark.
+-- the client lights it only when it is dark, unless it is set to Always on (K20, `st` `ao`).
 local ANIMATED_TYPES = {
   "assembling-machine", "furnace", "mining-drill", "lab", "boiler", "generator", "reactor",
   "radar", "rocket-silo", "pump", "offshore-pump", "beacon", "burner-generator",

@@ -30,11 +30,34 @@ vec4 belt_path_at(int code, float g) {
 	return mix(p0, p1, f - float(i));
 }
 
-// Record layout as belt_records.gd: 4 texels, 1024 texels a row, 16 rows a layer.
-vec4 belt_texel(int r, int k) {
+// item_cards.gd MAX_YAW and PILE_TURN.
+const float BELT_MAX_YAW = 0.35;
+const float BELT_PILE_TURN = 0.45;
+
+// A packed lane's item's turn (belt_lattice.gd, K14): `who` it is along its run and the run's seed, hashed
+// into the range every item turns in (item_cards.gd lattice_turn, the same integer steps).
+float belt_lattice_turn(int who, float run) {
+	uint x = uint(who & 1048575) + uint(round(run)) * 2654435769u;
+	x = x ^ (x >> 16u);
+	x = x * 2146121005u;
+	x = x ^ (x >> 15u);
+	x = x * 2221713035u;
+	x = x ^ (x >> 16u);
+	return (float(x % 2001u) / 1000.0 - 1.0) * BELT_MAX_YAW;
+}
+
+// Texels a layer (a page of belt_records.gd: 1024 a row, 4 rows, or 16 with --belt-draw-small-pages=off),
+// from the records' texture itself.
+int belt_layer_texels() {
+	ivec3 s = belt_tex == 1 ? textureSize(f3d_belt_lattice, 0) : textureSize(f3d_belt_records, 0);
+	return max(s.x * s.y, 1);
+}
+
+// Record layout as belt_records.gd: 4 texels, 1024 texels a row, `per` texels a layer.
+vec4 belt_texel(int r, int k, int per) {
 	int t = r * 4 + k;
-	int layer = t / 16384;
-	int within = t - layer * 16384;
+	int layer = t / per;
+	int within = t - layer * per;
 	if (belt_tex == 1) {
 		return texelFetch(f3d_belt_lattice, ivec3(within % 1024, within / 1024, layer), 0);
 	}
@@ -42,38 +65,61 @@ vec4 belt_texel(int r, int k) {
 }
 
 // Moves a vertex (world coordinates; a belt item's instance is unmoved) where its item is drawn now,
-// turned, and its normal with it; not drawn: nowhere. A pile's copy (texel 3: k > 0) is drawn from
+// turned, and its normal with it; not drawn: nowhere (also from the tick in an item's texel 3 w on). A pile's copy (texel 3: k > 0) is drawn from
 // its item's record, k pile steps higher, with its own turn (its texel 2: every copy turns, cards and
 // blocks too; belt_items.gd). A lattice slot's copies (belt_lattice.gd) slide with their slot (its texel
-// 3) and, as it, aren't masked.
+// 3) and, as it, aren't masked. A lattice slot whose texel 3 z is 2 holds who its item is in texel 2 (x:
+// on its record's clock, y: its run's seed): each period slid, the item there is the one that was a slot
+// behind, so who it is goes up by one and its turn goes on with it.
 void belt_place(inout vec3 vertex, inout vec3 normal, int id) {
 	if (belt_base < 0) {
 		return;
 	}
 	int r = belt_base + id;
-	vec4 d = belt_texel(r, 3);
+	int per = belt_layer_texels();
+	vec4 d = belt_texel(r, 3, per);
 	vec4 e = d;  // the drawn record's texel 3 (a copy's item's or slot's)
 	vec2 own = vec2(1.0, 0.0);
 	if (d.y > 0.5) {
-		own = belt_texel(r, 2).xy;
+		own = belt_texel(r, 2, per).xy;
 		r += int(round(d.x));
-		e = belt_texel(r, 3);
+		e = belt_texel(r, 3, per);
 	}
-	vec4 a = belt_texel(r, 0);
-	vec4 b = belt_texel(r, 1);
-	vec4 c = belt_texel(r, 2);
+	vec4 a = belt_texel(r, 0, per);
+	vec4 b = belt_texel(r, 1, per);
+	vec4 c = belt_texel(r, 2, per);
 	if (c.w < -0.5) {
 		vertex = vec3(0.0);
 		return;
 	}
+	vec2 who = c.xy;  // (a lattice slot's item, below)
 	if (d.y > 0.5) {
 		c.z += d.z * d.y;
 		c.xy = own;
 	}
 	float g = b.w > a.w ? clamp((f3d_belt_clock - a.w) / (b.w - a.w), 0.0, 1.0) : 1.0;
 	bool lattice = e.y < 0.5 && e.z > 0.5;
+	float slid = 0.0;
 	if (lattice && e.w > 0.0) {
-		g = fract((f3d_belt_clock - a.w) / e.w);
+		float q = (f3d_belt_clock - a.w) / e.w;
+		g = fract(q);
+		slid = floor(q);
+	}
+	if (lattice && e.z > 1.5) {
+		float turn = belt_lattice_turn(int(round(who.x)) + int(slid), who.y) + BELT_PILE_TURN * d.y;
+		c.xy = vec2(cos(turn), sin(turn));
+	}
+	// An item an inserter's hand took (--inserter-handoff: texel 3 w, the take's tick) isn't drawn from
+	// that tick: the hand holds it; one a hand puts (w negative, minus the put's tick) not before it.
+	if (!lattice && (e.w > 0.0 && f3d_belt_clock >= e.w || e.w < 0.0 && f3d_belt_clock < -e.w)) {
+		vertex = vec3(0.0);
+		return;
+	}
+	// The hole such a take leaves in a lattice (texel 3 x of the slot's own record: hidden from then to the
+	// end of that period; belt_lattice.gd hole).
+	if (lattice && e.x > 0.0 && f3d_belt_clock >= e.x && (e.w <= 0.0 || floor((f3d_belt_clock - a.w) / e.w) == floor((e.x - a.w) / e.w))) {
+		vertex = vec3(0.0);
+		return;
 	}
 	vec3 at = a.xyz;
 	if (c.w < 0.5) {

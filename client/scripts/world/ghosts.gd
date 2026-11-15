@@ -5,6 +5,11 @@ extends Node3D
 ## translucent blue-white; an entity marked for deconstruction (`extra.d`) gets Factorio's red cross over
 ## it, one marked for upgrade (`extra.up`) the green upgrade arrow. Per chunk, rebuilt when the
 ## world redraws the chunk (chunk_view.gd leaves ghosts out).
+##
+## A ghost is drawn in two passes (owner's I11, "ghost models look rough"): ghost_depth.gdshader
+## lays down every ghost's depth, then ghost.gdshader colours only the nearest surface, so a ghost
+## is one clean translucent layer instead of its inner faces and the ghosts behind it showing through
+## in whatever order they were drawn. Always the full model (a ghost has no levels of detail).
 
 const WorldMirror := preload("res://scripts/world/world.gd")
 const ProtoDB := preload("res://scripts/world/protos.gd")
@@ -13,11 +18,18 @@ const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const FluidsPower := preload("res://scripts/world/fluids_power.gd")
 const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
 const GhostShader := preload("res://shaders/ghost.gdshader")
+const GhostDepthShader := preload("res://shaders/ghost_depth.gdshader")
 const IconShader := preload("res://shaders/billboard_icon.gdshader")
 
 const MARK_SIZE := 0.9
 const GHOST_TINT := Color(0.58, 0.68, 1.0, 0.42)  # ghost.gdshader's
 const REBUILDS_PER_FRAME := 4
+## Every ghost's depth first, then their colour: both among the see-through things (up to 2), before
+## the smog (pollution.gd, 4) and the remote view's fog (5).
+const DEPTH_PRIORITY := 1
+const COLOR_PRIORITY := 2
+## ghost.gdshader's slow band of light rising through a ghost: faint, as Factorio's ghosts are still.
+const SHIMMER := 0.5
 
 var world: WorldMirror
 
@@ -30,8 +42,14 @@ var _ghosts := 0
 
 
 func _ready() -> void:
+	var colour := ShaderMaterial.new()
+	colour.shader = GhostShader
+	colour.render_priority = COLOR_PRIORITY
+	colour.set_shader_parameter("shimmer", SHIMMER)
 	_ghost_material = ShaderMaterial.new()
-	_ghost_material.shader = GhostShader
+	_ghost_material.shader = GhostDepthShader
+	_ghost_material.render_priority = DEPTH_PRIORITY
+	_ghost_material.next_pass = colour
 	var marks := {
 		"d": ["core/graphics/cancel.png", Color(0.85, 0.1, 0.1)],
 		"up": ["core/graphics/icons/upgrade-symbol.png", Color(0.2, 0.75, 0.2)],
@@ -45,6 +63,7 @@ func _ready() -> void:
 	_quad.size = Vector2.ONE
 	if world != null:
 		world.entities_changed.connect(_on_entities_changed)
+		world.ghost_hidden.connect(_on_entities_changed)
 
 
 func reset() -> void:
@@ -91,6 +110,8 @@ func _rebuild(c: Vector2i) -> void:
 	var ghosts := 0
 	var tiles: Array = []
 	for rec: WorldMirror.Rec in cv.entities.values():
+		if rec.extra.has("hid"):
+			continue  # removed by the player, the game's `del` on its way (predicted.gd)
 		if rec.extra.has("tg"):
 			# A tile ghost: a flat translucent square on its tile, like Factorio's blue tile ghosts.
 			tiles.append(Transform3D(Basis.from_scale(Vector3(0.96, 0.02, 0.96)), Vector3(floorf(rec.pos.x) + 0.5, 0.04, floorf(rec.pos.y) + 0.5)))
@@ -186,4 +207,5 @@ static func _add(parent: Node3D, mesh: Mesh, xforms: Array, material: Material) 
 	mmi.multimesh = mm
 	mmi.material_override = material
 	mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	mmi.lod_bias = 8.0  # the whole model at every normal zoom, should a mesh carry Godot's levels
 	parent.add_child(mmi)

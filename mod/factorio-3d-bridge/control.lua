@@ -10,10 +10,12 @@ local ground_items = require("scripts.ground_items")
 local fluids_power = require("scripts.fluids_power")
 local inserters = require("scripts.inserters")
 local sky = require("scripts.sky")
+local pollution = require("scripts.pollution")
 local puppet = require("scripts.puppet")
 local driving = require("scripts.driving")
 local screens = require("scripts.screens")
 local combat = require("scripts.combat")
+local repair = require("scripts.repair")
 local turrets = require("scripts.turrets")
 local shots = require("scripts.shots")
 local inventory = require("scripts.inventory")
@@ -59,14 +61,14 @@ script.on_event(defines.events.on_udp_packet_received, function(event) barrier.c
 -- live state.
 local STEPS = {
   { "transport", transport.flush }, { "tracker", tracker.tick }, { "puppet", puppet.tick },
-  { "combat", combat.tick }, { "turrets", turrets.tick }, { "shots", shots.tick },
+  { "repair", repair.tick }, { "combat", combat.tick }, { "turrets", turrets.tick }, { "shots", shots.tick },
   { "driving", driving.tick }, { "screens", screens.tick },
   { "inventory", inventory.tick }, { "crafting", crafting.tick }, { "research", research.tick },
   { "map", map.tick }, { "trains", trains.tick }, { "logistics", logistics.tick }, { "platforms", platforms.tick },
   { "planets", planets.tick }, { "space", space.tick }, { "collectors", collectors.tick },
   { "world", world.tick }, { "movers", movers.tick }, { "belt_items", belt_items.tick }, { "belt_lanes", belt_items.far_tick },
   { "ground_items", ground_items.tick }, { "fluids_power", fluids_power.tick },
-  { "inserters", inserters.tick }, { "sky", sky.tick }, { "ui_actions", ui_actions.tick }, { "alt_mode", alt_mode.tick }, { "belt_switch", belt_switch.tick },
+  { "inserters", inserters.tick }, { "sky", sky.tick }, { "pollution", pollution.tick }, { "ui_actions", ui_actions.tick }, { "alt_mode", alt_mode.tick }, { "belt_switch", belt_switch.tick },
   { "alerts", alerts.tick }, { "equipment", equipment.tick }, { "players", players.tick },
   { "enemies", enemies.tick }, { "requests", requests.tick }, { "gfx", gfx.tick }, { "mod_gui", mod_gui.tick },
 }
@@ -155,6 +157,8 @@ commands.add_command("f3d-player", { "command-help.f3d-player" }, admins_only(se
 commands.add_command("f3d-profile", { "command-help.f3d-profile" }, admins_only(session.profile_command))
 commands.add_command("f3d-rate", { "command-help.f3d-rate" }, admins_only(session.rate_command))
 commands.add_command("f3d-bs", { "command-help.f3d-bs" }, admins_only(session.bs_command))
+commands.add_command("f3d-perf", { "command-help.f3d-perf" }, admins_only(session.perf_command))
+commands.add_command("f3d-ih", { "command-help.f3d-ih" }, admins_only(session.ih_command))
 -- game.player for the client's Lua commands over RCON (console.lua).
 console.register_remote()
 

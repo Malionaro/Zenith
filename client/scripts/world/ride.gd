@@ -16,6 +16,7 @@ extends Node3D
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const Rockets := preload("res://scripts/world/rockets.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
+const GroundHeight := preload("res://scripts/world/ground_height.gd")
 
 const BOARD_TIME := 1.2       # seconds to walk into the rocket
 const FADE_FROM := 120.0      # tiles up the rocket climbs before the view fades out...
@@ -26,6 +27,7 @@ const FADE_IN := 1.2
 const GROUND_WAIT := 2.0      # on a planet the ground needs a moment to stream in before the view opens
 const DOCK_TIME := 1.3        # the pod sinks into the hub while parking
 const HUB_TOP := 3.5          # where a pod parks on a hub, above the ground (2.1.23: 3.5 tiles north)
+const JET_BELOW := -1.3       # the engine's flame under the pod's middle
 
 enum { IDLE, BOARDING, UP, ARRIVING, IN_HUB, LEAVING }
 
@@ -80,7 +82,7 @@ func _ready() -> void:
 	hot.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 	cone.material = hot
 	_jet.mesh = cone
-	_jet.position.y = -1.3
+	_jet.position.y = JET_BELOW
 	_pod.add_child(_jet)
 	_fade_layer.layer = 90  # over the world, under the menus
 	_fade.color = Color(0, 0, 0, 0)
@@ -292,7 +294,7 @@ func _rocket(_delta: float) -> void:
 	elif _ps != "":
 		ignition = 1.0
 	if rockets != null:
-		rockets.drive(_ground, _height, ignition)
+		rockets.drive(_ground, _height, ignition)  # false until the silo is in the world (a save loading): again next frame
 	# The camera waits while the rocket comes out of its shaft, then rises with it, tilting down to
 	# watch the ground fall away, and the view fades out high up.
 	var base := _height - Visuals.ROCKET_SINK
@@ -321,8 +323,13 @@ func _fly_pod() -> void:
 	# Its engine burns while it climbs, and brakes on the way down until it is nearly there.
 	_jet.visible = (_ps == "ascending") or (_ps == "descending" and h > 1.5)
 	_jet.scale = Vector3.ONE * (0.85 + 0.15 * sin(_t * 41.0))
+	# On an add-on's hills (ground_height.gd) the pod's model is lifted in its shader; its flame, and
+	# the capsule standing in for the model, have plain materials: lifted here by the height under it.
+	var stand_in := _pod.mesh is CapsuleMesh
+	var hills := GroundHeight.at(_pod_at.x, _ground.y) if _jet.visible or stand_in else 0.0
+	_jet.position.y = JET_BELOW + (0.0 if stand_in else hills)
 	# Factorio's pod position is its ground point shifted north by its height; across, it is its own.
-	_pod.position = Vector3(_pod_at.x, h, _ground.y)
+	_pod.position = Vector3(_pod_at.x, h + (hills if stand_in else 0.0), _ground.y)
 	_pod.rotation = Vector3.ZERO
 	_place_anchor(Vector2(_pod_at.x, _ground.y), maxf(1.0, h))
 	if state == ARRIVING and _fade_in_at >= 0.0 and _t >= _fade_in_at:

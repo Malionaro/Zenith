@@ -15,6 +15,8 @@ const GroundHeight := preload("res://scripts/world/ground_height.gd")
 const BeltLods := preload("res://scripts/world/belt_lods.gd")
 const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
 const ContactShade := preload("res://scripts/world/contact_shade.gd")
+const PipelineWarm := preload("res://scripts/world/pipeline_warm.gd")
+const NatureLooks := preload("res://scripts/world/nature_looks.gd")
 
 const SIZE := 32
 ## Entity types whose models get a per-entity random turn and size (see _model_transform).
@@ -98,6 +100,9 @@ var _lods := {}
 var _lod_allowed := -1.0
 var _lod_generation := -1
 var _lod_fading := 0
+## Set by world.gd while it looks at a chunk just shown again (behind_cull.gd): a switch then needs
+## no cross-fade, as nothing of the chunk was on screen to fade from.
+var lod_snap := false
 const LOD_LOOK_AGAIN := 0.03
 ## How high a chunk's buildings reach, for its nearest point to the camera (tiles).
 const LOD_HEIGHT := 12.0
@@ -156,6 +161,14 @@ func set_tiles_rle(rle: Array) -> void:
 	content_rev += 1
 
 
+## set_tiles_rle's result, decoded already (message_decode.gd, on the bridge's parsing thread).
+func set_tiles(ids: PackedInt32Array) -> void:
+	tile_ids = ids
+	loaded = true
+	slots = PackedInt32Array()
+	content_rev += 1
+
+
 func set_tile(local: Vector2i, id: int) -> void:
 	if tile_ids.size() == SIZE * SIZE:
 		tile_ids[local.y * SIZE + local.x] = id
@@ -179,6 +192,11 @@ func clear_entities() -> void:
 func start_snapshot(parts: int) -> void:
 	parts_expected = parts
 	parts_got.clear()
+	snapshot_msec = Time.get_ticks_msec()
+
+
+## When the snapshot being received started (world.gd builds the chunk once its last part is in).
+var snapshot_msec := 0
 
 
 func got_part(part: int) -> void:
@@ -205,19 +223,28 @@ func apply_terrain(job: TerrainMesher) -> void:
 	slots = job.slots if job.missing.is_empty() else PackedInt32Array()
 	ground_coarse = job.coarse
 	var mesh := ArrayMesh.new()
+	var t0 := Time.get_ticks_usec() if Probing.on else 0
 	if job.land.has_faces():
 		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, job.land.arrays(), [], {}, TerrainMesher.TerrainSurface.FORMAT)
 		mesh.surface_set_material(mesh.get_surface_count() - 1, Visuals.terrain_material())
 	if job.water.has_faces():
 		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, job.water.arrays(), [], {}, TerrainMesher.TerrainSurface.FORMAT)
 		mesh.surface_set_material(mesh.get_surface_count() - 1, Visuals.water_material())
+	if Probing.on:
+		Probing.add("ta_surfaces", t0)
+		t0 = Time.get_ticks_usec()
 	if _terrain == null:
 		_terrain = MeshInstance3D.new()
 		# Flat ground shades nothing worth a shadow pass (0.14-0.5 ms of GPU on the owner's save).
 		_terrain.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		add_child(_terrain)
 	_terrain.mesh = mesh
+	if Probing.on:
+		Probing.add("ta_mesh_set", t0)
+		t0 = Time.get_ticks_usec()
 	GroundHeight.hold_mesh(_terrain)  # on hills, room for their lift
+	if Probing.on:
+		Probing.add("ta_hold", t0)
 	if drawn_msec == 0:
 		drawn_msec = Time.get_ticks_msec()
 
@@ -390,6 +417,9 @@ class Want:
 	var recs: Array = []  # [rec, proto type] per instance, for its anim group
 	var part: ModelLibrary.AnimPart
 	var group := false  # handed to anim.gd (glowing models and moving parts)
+	## The first of a model's MultiMeshes (its parts and stand-in follow): a build may stop for the
+	## frame before it, never between a model and its parts, which share instance order.
+	var starts := false
 	var paint := Color.WHITE  # a train stop's colour (_painted_wants)
 	var paint_from := -1000.0
 
@@ -449,6 +479,9 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 			var rmesh: Mesh = remnant[0]
 			if merged and FarChunks.merges(proto.type, rmesh):
 				continue
+			if not PipelineWarm.mesh_ready(rmesh):
+				waiting_models = true  # its pipelines compiling (pipeline_warm.gd): drawn in a moment
+				continue
 			if not by_model.has(rmesh):
 				by_model[rmesh] = []
 				recs_by_model[rmesh] = []
@@ -456,11 +489,18 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 			by_model[rmesh].append(remnant[1])
 			recs_by_model[rmesh].append([rec, proto.type])
 			continue
-		if not ModelLibrary.entity_ready(proto.name, proto.type, rec.extra, rec.dir):
+		var t_ready := Time.get_ticks_usec() if Probing.on else 0
+		var ready := ModelLibrary.entity_ready(proto.name, proto.type, rec.extra, rec.dir)
+		if Probing.on:
+			Probing.add("cb_ready", t_ready)  # (--stutter-probe: the models asked for, w_cb_ready)
+		if not ready:
 			waiting_models = true  # nothing drawn until its model is made (no placeholder popping up)
 			continue
 		var mesh := ModelLibrary.mesh_for_entity(proto.name, proto.type, rec.extra, rec.dir)
 		if merged and FarChunks.merges(proto.type, mesh):
+			continue
+		if mesh != null and not PipelineWarm.model_ready(mesh, proto.name, proto.type, rec.extra, rec.dir):
+			waiting_models = true  # its pipelines compiling (pipeline_warm.gd): drawn in a moment, not in a frozen frame
 			continue
 		if mesh != null and proto.type == "train-stop" and rec.extra.get("col") is Array and rec.extra["col"].size() >= 3:
 			var col: Array = rec.extra["col"]
@@ -492,9 +532,15 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 					waiting_models = true
 			continue
 		# No model: the entity's own picture from the bridge's list (a mod's building), else a box.
+		var t_card := Time.get_ticks_usec() if Probing.on else 0
 		var card := SpriteStandins.card(proto.name, rec.dir, proto.size(), proto.type) if proto.type != "resource" else null
+		if Probing.on:
+			Probing.add("cb_card", t_card)
 		if card == null and SpriteStandins.coming(proto.name, rec.dir):
 			waiting_models = true  # drawn once its picture is composed, not as a box first
+			continue
+		if card != null and not PipelineWarm.mesh_ready(card):
+			waiting_models = true
 			continue
 		if card == null and proto.type != "resource" and SpriteStandins.in_use():
 			continue  # with a graphics list, no boxes or cones: only pictures (owner's choice)
@@ -532,6 +578,7 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 		var switches := _switches_in(recs_by_model[model], switchable)
 		var whole := _want(model, model, by_model[model], [], null, glows or not switches.is_empty(), recs_by_model[model], null, glows)
 		whole.switches = switches
+		whole.starts = true
 		wants.append(whole)
 		var parts: Array = parts_by_model[model]
 		for i in parts.size():
@@ -566,17 +613,37 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 	var wanted := {}
 	for w in wants:
 		wanted[w.key] = true
+		if w.part == null and (w.key is String or (w.key is Array and w.key[0] is String)):
+			w.starts = true  # cards, boxes, cones
 	for key in _nodes.keys():
 		if not wanted.has(key):
 			_drop(key)
 	count("us_build_wants", Time.get_ticks_usec() - t_wants)
 	var t_apply := Time.get_ticks_usec()
+	var applied := 0
+	var listed := false
 	for w in wants:
+		# The MultiMeshes stop at the deadline too (between models): filling a busy chunk's 60-150
+		# ran to the end whatever it cost, 171 overruns a laps run, the worst 11 ms against a 6 ms
+		# grant (client-cpu.md 6). Those filled stay drawn with the new instances, the rest with the old.
+		if apply_deadline and _until > 0 and w.starts and applied > 0 and Time.get_ticks_usec() > _until:
+			count("us_build_apply", Time.get_ticks_usec() - t_apply)
+			if not listed:
+				listed = true
+				_refresh_lists()  # none of the dropped ones left in the lists while it waits
+			await _wait_for_more()
+			t_apply = Time.get_ticks_usec()
+			applied = 0
 		if budget == null or budget.left > 0 or _nodes.has(w.key):
 			_apply(w, working, anim, budget)
+			applied += 1
 		else:
 			pending.append(w)
 	count("us_build_apply", Time.get_ticks_usec() - t_apply)
+	if apply_deadline and _until > 0 and applied > 0 and Time.get_ticks_usec() > _until:
+		if not listed:
+			_refresh_lists()
+		await _wait_for_more()  # the lists, shadows and contact rings next time
 	t_apply = Time.get_ticks_usec()
 	_refresh_lists()
 	_apply_shadows()
@@ -587,6 +654,9 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 
 ## A build part-way through (build_entities' until_usec) waits for this, with a new deadline.
 signal _more_time
+## Builds stop at their deadline between models' MultiMeshes too, not only in the records' pass
+## (`--build-apply-deadline=off`: the MultiMeshes all filled in one go, as before).
+static var apply_deadline := not OS.get_cmdline_user_args().has("--build-apply-deadline=off")
 ## True while a build waits part-way through for resume_build().
 var building := false
 var _until := 0
@@ -624,6 +694,7 @@ func _painted_wants(key: Array, entry: Array) -> Array[Want]:
 	var model: Mesh = key[0]
 	var glows := ModelLibrary.glows(model)
 	var out: Array[Want] = [_want(key, model, entry[0], [], null, glows, entry[1], null, glows)]
+	out[0].starts = true
 	var parts: Array = entry[2]
 	for i in parts.size():
 		var part: ModelLibrary.AnimPart = parts[i]
@@ -820,6 +891,8 @@ func _switch_level(mmi: MultiMeshInstance3D, st: LodState, level: int, levels: A
 	_end_fade(mmi, st)
 	st.level = level
 	mm.mesh = st.model if level == 0 else levels[level - 1][0]
+	if lod_snap:
+		return
 	if ModelLods.FADE_SECONDS <= 0.0 or ModelLods.full_detail or not mmi.visible or not mmi.is_inside_tree() or mm.instance_count == 0 or before == null:
 		return
 	var copy := MultiMesh.new()
@@ -989,7 +1062,8 @@ func _shadow_proxy(model: Mesh, xforms: Array, budget: Budget, key: Variant = nu
 	var mmi: MultiMeshInstance3D = _shadows.get(key)
 	if mmi == null:
 		count("shadow_mmi")
-		mmi = _new_mmi(ModelLods.material())
+		# Each surface its own stand-in material (a tree's crown its leaf one: ModelLods.leaf_material()).
+		mmi = _new_mmi(null)
 		mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_SHADOWS_ONLY
 		mmi.visible = false
 		_shadows[key] = mmi
@@ -1051,6 +1125,11 @@ func _model_transform(proto: ProtoDB.EntityProto, rec) -> Transform3D:
 	if not VARIED_TYPES.has(proto.type):
 		return ModelLibrary.placed(proto.name, proto.type, rec.dir, rec.extra, at)
 	var h := hash(rec.fixed)
+	if proto.type != "resource":
+		# Nauvis's trees and rocks: Factorio's variations, sizes and fallen trees (nature_looks.gd).
+		var looks: Variant = NatureLooks.placed(proto.name, h, at)
+		if looks != null:
+			return looks
 	var yaw := float(h & 0xffff) / 65536.0 * TAU
 	var size := 0.9 + 0.2 * float((h >> 16) & 0xff) / 255.0
 	var height := size

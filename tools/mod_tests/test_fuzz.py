@@ -25,6 +25,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 import protocol  # noqa: E402
 
+# A FAIL line can hold any character: on Windows, output to a file or pipe is in the system's code page,
+# and one character it lacks stopped the run with UnicodeEncodeError.
+sys.stdout.reconfigure(errors="backslashreplace")
+
 MOD = ROOT / "mod" / "factorio-3d-bridge"
 FAKE = pathlib.Path(__file__).with_name("fake_factorio.lua")
 CLIENT_PORT = 34201
@@ -140,10 +144,14 @@ def tick(n, what):
 def take():
     out = []
     for item in F.take_sent().values():
-        msg = json.loads(item[2])
-        for problem in protocol.problems(msg):
-            check(False, f"protocol after fuzzing: {problem}")
-        out.append(msg)
+        # A fuzzed hello can ask for joined datagrams (`b`): several messages, a line each.
+        for line in str(item[2]).split("\n"):
+            if not line:
+                continue
+            msg = json.loads(line)
+            for problem in protocol.problems(msg):
+                check(False, f"protocol after fuzzing: {problem}")
+            out.append(msg)
     return out
 
 
@@ -225,11 +233,22 @@ def main():
             tick(1, "a reconnect")
             take()
 
-    # The session recovers: a fresh client connects, gets the world and can walk.
-    hello("after-fuzz", 0)
-    tick(3, "a new hello")
-    msgs = take()
-    check(any(m.get("t") == "welcome" for m in msgs), "a new client gets a welcome after fuzzing")
+    # The session recovers: a fresh client connects, gets the world and can walk. It says hello every
+    # second until welcomed, as Zenith does: on a server a hello from a new port waits while the client
+    # holding the session was heard 1.5-4 s ago (session.lua gone_client, LIVE and STALE, longer at a
+    # game speed over 1). One hello and 3 ticks passed only when the fuzzing happened to end with the
+    # session on this port or its holder long silent; the random commands follow the mod's handlers,
+    # so new handlers moved where it ended (main failed after merging two branches that passed alone).
+    waited, welcomed = 0, False
+    while waited < 4000 and not welcomed:
+        if waited % 60 == 0:
+            hello("after-fuzz", 0)
+        tick(3, "a new hello")
+        waited += 3
+        welcomed = any(m.get("t") == "welcome" for m in take())
+    holder = g.storage.f3d.client
+    check(welcomed, f"a new client gets a welcome after fuzzing (within {waited} ticks; the session's client "
+                    f"{holder and (holder.sid, holder.port, holder.last_seen)} at tick {g.game.tick})")
     send({"t": "sub", "c": [[0, 0]]})
     # The handshake's stages and the chunk share the work budget a tick, which what was fuzzed may
     # have filled for a while: the chunk comes within seconds (12 ticks with seed 1), not always 6.

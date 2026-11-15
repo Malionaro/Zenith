@@ -12,11 +12,13 @@ extends Control
 ## or press Q to put it back; drag the held stack across slots to spread it (right button: one in
 ## each); Shift+click moves a stack to the other inventory (Ctrl+click: every stack of the item),
 ## through the mod's `xfer`. The bridge's character has no cursor of its own, so the
-## picked-up stack stays in its slot (shown with Factorio's hand) and a click sends `move`. Held
-## items build like the quickbar's.
+## picked-up stack stays in its slot (shown with Factorio's hand) and a click sends `move`; one
+## picked up from a machine's window goes into a free inventory slot at once, so it stays in the
+## cursor when the window closes, as Factorio's (I7). Held items build like the quickbar's.
+## Ctrl+clicks on entities play the item's sound and fly its icon when the mod answers (I3, I4).
 ##
-## Keys handled here (InputMap actions, controls.gd, rebindable): 1-0 quickbar (with the window
-## open, pin the hovered or held item instead), Shift+1-0 quickbar pages, X swap quickbars, T the technology
+## Keys handled here (InputMap actions, controls.gd, rebindable): 1-0 quickbar (again: put the hand
+## back; an empty slot with the window open pins the hovered item), Shift+1-0 quickbar pages, X swap quickbars, T the technology
 ## screen, M the map (minimap.gd in the corner, map_view.gd), P and K production and kill statistics
 ## (stats_window.gd), ` and / the chat and console (chat_window.gd), Ctrl+F crafting search, F4 the
 ## debug overlay (the HUD's status line), and Esc (fixed), which closes the item chooser, the chat,
@@ -79,6 +81,11 @@ const PlayersWindow := preload("res://scripts/ui/factorio/players_window.gd")
 const ModGui := preload("res://scripts/ui/factorio/mod_gui.gd")
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 const Sfx := preload("res://scripts/fx/sfx.gd")
+const ItemSounds := preload("res://scripts/fx/item_sounds.gd")
+const SoundBank := preload("res://scripts/fx/sound_bank.gd")
+## F's pick-up sound at most this often (F by a busy belt takes items every tick).
+const PICK_SOUND_MSEC := 70
+const FlyingItems := preload("res://scripts/ui/factorio/flying_items.gd")
 const EquipmentGrid := preload("res://scripts/ui/factorio/equipment_grid.gd")
 const PlannerUi := preload("res://scripts/ui/factorio/planner_ui.gd")
 const SpaceMap := preload("res://scripts/ui/factorio/space_map.gd")
@@ -133,6 +140,9 @@ var picker: ItemPicker
 var alt_overlay: AltOverlay
 var entity_info: EntityInfo
 var research_hud: ResearchProgress
+## Plays Factorio's research_completed sound (the UI test counts it instead).
+var research_chime := func() -> void: Sfx.play_ui("research-completed")
+var _chimed_tick := -1  # the tick of the research last chimed for: one chime a tick, as Factorio
 ## The top-right corner: research, the side menu's buttons and the minimap's frame.
 var side_menu: SideMenu
 var chat: ChatWindow
@@ -206,14 +216,37 @@ var cursor_label: Label = null
 var platform_panel: Control = null
 ## Where the stack in the cursor came from: {"role", "index" (1-based), "n" (0: all, else how
 ## many were picked up), "unit" (the machine's, for its roles)}; {} when the held item came from
-## the quickbar or nowhere in particular.
+## the quickbar or nowhere in particular. A stack picked up from a machine's window is moved into a
+## free slot of the inventory at once and held from there (I7), as Factorio's cursor owns what it
+## holds: until the inventory shows it there the hand has "await" (when) and "count".
 var hand := {}
+
+## Ctrl+clicks on entities sent and not answered yet, oldest first (player_input.gd's
+## _fast_transfer): {"item" (held, "": taking), "counts" (the inventory before), "at" (msec),
+## "pos" (the entity, a world point)}. The answer is the inventory changing.
+var _fast: Array = []
+var _pick_sound_msec := -PICK_SOUND_MSEC  # (picked)
+## Items flying between the world and the cursor or character after a Ctrl+click (I3, I4).
+var flying: FlyingItems
 
 ## A held stack dragged across slots with a button down (Factorio's drag splitting): {"button",
 ## "item", "total" (left: what the cursor held at the first slot), "origin" ([role, index, unit]:
 ## where the rest goes back to), "slots" ([[role, index, unit], ...] visited), "added" (how many
 ## each got)}; {} when not dragging.
 var _spread := {}
+## J12: Factorio sorts the character's main inventory by itself: whenever it changes while no
+## window shows it, and when the window closes after changes made in it. The bridge's character has
+## no player for the game to do it, so the client asks the bridge (`sort`) at those moments. Off in
+## the UI test where it counts the commands sent.
+var auto_sort := true
+## The main inventory changed since it was last sorted; a `sort` was sent and its answer (the next
+## change) is awaited, since when (msec); the main slots' signature last seen.
+var _sort_due := false
+var _sort_pending := false
+var _sort_sent_ms := -100000
+var _main_sig := 0
+const SORT_GAP_MS := 250
+const SORT_ANSWER_MS := 1000
 var _hover_at := Vector2(-1, -1)
 var _shortcuts_room := Rect2()
 var _shortcuts_shown := -1
@@ -334,6 +367,7 @@ func _ready() -> void:
 	research_hud = ResearchProgress.new()
 	research_hud.model = model
 	research_hud.open_requested.connect(func() -> void: open_research(true))
+	model.research_done.connect(_on_research_done)
 	side_menu = SideMenu.new()
 	side_menu.research = research_hud
 	side_menu.pressed.connect(_on_side_button)
@@ -452,6 +486,7 @@ func _ready() -> void:
 	chat.gps.connect(_on_gps)
 	Slot.info = item_info
 	model.inventory_changed.connect(_prefetch_items)
+	model.inventory_changed.connect(_note_inventory_change)
 
 	picker = ItemPicker.new()
 	picker.items = func() -> Array: return _protos().item_names.values() if _protos() != null else []
@@ -467,6 +502,8 @@ func _ready() -> void:
 	planners = PlannerUi.new()
 	planners.ui = self
 	add_child(planners)
+	Slot.picture_for = planners.tip_picture  # a blueprint's tooltip draws its picture (K11)
+	Slot.picture_protos = _protos
 	move_child(picker, -1)  # the item chooser over the planner windows
 	screen.model = model
 	screen.picker = picker
@@ -494,6 +531,9 @@ func _ready() -> void:
 
 	cursor = CursorStack.new()
 	add_child(cursor)
+	flying = FlyingItems.new()
+	add_child(flying)
+	ItemSounds.prepare()
 
 	Settings.listen(_on_setting)
 	_apply_settings()
@@ -618,7 +658,12 @@ func _process(_delta: float) -> void:
 			_follow_hover_unit()
 		_push_hover()
 	var held := held_item()
+	flying.player = player
+	_check_fast(held)
+	held = held_item()
 	_check_hand(held)
+	held = held_item()
+	_auto_sort()
 	quickbar.set_held(held)
 	# Factorio marks only a stack picked up whole (not a split, nor a one-item stack's right click).
 	var hand_slot := [hand["role"], hand["index"], int(hand["n"])] if not hand.is_empty() and hand["role"] != "grid" and not hand.get("nohand", false) else []
@@ -694,6 +739,16 @@ func layout() -> void:
 	# In the remote view Factorio moves the corner down under the frame's title bar.
 	var corner_top := float(Kit.px(RemoteFrame.TITLE_HEIGHT + RemoteFrame.BORDER)) if remote_frame != null and remote_frame.visible else 0.0
 	side_menu.global_position = Vector2(view.x - side_menu.size.x - (Kit.px(RemoteFrame.BORDER) if corner_top > 0.0 else 0), corner_top)
+	# Top left, where Factorio's mods put their buttons, Zenith's Show in Factorio: in the remote view it
+	# goes down under the frame's title bar as the top right corner does (at the top it covered the
+	# title's first letters), and the frame's panels on that side (Surfaces, the logistic networks)
+	# start under it.
+	if factorio_button != null:
+		var in_frame := corner_top > 0.0
+		factorio_button.position = Vector2(Kit.px(RemoteFrame.BORDER + 4), remote_frame.title_bottom() + Kit.px(4)) if in_frame else Kit.pxv(8, 8)
+		var under := factorio_button.position.y + factorio_button.get_combined_minimum_size().y + Kit.px(4) if in_frame and factorio_button.visible else 0.0
+		remote_frame.left_top = under
+		networks.set_top(under)
 	if minimap.visible:  # a short window: the minimap shrinks to stay above the quickbar
 		var room := floorf(bottom.position.y - m - side_menu.minimap_slot.get_global_rect().position.y)
 		if room != minimap.max_side:
@@ -745,7 +800,11 @@ func layout() -> void:
 	entity_info.global_position = Vector2(view.x - entity_info.size.x, info_top)
 
 	# The crafting queue right of the tool bar along the bottom, as Factorio has it, or over the tool
-	# bar when it would run into the quickbar.
+	# bar when it would run into the quickbar. Its row takes the room there, a longer queue ending in
+	# "+N" (J13); over the tool bar when not even three slots (or its entries) fit beside it.
+	var beside := bar.position.x - m - (arms.end.x + m)
+	var least := float(Kit.px(Kit.SLOT)) * clampi(craft_queue.entry_count(), 1, 3)
+	craft_queue.set_room(beside if beside >= least else bar.position.x - 2.0 * m)
 	craft_queue.reset_size()
 	if arms.end.x + m + craft_queue.size.x <= bar.position.x - m:
 		craft_queue.global_position = Vector2(arms.end.x + m, view.y - Kit.px(4) - craft_queue.size.y)
@@ -886,6 +945,8 @@ func hand_count() -> int:
 	if not hand.is_empty():
 		if hand["role"] == "grid":
 			return 1
+		if hand.has("await"):
+			return int(hand["count"])
 		var stack := _stack(hand["role"], int(hand["index"]))
 		if stack.get("item", "") == held:
 			var n := int(stack["count"])
@@ -912,10 +973,22 @@ func mouse_over_gui() -> bool:
 
 
 ## When the cursor's item changed elsewhere (quickbar, Q) the hand is forgotten; when its slot was
-## used up, it moves to another stack of the item, as Factorio refills the cursor.
+## used up, it moves to another stack of the item, as Factorio refills the cursor, and with none
+## left the cursor is emptied (I5: it stayed holding the item with none, a ghost cursor that made
+## the next click or drag place ghosts).
 func _check_hand(held: String) -> void:
 	if hand.is_empty():
 		return
+	if hand.has("await"):
+		# Taken from a machine and on its way into the inventory (_pick_up): held meanwhile.
+		if held != "" and model.stack_at("main", int(hand["index"])).get("item", "") == held:
+			hand.erase("await")
+			hand.erase("count")
+		elif held != "" and Time.get_ticks_msec() - int(hand["await"]) < 3000:
+			return
+		else:
+			_drop_hand()  # the mod couldn't move it (the window closed first, out of reach)
+			return
 	if hand["role"] == "grid":
 		# Equipment picked up from a grid stays in the cursor while it is still there.
 		if held == "" or model.equipment_at(str(hand["kind"]), hand["cell"]).get("name", "") != held:
@@ -951,6 +1024,157 @@ func _check_hand(held: String) -> void:
 			if model.main_slots[i].get("item", "") == held:
 				hand = {"role": "main", "index": i + 1, "n": 0, "unit": 0}
 				break
+		if hand.is_empty() and model.knows_slots("main") and player != null and str(player.get("cursor_tool")) == "":
+			_drop_hand()
+
+
+## A `slots` change: the main inventory needs sorting again, unless it is the answer to the last
+## `sort` (or only the guns, ammo, armour or trash changed).
+func _note_inventory_change() -> void:
+	if not model.has_slots:
+		return
+	var sig := str(model.main_slots).hash()
+	if sig == _main_sig:
+		return
+	_main_sig = sig
+	if _sort_pending:
+		_sort_pending = false  # the bridge's sorted inventory
+		return
+	_sort_due = true
+
+
+## J12: sends the bridge a `sort` of the main inventory when it is due and no window shows it, at
+## most every SORT_GAP_MS. Not while the hand holds one of its stacks: Factorio's cursor stack is
+## out of the inventory, but here the hand points at its slot, which sorting would move.
+func _auto_sort() -> void:
+	var now := Time.get_ticks_msec()
+	if _sort_pending and now - _sort_sent_ms > SORT_ANSWER_MS:
+		_sort_pending = false  # nothing moved: the bridge sent no slots
+	if not auto_sort or not _sort_due or _sort_pending or window.is_open() or not hand.is_empty():
+		return
+	if not model.knows_slots("main") or now - _sort_sent_ms < SORT_GAP_MS:
+		return
+	_sort_due = false
+	_sort_pending = true
+	_sort_sent_ms = now
+	model.sort_inventory("main")
+
+
+## The main inventory slot (1-based) the held stack is in, or 0 (none in particular, or not from
+## the main inventory): a Ctrl+click's `hs`, so the mod empties that stack first.
+func held_slot() -> int:
+	if hand.is_empty() or hand["role"] != "main" or hand.has("await"):
+		return 0
+	return int(hand["index"])
+
+
+## player_input.gd sent a Ctrl+click on an entity: `item` the held item put in, "" taking out;
+## `pos` the entity's middle in the world.
+func fast_transfer_sent(item: String, pos: Vector3) -> void:
+	_fast.append({"item": item, "counts": model.counts.duplicate(), "at": Time.get_ticks_msec(), "pos": pos})
+	while _fast.size() > 8:
+		_fast.pop_front()
+
+
+## A Ctrl+click's answer, the inventory changing (the mod sends it at once): its sound and the
+## items flying (I3, I4), and a hand emptied into the entity drops the selection (I1). One that
+## changed nothing (nothing fitted, nothing to take) is let go after a while.
+func _check_fast(held: String) -> void:
+	if _fast.is_empty():
+		return
+	var f: Dictionary = _fast[0]
+	var before: Dictionary = f["counts"]
+	if model.counts == before:
+		if Time.get_ticks_msec() - int(f["at"]) > 1500:
+			_fast.pop_front()
+		return
+	_fast.pop_front()
+	for later in _fast:
+		later["counts"] = model.counts.duplicate()  # sent before this answer, answered after it
+	var item := str(f["item"])
+	if item != "":
+		var put := int(before.get(item, 0)) - model.count_of(item)
+		if put <= 0:
+			return
+		var sound := ItemSounds.move_sound(item)
+		Sfx.play_ui(str(sound[0]), float(sound[1]))
+		flying.fly(item, -put, "mouse", f["pos"])
+		if held != item:
+			return
+		# Factorio: the held stack went in; what is left of it stays in the cursor, and an emptied
+		# hand takes the next stack of the item from the inventory (J3), or with none left holds
+		# nothing (no ghost cursor, I1).
+		if hand.is_empty():
+			if model.count_of(item) == 0:
+				_drop_hand()
+		elif hand["role"] == "main":
+			if int(hand["n"]) > 0:
+				hand["n"] = int(hand["n"]) - put
+				if int(hand["n"]) <= 0:
+					_refill_hand(item)
+			elif model.stack_at("main", int(hand["index"])).get("item", "") != item:
+				_refill_hand(item)
+		return
+	var got: Array = []
+	for name in model.counts:
+		var gained := model.count_of(str(name)) - int(before.get(name, 0))
+		if gained > 0:
+			got.append([str(name), gained])
+	if got.is_empty():
+		return
+	var first := ItemSounds.pick_sound(str(got[0][0]))
+	Sfx.play_ui(str(first[0]), float(first[1]))
+	for i in mini(got.size(), 6):
+		flying.fly(str(got[i][0]), int(got[i][1]), f["pos"], "character", i)
+
+
+## J20 (issue #19): the bridge's `mnd`, the tick the character mined something: what it got flies from
+## where the thing was to the character, as a Ctrl+click's take does (I4), the thing's own item first and
+## then what it held (a belt's items, a chest's contents, a tree's wood, a unit of ore). Its sound is the
+## mining's own (fx.gd), so none here.
+func mined(msg: Dictionary) -> void:
+	if flying == null:
+		return
+	var from := Vector3(int(msg.get("x", 0)) / 256.0, 0.6, int(msg.get("y", 0)) / 256.0)
+	var l: Array = UiModel._array(msg.get("l"))
+	for i in mini(l.size(), 6):
+		var r = l[i]
+		if r is Array and r.size() >= 2 and int(r[1]) > 0:
+			flying.fly(str(r[0]), int(r[1]), from, "character", i)
+
+
+## Issue #18: what F took (`pku`: [item, count, x, y, ...] nearest first): each kind flies from where the
+## nearest of it was (on the ground or a belt) to the character with the count got, as a Ctrl+click's take
+## does (I4), and one pick sound plays, the item's own pick_sound (else Factorio's picked_up_item), at most
+## every PICK_SOUND_MSEC while F keeps taking.
+func picked(msg: Dictionary) -> void:
+	var order: Array[String] = []
+	var got := {}  # item -> [count, where the nearest was]
+	for r in UiModel._array(msg.get("l")):
+		if not (r is Array) or r.size() < 4 or int(r[1]) <= 0:
+			continue
+		var item := str(r[0])
+		if not got.has(item):
+			order.append(item)
+			got[item] = [0, Vector3(int(r[2]) / 256.0, 0.25, int(r[3]) / 256.0)]
+		var e: Array = got[item]
+		e[0] = int(e[0]) + int(r[1])
+	if order.is_empty():
+		return
+	if flying != null:
+		for i in mini(order.size(), 6):
+			var kind: Array = got[order[i]]
+			flying.fly(order[i], int(kind[0]), kind[1], "character", i)
+	var now := Time.get_ticks_msec()
+	if now - _pick_sound_msec < PICK_SOUND_MSEC:
+		return
+	_pick_sound_msec = now
+	var sound := ItemSounds.pick_sound(order[0])
+	if str(sound[0]) == ItemSounds.GENERIC:
+		var general := SoundBank.pick("core/sound/picked-up-item")
+		if general != "":
+			sound = [general, 1.0]
+	Sfx.play_ui(str(sound[0]), float(sound[1]))
 
 
 func _stack(role: String, index: int) -> Dictionary:
@@ -975,6 +1199,23 @@ func open_research(on: bool) -> void:
 			screen.close()
 		window.open_crafting(false)
 	research.open(on)
+
+
+## Research finished (K23), as Factorio 2.1 says it: its research_completed sound once for a tick's
+## research however many (its 2.0.34 fix), and for each one the console line core.cfg's
+## technology-researched makes ("__1__ researched.", the technology with its icon; no chat sound,
+## 1.1.95). The research panel shows the last as finished (research_progress.gd).
+func _on_research_done(done: Array, more: int, tick: int) -> void:
+	if done.is_empty():
+		return
+	if tick <= 0 or tick != _chimed_tick:
+		_chimed_tick = tick
+		research_chime.call()
+	for d: Dictionary in done:
+		var name := str(d["name"])
+		model.console_line("[technology=%s] %s researched." % [name, Kit.tech_level_name(name, int(d["level"]))])
+	if more > 0:
+		model.console_line("%d more technologies researched." % more)
 
 
 func is_open() -> bool:
@@ -1479,12 +1720,7 @@ func _unhandled_input(event: InputEvent) -> void:
 				break
 			if Controls.pressed(event, "quickbar_%d" % (i + 1)):
 				handled = true
-				if window.is_open():
-					var item := window.hovered_item if window.hovered_item != "" else held_item()
-					if item != "":
-						model.pin(i, item)
-						break
-				_select(i)
+				_quickbar_key(i)
 				break
 	if handled:
 		get_viewport().set_input_as_handled()
@@ -1605,21 +1841,45 @@ func hud_message(text: String) -> void:
 		hud.show_message(text)
 
 
-## Holds the slot's item for building, or puts it away if it is already held.
+## A quickbar key (1-0), as Factorio 2.1's Shortcut 1-10, the inventory open or not: a pinned slot's
+## item comes into the hand, or the hand is put back when it holds that item already (K17), however
+## it got there (the quickbar, a slot, the pipette; a ghost cursor too). A key never changes what a
+## pinned slot holds (K18: with a window open it pinned the held item, moving it off its own slot).
+## An empty slot's key takes the item under the mouse in the window, as Factorio's quick pipette
+## sets the slot with what it picks (2.1.21, on by default); the held item alone sets nothing.
+func _quickbar_key(index: int) -> void:
+	if str(model.quickbar[index]) != "":
+		_select(index)
+	elif window.is_open() and window.hovered_item != "":
+		model.pin(index, window.hovered_item)
+
+
+## Holds the slot's item for building, or puts the hand back (Q's clear cursor) when it holds that
+## item already.
 func _select(index: int) -> void:
-	var item: String = model.quickbar[index]
+	_select_item(str(model.quickbar[index]))
+
+
+func _select_item(item: String) -> void:
 	if item == "" or player == null:
 		return
+	if held_item() == item:
+		clear_cursor()
+		return
 	hand = {}
-	player.hold("" if held_item() == item else item)
+	player.hold(item)
 
 
+## Factorio 2.1's clicks on a quickbar slot, with its "Set quickbar filter by clicking with item" off
+## (the default): a pinned slot's item is picked as by its key, also with another item in the hand
+## (K18: that item was pinned over it); only an empty slot takes the held item. Right and middle
+## click clear it (Factorio: middle; its right click picks half a stack).
 func _on_quickbar_clicked(index: int, button_index: int) -> void:
-	if button_index == MOUSE_BUTTON_RIGHT or button_index == MOUSE_BUTTON_MIDDLE:  # Factorio: middle-click clears
+	if button_index == MOUSE_BUTTON_RIGHT or button_index == MOUSE_BUTTON_MIDDLE:
 		model.unpin(index)
 	elif button_index == MOUSE_BUTTON_LEFT:
 		var held := held_item()
-		if held != "" and held != model.quickbar[index]:
+		if str(model.quickbar[index]) == "" and held != "":
 			model.pin(index, held)
 		else:
 			_select(index)
@@ -1637,11 +1897,10 @@ func _on_page_slot_clicked(page: int, index: int, button_index: int) -> void:
 		model.pin_on_page(page, index, "")
 	elif button_index == MOUSE_BUTTON_LEFT:
 		var held := held_item()
-		if held != "" and held != item:
+		if item == "" and held != "":
 			model.pin_on_page(page, index, held)
-		elif item != "" and player != null:
-			hand = {}
-			player.hold("" if held == item else item)
+		else:
+			_select_item(item)
 
 
 ## A slot of the character's inventories. Shift (Ctrl: every one of the item) moves the stack into
@@ -1878,7 +2137,7 @@ func _click_slot(role: String, index: int, stack: Dictionary, button_index: int,
 			return
 		# Right click takes the bigger half (37: 19 in the cursor, 18 stay), as in Factorio 2.1.
 		var half := button_index == MOUSE_BUTTON_RIGHT and int(stack["count"]) > 1
-		_pick_up(role, index, unit, str(stack["item"]), ceili(int(stack["count"]) / 2.0) if half else 0)
+		_pick_up(role, index, unit, str(stack["item"]), ceili(int(stack["count"]) / 2.0) if half else 0, int(stack["count"]))
 		if button_index == MOUSE_BUTTON_RIGHT:
 			hand["nohand"] = true
 		return
@@ -1912,7 +2171,7 @@ func _click_slot(role: String, index: int, stack: Dictionary, button_index: int,
 	if not stack.is_empty() and not same and not MACHINE_ROLES.has(from_role) and not hand.get("nohand", false):
 		# A different item, with the held stack's hand in the character's inventory: Factorio (2.1.23)
 		# puts the held stack back in its hand slot and picks up the clicked one, so nothing moves.
-		_pick_up(role, index, unit, str(stack["item"]), 0)
+		_pick_up(role, index, unit, str(stack["item"]), 0, int(stack["count"]))
 		if MACHINE_ROLES.has(role):
 			hand["nohand"] = true
 		return
@@ -2085,17 +2344,49 @@ func pipette_slot(s: Slot) -> bool:
 	return true
 
 
-func _pick_up(role: String, index: int, unit: int, item: String, n: int) -> void:
+func _pick_up(role: String, index: int, unit: int, item: String, n: int, count := 0) -> void:
 	if player == null:
 		return
 	hand = {"role": role, "index": index, "n": n, "unit": unit}
 	player.hold(item)
+	if MACHINE_ROLES.has(role) and model.knows_slots("main") and screen.knows_slots(role):
+		# I7: Factorio's cursor owns the stack it took from a chest or machine: it stays held when the
+		# window closes or the character walks away, and goes back into the inventory, not the
+		# chest. The bridge's character has no cursor, so the stack moves into a free inventory
+		# slot now and is held from there. With the inventory full it stays in the machine, held
+		# while its window is open, as before.
+		var free := _slot_of("")
+		if free > 0:
+			model.move(role, index, "main", free, n, unit)
+			hand = {"role": "main", "index": free, "n": 0, "unit": 0, "await": Time.get_ticks_msec(),
+				"count": n if n > 0 else count}
 
 
 func _drop_hand() -> void:
 	hand = {}
 	if player != null:
 		player.hold("")
+
+
+## Factorio's cursor refill (J3): the hand's stack went into an entity, so the next stack of the
+## item (of the held quality first) comes into the hand from the main inventory, whole; with none
+## left the cursor is emptied.
+func _refill_hand(item: String) -> void:
+	var quality: String = str(player.get("cursor_quality")) if player != null and player.get("cursor_quality") != null else "normal"
+	var other := 0
+	for i in model.main_slots.size():
+		var s: Dictionary = model.main_slots[i]
+		if s.get("item", "") != item:
+			continue
+		if str(s.get("quality", "normal")) == quality:
+			hand = {"role": "main", "index": i + 1, "n": 0, "unit": 0}
+			return
+		if other == 0:
+			other = i + 1
+	if other > 0:
+		hand = {"role": "main", "index": other, "n": 0, "unit": 0}
+		return
+	_drop_hand()
 
 
 ## --ui-hover: from now on the mouse is taken to be there (the motion is sent again every frame,

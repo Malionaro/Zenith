@@ -17,12 +17,7 @@ const PlannerSlot := preload("res://scripts/ui/factorio/planner_slot.gd")
 const Slot := preload("res://scripts/ui/factorio/slot.gd")
 const EntityPanels := preload("res://scripts/ui/factorio/entity_panels.gd")
 const Parts := preload("res://scripts/ui/factorio/planner_parts.gd")
-const SpriteProjection := preload("res://scripts/world/sprite_projection.gd")
-const ItemIcons := preload("res://scripts/world/item_icons.gd")
-## Belts have no sheet in sprite_projection.json: their own animation sheet's first frames (rows
-## east, west, north, south; a 128 px frame is 2 tiles).
-const BELT_SHEETS := {"transport-belt": "base", "fast-transport-belt": "base", "express-transport-belt": "base",
-	"turbo-transport-belt": "space-age"}
+const BlueprintPicture := preload("res://scripts/ui/factorio/blueprint_picture.gd")
 
 signal close_requested
 signal saved(record: Dictionary, source: Dictionary)
@@ -456,10 +451,8 @@ func _on_save() -> void:
 	close_requested.emit()
 
 
-## The blueprint seen from above, fitted into the panel, as Factorio draws it: each entity's own
-## sprite frame from the player's install (sprite_projection.gd's sheets: the frame for its
-## direction, its anchor on the entity's position), tiles as squares in their map colour. An
-## entity without a sheet (or without Factorio) is its footprint in its map colour with its icon.
+## The blueprint seen from above, fitted into the panel, as Factorio draws it (blueprint_picture.gd's
+## drawing, which a blueprint's tooltip shows too); entities right clicked away drawn faded red.
 class Preview extends Control:
 	var window  # the blueprint window
 
@@ -468,108 +461,19 @@ class Preview extends Control:
 		clip_contents = true
 
 	func _layout() -> Array:
-		var b := BpString.body(window.record)
-		var items: Array = []  # [rect in tiles, name, entity_number, colour]
-		for t in BpString._list(b.get("tiles")):
-			var p: Dictionary = t.get("position", {})
-			items.append([Rect2(float(p.get("x", 0)), float(p.get("y", 0)), 1, 1), "", 0, _tile_color(str(t.get("name", ""))), 0])
-		for e in BpString._list(b.get("entities")):
-			var p: Dictionary = e.get("position", {})
-			var size := Vector2.ONE
-			var color := Color(0.45, 0.45, 0.45)
-			if window.protos != null:
-				var proto = window.protos.entities_by_name.get(str(e.get("name", "")))
-				if proto != null:
-					size = Vector2(proto.tile_size)
-					color = proto.color
-			var d := int(e.get("direction", 0))
-			if d == 4 or d == 12:
-				size = Vector2(size.y, size.x)
-			var at := Vector2(float(p.get("x", 0)), float(p.get("y", 0)))
-			items.append([Rect2(at - size * 0.5, size), str(e.get("name", "")), int(e.get("entity_number", 0)), color, d])
-		return items
-
-	func _tile_color(name: String) -> Color:
-		if window.protos != null:
-			var i: int = window.protos.tile_names.find(name)
-			if i >= 0 and i < window.protos.tile_colors.size():
-				return window.protos.tile_colors[i]
-		return Color(0.35, 0.35, 0.35)
+		return BlueprintPicture.layout(window.record, window.protos)
 
 	## [scale, offset]: tiles to pixels.
 	func _fit(items: Array) -> Array:
-		if items.is_empty():
-			return [1.0, Vector2.ZERO]
-		var r: Rect2 = items[0][0]
-		for it in items:
-			r = r.merge(it[0])
-		var margin := float(Kit.px(48))
-		var k := minf((size.x - margin * 2) / maxf(r.size.x, 1.0), (size.y - margin * 2) / maxf(r.size.y, 1.0))
-		k = minf(k, float(Kit.px(64)))
-		return [k, size * 0.5 - r.get_center() * k]
+		return BlueprintPicture.fit(items, size, float(Kit.px(48)), float(Kit.px(64)))
 
 	func _draw() -> void:
-		draw_rect(Rect2(Vector2.ZERO, size), Color8(37, 37, 37))
+		draw_rect(Rect2(Vector2.ZERO, size), BlueprintPicture.BACKGROUND)
 		if window == null or window.record.is_empty():
 			return
 		var items := _layout()
 		var f := _fit(items)
-		var k: float = f[0]
-		var off: Vector2 = f[1]
-		# Back to front, as Factorio sorts them: tiles, then entities by their southern edge.
-		items.sort_custom(func(a: Array, b: Array) -> bool:
-			if (str(a[1]) == "") != (str(b[1]) == ""):
-				return str(a[1]) == ""
-			return (a[0] as Rect2).end.y < (b[0] as Rect2).end.y)
-		for it in items:
-			var r := Rect2((it[0] as Rect2).position * k + off, (it[0] as Rect2).size * k)
-			var gone: bool = window.removed.has(int(it[2])) and int(it[2]) > 0
-			if str(it[1]) == "":
-				draw_rect(r, (it[3] as Color).darkened(0.2))
-				continue
-			var tint := Color(1, 0.4, 0.4, 0.35) if gone else Color.WHITE
-			if _draw_sprite(str(it[1]), int(it[4]), r.get_center(), k, tint):
-				continue
-			draw_rect(r.grow(-1), Color(it[3], 0.35 if not gone else 0.12))
-			var s := minf(r.size.x, r.size.y) * 0.8
-			draw_texture_rect(Kit.item_icon(str(it[1])), Rect2(r.get_center() - Vector2(s, s) * 0.5, Vector2(s, s)), false,
-				Color(1, 0.4, 0.4, 0.35) if gone else Color.WHITE)
-
-	static var _belts := {}  # name -> ImageTexture (four frames, east west north south) or null
-
-	## The entity's sprite frame with its anchor at `at`; false when there is no sheet for it.
-	func _draw_sprite(name: String, d: int, at: Vector2, k: float, tint: Color) -> bool:
-		if BELT_SHEETS.has(name):
-			var belt := _belt(name)
-			if belt == null:
-				return false
-			var row: int = {4: 0, 12: 1, 0: 2, 8: 3}.get(posmod(d, 16), 2)
-			draw_texture_rect_region(belt, Rect2(at - Vector2(k, k), Vector2(k, k) * 2.0), Rect2(0, row * 128, 128, 128), tint)
-			return true
-		var p = SpriteProjection.for_flat(name)
-		if p == null or p.texture == null or p.mode == 3 or p.cells < 1:
-			return false
-		var cell := 0
-		if p.mode == 1:
-			cell = (posmod(d, 16) / 4) % p.cells
-		var slot := Vector2(float(p.atlas_size.x) / int(p.cells), float(p.atlas_size.y))
-		var src := Rect2(Vector2(slot.x * cell, 0), slot)
-		var ratio: float = k / float(p.px_per_tile)
-		var anchor: Vector2 = p.anchors[cell]
-		draw_texture_rect_region(p.texture, Rect2(at - (anchor - src.position) * ratio, slot * ratio), src, tint)
-		return true
-
-	static func _belt(name: String) -> Texture2D:
-		if _belts.has(name):
-			return _belts[name]
-		_belts[name] = null
-		var dir := ItemIcons.factorio_data_dir()
-		var path := dir.path_join("%s/graphics/entity/%s/%s.png" % [BELT_SHEETS[name], name, name]) if dir != "" else ""
-		if path != "" and FileAccess.file_exists(path):
-			var img := Image.load_from_file(path)
-			if img != null and img.get_width() >= 128 and img.get_height() >= 512:
-				_belts[name] = ImageTexture.create_from_image(img.get_region(Rect2i(0, 0, 128, 512)))
-		return _belts[name]
+		BlueprintPicture.draw_items(self, items, f[0], f[1], window.removed)
 
 	func _gui_input(event: InputEvent) -> void:
 		var mb := event as InputEventMouseButton

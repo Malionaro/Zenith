@@ -40,6 +40,21 @@ then `--in-place` on the originals. On a textured model the occlusion only shade
 keep their wear, with none of Zenith's crevice grime added. FUE5's models are baked this way
 (`fue5.py` runs it after each conversion).
 
+Nauvis's trees and rocks are dressed from Factorio's own pictures at runtime, without any of them
+in the repo (`client/scripts/world/nature_looks.gd`): a tree's leaf cards (materials `leafcard-*`)
+wear patches of its leaves picture, its bark (`bark-01`..`bark-09`) and the rocks' stone (`rock`,
+`sand-rock`) the grain of their pictures; each tree grows in one of Factorio's variations and leaf
+colours. A tree model is still variation a's shape: the client scales it to the others and lays the
+fallen ones down (`client/data/nature_looks.json`, from `tools/models/nature/tree_looks.py`; run it
+again after changing a tree's height or its materials' names). `tools/models/nature/raster.py`
+draws one beside its sprite without Blender, `score.py` scores its silhouette against the sprite,
+and `build_plain.py` builds the nature models without Blender (then part_colors.py, as after any
+build). Crowns are clumps of leaf cards round small dark cores (`leaf-shadow-*`); solid leaves
+(`leaf-*`, tree-06's strands) are drawn with the leaf cards' shader too, so pollution takes them.
+Their UV tells them apart where model_library.gd merges them into one surface: cards 0-1, cores
+(-1, -1), solid leaves (-2, -2). A tree's shadow stand-in casts its crown from a surface of its own
+that drops what pollution took (model_lods.gd `crown_arrays`, shadow_stand_in_leaf.gdshader).
+
 Models under their own licence live in a subfolder looked in first (`model_library.gd`
 `MODEL_SUBDIRS`): `fue5/` (CC BY-NC-SA 3.0, see its README) replaces ours of the same name.
 
@@ -115,6 +130,18 @@ moves with the belt the `belt_surface` material. A transport belt's frame (`tier
 steel on every tier, as Factorio's belt sheets have it (`STEEL_FRAMES`); undergrounds, splitters
 and loaders take the tier's paint.
 
+The return run: a textured `belt_surface` (a modeller's) is drawn coming back under the rollers too,
+seen through an open frame and round a line's end pieces (`client/scripts/world/belt_return.gd`).
+Model the return as part of the surface, as Vasillo's belts have it: a strip just above the ground
+(0.006 tiles), under the rollers, facing down, its UVs running the other way round the loop. Models
+are drawn one side to a face, so Zenith adds that strip's inner side, facing up at the rollers, shaded
+as in the belt's shadow. A surface with only its top run gets the top mirrored under itself, its lowest
+point at 0.006, its UVs mirrored along the belt; the same scroll runs either backwards at the tier's
+speed. Faces count as the top run when they look up, as the model's own return when they look down
+from at least 0.1 tiles under it. Line end pieces (`-start`, `-end`) get none (their surface is the
+wrap round the roller), nor do Zenith's own belts (drawn slats on a closed frame). It is only drawn at
+full detail, not in the shadows or far away; `-- --belt-return=off` leaves it out to compare.
+
 ## Variants
 
 Some entities are drawn with a variant model picked from their entity record
@@ -156,8 +183,11 @@ own, `fast-transport-belt-start.glb`...; a tier without them wears the yellow on
 drawn where a line of belts begins and ends, so the belt rolls over a roller there. They are modelled
 with the belt running east (start to the west, end to the east, the belt's tile between) and turned
 onto the belt. The client works out the line ends from the neighbours (`world.gd` `_connect_belt`):
-a start where nothing feeds the tile from behind, an end where nothing in front takes its items
-(a belt from the side counts; one head-on doesn't). They go on straight belts (curves at their
+a start where nothing feeds the tile from behind, an end where nothing in front carries the line on
+(`belt_continues`): a belt, splitter, loader or underground entrance going the same way does, and a
+curve the belt makes (fed from its side by it, `extra.s`); one head-on doesn't, nor does a belt facing
+into the side of a straight belt, of a curve fed from its other side or of an underground: that is
+side-loading, where Factorio draws the feeding belt's ending sprite. They go on straight belts (curves at their
 end only), on each half of a splitter on its own (a lone splitter gets four: both halves' back and
 front, each on its half's tile), and on an underground's open end: an entrance's back, an exit's
 front (facing the way items travel, though the exit's model is turned round). Splitters and
@@ -354,7 +384,7 @@ with MultiMesh: the weathering is in model space.
 
 | glTF attribute | Godot | Contents |
 |---|---|---|
-| `COLOR_0` | `COLOR` | rgb: albedo multiplier (1, or the nature models' own shading); a: ambient occlusion (1 open, 0 enclosed; rays through a voxel copy of the model and the ground) |
+| `COLOR_0` | `COLOR` | rgb: albedo multiplier (1, or the nature models' own shading; on a worm's or spawner's skinned material its mask's shade and cover, creature_skin.py); a: ambient occlusion (1 open, 0 enclosed; rays through a voxel copy of the model and the ground) |
 | `TEXCOORD_0` | `UV` | planar UVs in tiles (not used by the shader) |
 | `TEXCOORD_1` | `UV2` | x: worn edge (1 on narrow faces at convex edges: bevels, rims, bolts); y: random value per connected part |
 | `TEXCOORD_2` | `CUSTOM0.xy` | how much Factorio's camera sees of the vertex with the model facing north, east |
@@ -475,7 +505,9 @@ shapes, swept and ribbed hoses, lumpy blobs, craggy rocks). Each is matched to i
 - Gleba plants are drawn at 0.33 x their scale multiplier (`gleba_tree_variations`), variation 1.
 - Pentapods (`small/medium/big-` wriggler, strafer, stomper): the strafer's and stomper's five
   legs are separate parts that `vehicle_anim.gd` stands where the mod's spider-leg entities are
-  (Factorio's leg tables per tier); the wriggler walks on the vertex shader's limb rig.
+  (Factorio's leg tables per tier); the wriggler walks on the vertex shader's limb rig. Their
+  colours come from `space_skin.py` (below, "Space Age creatures measured from their sprites"),
+  which `part_colors.py` leaves alone.
 - The capture robot is modelled on its origin and lifted by the client like other robots; its
   projection `anchor` is negative so its high-drawn sprite lands on it.
 
@@ -489,8 +521,29 @@ Converted from Wube's printable models (`wube_recipes.py`, "Creatures"; CC BY-NC
 `tools/models/creature_pose.py`) and `character-gun` (shooting). The character also has armour
 looks on the same skeleton (`character-armor-2`, `-3`, `tools/models/armour_looks.py`) and the
 mech armour (`character-mech-armor`). The other
-tiers are the same model scaled and their carapace tinted (`creature_models.gd`, `ALIASES`, from
-Factorio's enemy-constants.lua); `spitter-spawner` is the biter spawner tinted red, as in the game.
+tiers are the same model scaled (`creature_models.gd`, `ALIASES`, from Factorio's
+enemy-constants.lua) and coloured by their own tints (below); `spitter-spawner` is the biter spawner
+under its red tint, as in the game.
+
+Skins (`tools/models/creature_skin.py`): the biter, spitter, worm and spawner and their pose models
+are coloured per vertex from Factorio's own pictures, not one colour per part: every run frame in
+its 16 directions with the model posed as the client poses it at that frame, the worm standing in
+its 16 attack directions, the corpses from their last dying frame in their fall's directions. Each
+picture is lined up on the model's silhouette, Factorio's painted-in light divided out, and each
+triangle keeps the mean of its samples less the furthest third. The carapace is stored the way
+Factorio draws a tier, as its mask layers, which each tier's own tints (from its prototype, in
+`client/data/creature_skins.json`) colour in the shader (`skin_mode`): for biters and spitters the
+two masks' shades and the second's cover in the part colours, for worms and spawners the colour
+under the one mask in the part colours and the mask's shade and cover in `COLOR_0` (red
+sqrt(shade / 4), green cover). Only numbers are stored. `part_colors.py` leaves these models to
+`creature_skin.py` (a run over every model would flatten them again), and `wube.py` runs it after
+converting a creature. Run it again after anything rewrites a creature's `.glb`:
+
+```bash
+python tools/models/creature_gait.py          # knees and the walk's bend, fitted to the run sheets
+python tools/models/creature_pose.py --table  # the poses' legs and body moves for the client
+python tools/models/creature_skin.py          # the skins (--check --debug DIR: pictures, out of the repo)
+```
 
 Limbs move in the vertex shader, not as `anim_*` nodes: every vertex carries its limb number and
 how much it follows it in `TEXCOORD_0` (x: 1-12, 0 for the body; y: 0 at the joint to 1), and
@@ -500,12 +553,26 @@ in `INSTANCE_CUSTOM.rg` that `creatures.gd` (units) and `avatar.gd` (the charact
 distance walked; idle ones (worms swaying, spawners breathing) by the clock. So a screen full of
 biters is one MultiMesh per model and pose, and the joints bend without tearing.
 
+Walking legs also fold at a knee (`knee`, `reach` and `bend` per limb in creature_rigs.json,
+`tools/models/creature_gait.py`): the outer part of the leg turns about the lift axis, as
+creature_pose.py folds it for the poses, and the walk has a rest bend per pair of legs and a flex
+while a leg is lifted, with the body standing on them (`body`), all fitted to Factorio's 16 run
+frames in their 16 directions (silhouette overlap: biter 0.593 -> 0.606, spitter 0.605 -> 0.725).
+The walking model carries its attack and corpse poses' legs too (`rig_pose`, from
+creature_poses.json's `legs`): a biting, spitting or dying creature is the walking model with its
+legs blended into the pose in the shader (the instance's custom data `a`: 2 + slot + amount) and
+its body turned on the CPU the way the pose's body moved, so it reaches the corpse model exactly
+(to about a hundredth of a tile above the ground) and the swap doesn't show, and attackers share
+the walkers' MultiMeshes.
+
 | Family | Limbs | Client |
 |---|---|---|
-| Biter | six legs, picked by hand-placed hips and seeds (recipe `hips`, `seeds`), two alternating tripods | walks by distance; attacks what the mod says it attacks (`en`): `-attack` pose, biting once per cooldown; dies: falls into one of its four corpses, which lies 15 minutes in Factorio's blood puddle |
-| Spitter | twelve short legs found automatically (`core`) | as the biter; braces in its `-attack` pose to spit |
-| Worm | neck sways and breathes | folds, rises and lunges at its target from `en`, at Factorio's state speeds |
+| Biter | six legs, picked by hand-placed hips and seeds (recipe `hips`, `seeds`), two alternating tripods, knees | walks by distance; attacks what the mod says it attacks (`en`): rears into its `-attack` pose and back once per cooldown over Factorio's 11 frames (the pose at frame 5); dies: falls into one of its four corpses, its legs folding into the corpse's, which lies 15 minutes in Factorio's blood puddle |
+| Spitter | twelve short legs found automatically (`core`), knees | as the biter; rises into its `-attack` stance and back over the 14 frames forward and back, spitting at the top |
+| Worm | neck sways and breathes | folds (its horns closing over the mouth), rises (opening them) and lunges at its target from `en`, at Factorio's state speeds; on a fifth of its idle loops Factorio's alternative idle (head thrown back, horns spread) |
 | Spawner | dome breathes | always, on Factorio's idle loop |
+| Wriggler (Gleba) | five tentacle legs (gleba.py), knees | as the biter: rears into its `-attack` pose (frame 3 of 19, front legs up) and back by frame 12, squeezed into its 26-tick cooldown; dies into its corpse, which lies Factorio's minute (no Nauvis blood) |
+| Gleba spawner | egg sacs swell | always, on Factorio's idle loop (16 frames forward and back at 0.1 a tick: 5 s) |
 | Character | bones posed in the shader (`mode: pose`, `character_anim.gd`) | runs by distance at Factorio's cycle length, `character-gun` while firing, mining; the look follows the armour worn |
 
 ## Items (on belts, on the ground, in inserter hands)
@@ -588,4 +655,33 @@ direction (torsos without their legs, lined up by their centres since they bob).
 python tools/models/creature_hull.py [names...]     # remeasure (needs Factorio's sprites)
 blender --background --factory-startup --python tools/models/build.py -- demolisher-head ...
 python tools/models/creature_score.py --space
+```
+
+Their skins (`tools/models/space_skin.py`), as `creature_skin.py`'s for Nauvis: every triangle
+coloured from the pixels that land on it in every picture Factorio draws it with (32 of the
+demolishers' 128 directions, 32 of a torso's 64 with its legs left out and lined up by its middle,
+the wriggler's run frames posed as the client poses it, the small spawner's, the spawner corpse's
+and the shells' one picture unturned, the shells at their true length), Factorio's light divided
+out. Not the big Gleba spawner: its sacs don't lie where the picture's do, so its pixels darkened
+the heap with the cracks between them; it keeps `part_colors.py`'s colour per patch. Factorio tints
+these with `tint_as_overlay` (an overlay blend, not a multiply): a near-grey on the main picture,
+the tier's colour on a mask layer half or more see-through. A pentapod's and a shell's tiers are
+models of their own, so their tints are blended in as Factorio blends them; the wriggler is one
+model for its tiers, so it keeps the mask (skin_mode 2: the colour under it as part colours, its
+shade and cover in `COLOR_0`) and each tier's tint, fitted to what the overlay gives over the
+mask's pixels, goes to `client/data/creature_skins.json` (the others there as `colour`, so
+`part_colors.py` leaves them to it). A pentapod's legs are pictures stretched along each part
+(thigh, knee, shin, foot, 32 of each for the ways Factorio lights them): each vertex takes its
+picture's row at its place along the part, the row's middle averaged over every lighting.
+
+The wriggler walks with knees and a bend fitted to its run (`creature_gait.py`), and strikes and
+dies on the walking model like a biter: `big-wriggler-pentapod-attack` (rearing, front legs up,
+frame 3 of 19) and `-corpse` (on its belly, legs flung out, the last dying frame) are posed by
+`creature_pose.py` and their legs blended in the shader. Run after rebuilding any of these:
+
+```bash
+python tools/models/creature_gait.py big-wriggler-pentapod                # its knees and walk
+python tools/models/creature_pose.py big-wriggler-pentapod-attack big-wriggler-pentapod-corpse
+python tools/models/space_skin.py              # the skins (--score: colours against the sprites;
+                                               # --shots DIR --before DIR2: pictures, out of the repo)
 ```

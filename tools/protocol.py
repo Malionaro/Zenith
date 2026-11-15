@@ -5,11 +5,12 @@ two can't drift apart. `problems(msg)` returns a list of strings; empty means va
 """
 
 RELIABLE = {"cmdr", "welcome", "protos", "tprotos", "iprotos", "fprotos", "ready", "chunk", "ents", "add", "upd", "del", "aiu", "tiles", "st", "inv", "recipes",
-            "guns", "slots", "qb", "rdet", "craftable", "techs", "clog", "surface", "eprops", "surfs", "planet",
-            "bp", "bp_ok", "bpl", "hist", "quals", "iuse", "pidx", "dprotos", "dec", "ccol"}
-IMMEDIATE = {"me", "mv", "bi", "ih", "gi", "sky", "msg", "gui", "hp", "tf", "ts", "afx", "died", "cq", "rs", "fl", "pw", "ht", "chart", "tags", "tr", "ln", "rc", "plat",
+            "guns", "slots", "qb", "rdet", "craftable", "techs", "rdone", "clog", "surface", "eprops", "surfs", "planet",
+            "bp", "bp_ok", "bpl", "hist", "quals", "iuse", "pidx", "dprotos", "dec", "ccol", "kept", "ac", "am"}
+IMMEDIATE = {"me", "mv", "bi", "ih", "ie", "gi", "sky", "msg", "gui", "hp", "tf", "ts", "afx", "died", "cq", "rs", "fl", "pw", "ht", "chart", "tags", "tr", "ln", "rc", "plat",
              "ai", "clip", "chat", "stats", "trl", "seg", "lt", "legs", "cp", "pg", "sp", "fz", "rk", "pst", "bf",
-             "eq", "cinfo", "dead", "pl", "ach", "bq", "smap", "al", "pedia", "lnets", "lnet", "bonus", "perms", "spd", "unghost", "hinfo", "terr", "mtr", "mrp", "lpad", "cov", "bfar", "raise", "pj", "gf", "shot", "en", "acol", "wb", "gfx", "mgui", "bs"}
+             "eq", "cinfo", "dead", "pl", "ach", "bq", "smap", "al", "pedia", "lnets", "lnet", "bonus", "perms", "spd", "unghost", "hinfo", "terr", "mtr", "mrp", "lpad", "cov", "bfar", "raise", "pj", "gf", "shot", "en", "acol", "wb", "gfx", "mgui", "bs", "dg", "pol",
+             "mnd", "pku"}
 CHARACTER_ROLES = {"main", "guns", "ammo", "armor", "trash"}
 DICTIONARY_WIDTH = {"protos": 12, "tprotos": 5, "iprotos": 2, "fprotos": 5, "dprotos": 2}
 GUI_KINDS = {"container", "crafter", "furnace", "lab", "combinator", "train", "stop", "roboport", "other",
@@ -22,7 +23,7 @@ PLANNER_ITEMS = {"", "blueprint", "blueprint-book", "deconstruction-planner", "u
 RECORD_TYPES = {"blueprint", "blueprint-book", "deconstruction-planner", "upgrade-planner"}
 STATS_KINDS = {"item", "fluid", "kill", "electric", "build", "pollution"}
 ALERT_KINDS = {"destroyed", "attack", "fire", "no_ammo", "no_material", "no_robots", "no_repair", "train_fuel", "train_path",
-               "platform_path", "platform_storage", "collector", "launch", "unplugged", "no_fuel", "output_full"}
+               "platform_path", "platform_storage", "collector", "launch", "unplugged", "no_fuel", "output_full", "depleted"}
 PEDIA_KINDS = {"item", "fluid", "entity", "recipe", "technology", "tile", "planet", "space-location", "quality"}
 
 
@@ -216,17 +217,20 @@ def item_counts_problems(v, where):
 
 
 def slot_list_problems(v, where):
-    """[[item, count] or [item, count, quality], or 0 for an empty slot, ...]"""
+    """[[item, count] or [item, count, quality] or [item, count, quality, freshness] or, for a worn tool,
+    [item, count, quality, freshness or -1, durability (0-999)], or 0 for an empty slot, ...]"""
     if not _list(v):
         return [f"{where}: must be a list of slots: {v!r}"]
     out = []
     for slot in _items(v):
         if slot == 0:
             continue
-        if not (isinstance(slot, list) and len(slot) in (2, 3, 4) and isinstance(slot[0], str) and _int(slot[1])
+        if not (isinstance(slot, list) and len(slot) in (2, 3, 4, 5) and isinstance(slot[0], str) and _int(slot[1])
                 and slot[1] > 0 and (len(slot) == 2 or isinstance(slot[2], str))
-                and (len(slot) < 4 or (_int(slot[3]) and 0 <= slot[3] <= 1000))):
-            out.append(f"{where}: slot must be 0 or [item, count, quality?, freshness (0-1000)?]: {slot!r}")
+                and (len(slot) != 4 or (_int(slot[3]) and 0 <= slot[3] <= 1000))
+                and (len(slot) != 5 or (_int(slot[3]) and -1 <= slot[3] <= 1000 and _int(slot[4]) and 0 <= slot[4] < 1000))):
+            out.append(f"{where}: slot must be 0 or [item, count, quality?, freshness (0-1000)?] "
+                       f"or [item, count, quality, freshness or -1, durability (0-999)]: {slot!r}")
     return out
 
 
@@ -252,10 +256,12 @@ def recipe_detail_problems(rec):
 
 
 def eprops_overlay_problems(x):
-    """eprops' fifth entry: {ip, id: [x, y]} inserter vectors, {lr, cr} roboport radii, {mr, vp?}
+    """eprops' fifth entry: {ip, id: [x, y], rs, es} inserter vectors and hand speeds, {lr, cr} roboport radii, {mr, vp?}
     mining radius and drop vector, {fb: [[x, y, direction, "i"|"o"|"b"], ...]} fluid connections, fo: 1
     when those show only while the recipe needs fluid, cw the circuit wire reach, ww a power switch's copper
-    wire reach."""
+    wire reach, tb the tiles it needs and keeps off (tile_buildability_rules), ms its own mining sound, ids where
+    Alt-mode draws its own icon (icon_draw_specification), isq the rows of its modules and a lab's packs (K1, K2),
+    rsd its own repair sound (K13)."""
     if not isinstance(x, dict) or not x:
         return [f"must be a non-empty object: {x!r}"]
     out = []
@@ -267,9 +273,29 @@ def eprops_overlay_problems(x):
             ok = v == 1
         elif k in ("lr", "cr", "mr", "cw", "ww"):
             ok = _num(v) and v >= 0
+        elif k in ("rs", "es"):
+            ok = _num(v) and v > 0  # an inserter's rotation (turns a tick) and extension (tiles a tick) speed
         elif k == "fb":
             ok = isinstance(v, list) and all(isinstance(c, list) and len(c) == 4 and _num(c[0]) and _num(c[1]) and _int(c[2])
                                              and c[3] in ("i", "o", "b") for c in v)
+        elif k in ("ms", "rsd"):
+            # J11: its own mining sound, K13: its repair sound, each its variations' prefix in the player's
+            # install ("base/sound/x").
+            ok = isinstance(v, str) and "/" in v and not v.startswith("__")
+        elif k == "ids":
+            # icon_draw_specification: [shift x, shift y, scale], only when not the default.
+            ok = isinstance(v, list) and len(v) == 3 and all(_num(n) for n in v) and v[2] > 0 and v != [0, 0, 1]
+        elif k == "isq":
+            # icons_positioning: [[kind, shift x, shift y, scale, icons a row, rows, separation, first row's lift], ...],
+            # kind "m" modules or "l" a lab's science packs.
+            ok = isinstance(v, list) and 0 < len(v) <= 4 and all(
+                isinstance(c, list) and len(c) == 8 and c[0] in ("m", "l") and all(_num(n) for n in c[1:4]) and c[3] > 0
+                and _int(c[4]) and c[4] >= 1 and _int(c[5]) and c[5] >= 1 and _num(c[6]) and c[6] > 0 and _num(c[7]) for c in v)
+        elif k == "tb":
+            # Tile rules: [x1, y1, x2, y2, need, avoid], need / avoid "w" water, "g" ground, "" none.
+            ok = isinstance(v, list) and 0 < len(v) <= 8 and all(
+                isinstance(c, list) and len(c) == 6 and all(_num(n) for n in c[:4]) and c[4] in ("w", "g", "")
+                and c[5] in ("w", "g", "") and (c[4] or c[5]) for c in v)
         else:
             ok = False
         if not ok:
@@ -436,6 +462,8 @@ def gui_problems(msg):
         out.append(f"gui: recipe must be a name: {msg['recipe']!r}")
     if "pr" in msg and not (_int(msg["pr"]) and 0 <= msg["pr"] <= 1000):
         out.append(f"gui: pr must be thousandths: {msg['pr']!r}")
+    if "ps" in msg and not (_int(msg["ps"]) and msg["ps"] >= 0 and "pr" in msg):
+        out.append(f"gui: ps (thousandths of a craft a second, with pr) must be whole and not negative: {msg['ps']!r}")
     if "rl" in msg and not (_list(msg["rl"]) and all(isinstance(v, str) for v in _items(msg["rl"]))):
         out.append(f"gui: rl must be recipe names: {msg['rl']!r}")
     if kind not in ("crafter", "furnace", "silo") and ("recipe" in msg or "pr" in msg):
@@ -917,9 +945,9 @@ def equipment_grid_problems(msg):
 
 
 def item_use_problems(rec):
-    """[item, kind, ...]: "t" tiles, "c" capsules, "r" rail planners, "b" belts, "p" pipes, "m" modules."""
-    if not (isinstance(rec, list) and len(rec) >= 3 and isinstance(rec[0], str) and rec[1] in ("t", "c", "r", "b", "p", "m")):
-        return [f"entry must start with item name and kind t|c|r|b|p|m: {rec!r}"]
+    """[item, kind, ...]: "t" tiles, "c" capsules, "r" rail planners, "b" belts, "p" pipes, "m" modules, "h" repair tools."""
+    if not (isinstance(rec, list) and len(rec) >= 3 and isinstance(rec[0], str) and rec[1] in ("t", "c", "r", "b", "p", "m", "h")):
+        return [f"entry must start with item name and kind t|c|r|b|p|m|h: {rec!r}"]
     kind = rec[1]
     if kind == "t" and not (len(rec) == 5 and isinstance(rec[2], str) and isinstance(rec[3], str) and _list(rec[4])
                             and all(_int(v) for v in _items(rec[4]))):
@@ -932,6 +960,8 @@ def item_use_problems(rec):
         return [f"belt / pipe entry must be [item, kind, underground item]: {rec!r}"]
     if kind == "m" and not (len(rec) == 3 and isinstance(rec[2], str)):
         return [f"module entry must be [item, 'm', category]: {rec!r}"]
+    if kind == "h" and not (len(rec) == 4 and _num(rec[2]) and rec[2] >= 0 and _num(rec[3]) and rec[3] >= 0):
+        return [f"repair tool entry must be [item, 'h', speed, durability]: {rec!r}"]
     return []
 
 
@@ -1037,6 +1067,8 @@ def problems(msg):
             out.append(f"welcome: gf is the graphics list's fingerprint, gn its parts: {msg.get('gf')!r} {msg.get('gn')!r}")
         if "sq" in msg and not (_int(msg["sq"]) and msg["sq"] >= 1):
             out.append(f"welcome: sq is the furthest square subscription, in chunks: {msg['sq']!r}")
+        if "sid" in msg and not (isinstance(msg["sid"], str) and msg["sid"]):
+            out.append(f"welcome: sid is the save's name for the client, a string: {msg['sid']!r}")
     elif t == "surface":
         need("si", "x", "y")
         out += surface_field_problems(msg, t)
@@ -1089,6 +1121,12 @@ def problems(msg):
                 out.append("chunk: tiles must be [id, count, ...] integers")
             elif sum(tiles[1::2]) != 1024:
                 out.append(f"chunk: tiles cover {sum(tiles[1::2])} tiles, not 1024")
+    elif t == "kept":
+        need("rs")
+        need("l", check=_list)
+        l = msg.get("l")
+        if isinstance(l, list) and (len(l) % 4 or not all(_int(v) for v in l)):
+            out.append("kept: l must be [cx, cy, rv, n, ...] integers")
     elif t == "ents":
         need("cx", "cy", "part", "parts")
         need("e", check=_list)
@@ -1112,14 +1150,45 @@ def problems(msg):
         out += entity_record_problems(msg.get("e"), t)
     elif t in ("del", "died"):
         need("u", "p", "x", "y")
+    elif t == "mnd":
+        need("u", "p", "x", "y")
+        if msg.get("g") not in (0, 1) or msg.get("gi", 0) not in (0, 1):
+            out.append(f"mnd: g (gone) and gi (an item on the ground) are 0 or 1: {msg!r}")
+        l = msg.get("l")
+        if not (_list(l) and all(isinstance(r, list) and len(r) == 2 and isinstance(r[0], str) and _int(r[1]) and r[1] > 0
+                                 for r in _items(l))):
+            out.append(f"mnd: l must be [[item, count > 0], ...]: {l!r}")
+    elif t == "pku":
+        need("k")
+        l = msg.get("l")
+        # [item, count, x, y, lane key, unique id, left, item id]: lane key and unique id both 0 on the ground,
+        # both set on a belt.
+        if not (isinstance(l, list) and l and all(
+                isinstance(r, list) and len(r) == 8 and isinstance(r[0], str) and r[0] != "" and all(_int(v) for v in r[1:])
+                and r[1] > 0 and r[4] >= 0 and r[5] >= 0 and r[6] >= 0 and r[7] >= 0 and (r[4] == 0) == (r[5] == 0)
+                for r in l)):
+            out.append(f"pku: l must be [[item, count > 0, x, y, lane key, unique id, left, item id], ...]: {l!r}")
     elif t == "tiles":
         l = msg.get("l")
         if not isinstance(l, list) or len(l) % 3 or not all(_int(v) for v in l):
             out.append("tiles: l must be [x, y, id, ...] integers")
     elif t == "st":
         l = msg.get("l")
-        if not isinstance(l, list) or len(l) % 2 or not all(_int(v) for v in l) or not all(v in (0, 1, 2, 3, 4, 5) for v in l[1::2]):
+        if not _list(l) or len(_items(l)) % 2 or not all(_int(v) for v in _items(l)) \
+                or not all(v in (0, 1, 2, 3, 4, 5) for v in _items(l)[1::2]):
             out.append("st: l must be [unit, state 0-5, ...]")
+        # K10: lit lamps' colours, [unit, 0xRRGGBB or -1 (white, the plain light), ...]; never empty.
+        lc = msg.get("lc")
+        if "lc" in msg and not (isinstance(lc, list) and lc and len(lc) % 2 == 0 and all(_int(v) for v in lc)
+                                and all(v == -1 or 0 <= v <= 0xFFFFFF for v in lc[1::2])):
+            out.append(f"st: lc must be [unit, colour 0xRRGGBB or -1, ...]: {lc!r}")
+        # K20: lit lamps set to Always on (shining by day too), [unit, 1 or 0, ...]; never empty.
+        ao = msg.get("ao")
+        if "ao" in msg and not (isinstance(ao, list) and ao and len(ao) % 2 == 0 and all(_int(v) for v in ao)
+                                and all(v in (0, 1) for v in ao[1::2])):
+            out.append(f"st: ao must be [unit, 0/1, ...]: {ao!r}")
+        if "lc" not in msg and "ao" not in msg and not _items(l):
+            out.append("st: an empty l comes only with lc or ao")
     elif t == "mv":
         need("part", "parts")
         if msg.get("z", 1) != 1:
@@ -1130,16 +1199,20 @@ def problems(msg):
         for rec in _items(msg.get("l")):
             if not isinstance(rec, list) or len(rec) not in (4, 5) or not all(_int(v) for v in rec):
                 out.append(f"mv: mover must be 4 or 5 integers: {rec!r}")
-    elif t in ("bi", "ih", "gi", "fl", "pw", "ht"):
+    elif t in ("bi", "ih", "ie", "gi", "fl", "pw", "ht"):
         need("part", "parts")
         l = msg.get("l")
-        width = {"gi": 3, "fl": 6, "pw": 2, "ht": 2}.get(t, 4)
+        width = {"gi": 3, "fl": 6, "pw": 2, "ht": 2, "ie": 9}.get(t, 4)
         if not _list(l) or len(_items(l)) % width or not all(_int(v) for v in _items(l)):
             out.append(f"{t}: l must be flat groups of {width} integers")
-        elif t in ("bi", "ih") and msg.get("z", 1) != 1:
+        elif t in ("bi", "ih", "ie") and msg.get("z", 1) != 1:
             out.append(f"{t}: z must be 1 (delta-coded) or absent: {msg.get('z')!r}")
-        elif t in ("bi", "ih") and "p" in msg and not (_int(msg["p"]) and msg["p"] >= 1):
+        elif t in ("bi", "ih", "ie") and "p" in msg and not (_int(msg["p"]) and msg["p"] >= 1):
             out.append(f"{t}: p (ticks between updates) must be a positive integer: {msg['p']!r}")
+        elif t == "ie" and not (_int(msg.get("n")) and msg["n"] >= 1):
+            out.append(f"ie: n (the ticks the events cover) must be a positive integer: {msg.get('n')!r}")
+        elif t == "ie" and msg.get("z", 0) != 1 and any(not (1 <= v <= 6) for v in _items(l)[::9]):
+            out.append(f"ie: each record's kind must be 1-6: {_items(l)[:9]!r}")
         elif t == "bi" and any(k in msg for k in ("fx", "fy", "fr")) and not (
                 all(_int(msg.get(k)) for k in ("fx", "fy", "fr")) and msg["fr"] >= 0):
             out.append(f"bi: fx, fy (1/256 tile) and fr (tiles, >= 0) come together, as integers: {msg.get('fx')!r} {msg.get('fy')!r} {msg.get('fr')!r}")
@@ -1165,6 +1238,16 @@ def problems(msg):
             out.append("en: l must be flat groups of 3 integers (unit, target x, target y), not empty")
         elif not all(v > 0 for v in _items(l)[0::3]):
             out.append(f"en: units must be positive: {l!r}")
+    elif t == "pol":
+        need("si", "w")
+        w = msg.get("w")
+        if _int(w) and w > 0:
+            need("cx", "cy", "md")
+            l = msg.get("l")
+            if not _list(l) or len(_items(l)) != w * w or not all(_int(v) and v >= 0 for v in _items(l)):
+                out.append(f"pol: l must be w * w whole, non-negative pollution amounts, row by row: {msg!r}")
+        elif _int(w) and w < 0:
+            out.append(f"pol: w must be 0 (none) or the square's side in chunks: {msg!r}")
     elif t == "sky":
         need("d", "n")
         if _int(msg.get("d")) and _int(msg.get("n")) and not (0 <= msg["d"] < 1000 and 0 <= msg["n"] <= 1000):
@@ -1191,6 +1274,11 @@ def problems(msg):
             out.append(f"me: fl (flying) and fh (flight height) come together: {msg!r}")
         elif "fh" in msg and not (_int(msg["fh"]) and msg["fh"] >= 0):
             out.append(f"me: fh must be thousandths of a tile, 0 or more: {msg['fh']!r}")
+        if "rp" in msg:
+            # K13: repairing, and where (the target's position).
+            need("rx", "ry")
+            if msg["rp"] != 1:
+                out.append(f"me: rp is 1 while repairing, else left out: {msg['rp']!r}")
         if "pod" in msg:
             need("pod", "gx", "gy", "up")
             if not isinstance(msg.get("ps"), str):
@@ -1302,10 +1390,18 @@ def problems(msg):
     elif t == "gui":
         out += gui_problems(msg)
     elif t == "chart":
-        need("cx", "cy", "n")
+        # `same`: the client's picture (its stamp) is still the chunk's: only the live parts come, no n.
+        if "same" in msg:
+            need("cx", "cy", "same")
+            if not (_int(msg["same"]) and msg["same"] >= 0) or "px" in msg or "pal" in msg:
+                out.append(f"chart: same is a stamp (a whole number >= 0) and comes without a picture: {msg.get('same')!r}")
+        else:
+            need("cx", "cy", "n")
+        if "st" in msg and not (_int(msg["st"]) and msg["st"] >= 0 and _int(msg.get("n")) and msg["n"] > 0):
+            out.append(f"chart: st is a stamp (a whole number >= 0) on a chart with a picture: {msg['st']!r}")
         if "si" in msg:
             need("si")
-        n = msg.get("n")
+        n = msg.get("n", 0)
         if _int(n) and n > 0:
             if n not in (1, 2, 4, 8, 16):
                 out.append(f"chart: n must be 32 / (2, 4, 8, 16 or 32): {n!r}")
@@ -1517,6 +1613,25 @@ def problems(msg):
             out.append(f"hinfo: el is {{e, b, mx, mn}}: joules in the buffer, its size, max. and min. consumption (W): {msg!r}")
         if "rn" in msg and not (_list(msg["rn"]) and len(_items(msg["rn"])) % 2 == 0 and all(_int(v) for v in _items(msg["rn"]))):
             out.append(f"hinfo: rn is [x, y, ...]: the linked roboports' positions in 1/256 tiles: {msg!r}")
+        for rec in _items(msg.get("inv", [])):
+            if not (_list(rec) and len(rec) == 2 and isinstance(rec[0], str) and _list(rec[1]) and rec[1]
+                    and all(_list(it) and len(it) in (2, 3) and isinstance(it[0], str) and _int(it[1]) and it[1] > 0
+                            and (len(it) == 2 or isinstance(it[2], str)) for it in _items(rec[1]))):
+                out.append(f"hinfo: inv is [[role, [[item, count, quality?], ...]], ...], none empty: {rec!r}")
+        if "inv" in msg and not _list(msg["inv"]):
+            out.append(f"hinfo: inv must be a list: {msg!r}")
+        for k in ("pr", "bn"):
+            if k in msg and not (_int(msg[k]) and 0 <= msg[k] <= 1000):
+                out.append(f"hinfo: {k} must be thousandths: {msg!r}")
+        if "ps" in msg and not (_int(msg["ps"]) and msg["ps"] >= 0 and "pr" in msg):
+            out.append(f"hinfo: ps (thousandths of a craft a second, with pr) must be whole and not negative: {msg!r}")
+        if "io" in msg:
+            io = msg["io"]
+            rows = lambda k: _items(io.get(k, [])) if isinstance(io, dict) else []
+            if not (isinstance(io, dict) and set(io) <= {"i", "o"} and all(_list(io.get(k, [])) for k in ("i", "o"))
+                    and all(_list(r) and len(r) == 3 and r[0] in ("item", "fluid") and isinstance(r[1], str) and _int(r[2]) and r[2] >= 0
+                            for k in ("i", "o") for r in rows(k))):
+                out.append(f"hinfo: io is {{i, o}}: [[item or fluid, name, thousandths a second], ...] each: {msg!r}")
     elif t == "cmdr":
         need("id")
         need("l", check=_list)
@@ -1602,6 +1717,8 @@ def problems(msg):
         need("part", "parts")
         if "si" in msg:
             need("si")
+        if "c" in msg:
+            need("c")
         need("l", check=_list)
         for rec in _items(msg.get("l")):
             if not (_list(rec) and len(_items(rec)) % 2 == 0 and all(_int(v) for v in _items(rec))):
@@ -1621,8 +1738,19 @@ def problems(msg):
             out.append("recipes: l must be names")
     elif t == "msg":
         need("text", check=lambda v: isinstance(v, str))
+        # (Bridges before `rdone` named a finished research's technology here.)
         if "tech" in msg and not isinstance(msg["tech"], str):
             out.append(f"msg: a research notification's tech is its name: {msg!r}")
+    elif t == "rdone":
+        need("tick")
+        need("l", check=lambda v: isinstance(v, list) and len(v) > 0)
+        for e in _items(msg.get("l")):
+            if not (isinstance(e, list) and len(e) == 2 and isinstance(e[0], str) and e[0] and _int(e[1]) and e[1] >= 0):
+                out.append(f"rdone: each finished research is [technology, level done or 0]: {e!r}")
+        if len(_items(msg.get("l"))) > 100:
+            out.append(f"rdone: at most 100 named, n counts the rest: {len(msg['l'])}")
+        if "n" in msg and not (_int(msg["n"]) and msg["n"] > 0):
+            out.append(f"rdone: n is how many more finished than l names: {msg['n']!r}")
     elif t == "slots":
         lists = msg.get("l")
         if not isinstance(lists, dict) or not lists:
@@ -1686,6 +1814,25 @@ def problems(msg):
             if not (isinstance(rec, list) and len(rec) in (3, 4) and _int(rec[0]) and rec[1] in ("item", "fluid", "recipe", "virtual")
                     and isinstance(rec[2], str) and (len(rec) == 3 or (_list(rec[3]) and all(isinstance(v, str) for v in _items(rec[3]))))):
                 out.append(f"ai: entry must be [unit, icon type, name, more filters?]: {rec!r}")
+    elif t == "ac":
+        need("g")
+        need("l", check=_list)
+        for rec in _items(msg.get("l")):
+            if not (isinstance(rec, list) and 1 <= len(rec) <= 3 and _int(rec[0])
+                    and (len(rec) == 1 or (isinstance(rec[1], str) and rec[1] != ""))
+                    and (len(rec) < 3 or (_list(rec[2]) and _items(rec[2]) and all(isinstance(x, str) and x for x in _items(rec[2]))))):
+                out.append(f"ac: entry must be [unit, item, [more items]?] or [unit]: {rec!r}")
+    elif t == "am":
+        need("g")
+        need("l", check=_list)
+        item = lambda x: (isinstance(x, str) and x != "") or (isinstance(x, list) and len(x) == 2 and all(isinstance(v, str) and v for v in x)
+                                                             and x[1] != "normal")
+        for rec in _items(msg.get("l")):
+            if not (isinstance(rec, list) and 1 <= len(rec) <= 3 and _int(rec[0])
+                    and (len(rec) == 1 or rec[1] == 0 or (_list(rec[1]) and _items(rec[1]) and all(item(x) for x in _items(rec[1]))))
+                    and (len(rec) < 3 or (_list(rec[2]) and _items(rec[2]) and all(item(x) for x in _items(rec[2]))))
+                    and not (len(rec) == 2 and rec[1] == 0)):
+                out.append(f"am: entry must be [unit, modules or 0, [science packs]?] or [unit], each item a name or [name, quality]: {rec!r}")
     elif t == "aiu":
         need("l", check=_list)
         for rec in _items(msg.get("l")):

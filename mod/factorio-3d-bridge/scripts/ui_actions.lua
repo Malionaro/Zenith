@@ -17,6 +17,10 @@ local screens = require("scripts.screens")
 local map = require("scripts.map")
 local history = require("scripts.history")
 local alt_mode = require("scripts.alt_mode")
+local inventory = require("scripts.inventory")
+local mining_sounds = require("scripts.mining_sounds")
+local belt_sim = require("scripts.belt_sim")
+local perf = require("scripts.perf")
 
 local M = {}
 
@@ -66,6 +70,34 @@ local function target(c, cmd)
 end
 
 ---------------------------------------------------------------------------------------------
+-- Items the character put on a belt or took off it (J21). No event says so, and a lane nothing else
+-- touches is only checked against the client's simulation every pc_every updates (several seconds), so the
+-- item showed that late; the lanes are read in the next belt update instead, as the client's `bre` asks.
+
+local LANE_KEYS = 8 -- belt_sim.lua's: unit number * 8 + line index
+
+local function belt_lanes_changed(belts)
+  if not perf.on("put_lanes") then
+    return
+  end
+  local keys = {}
+  for _, e in ipairs(belts) do
+    if e.valid and e.unit_number then
+      local ok, lines = pcall(function() return e.get_max_transport_line_index() end)
+      for i = 1, ok and lines or 0 do
+        keys[#keys + 1] = e.unit_number * LANE_KEYS + i
+      end
+    end
+  end
+  if #keys > 0 then
+    belt_sim.resend({ l = keys })
+  end
+end
+
+-- And the belts F took items off (puppet.lua, issue #18).
+puppet.belt_listeners[#puppet.belt_listeners + 1] = belt_lanes_changed
+
+---------------------------------------------------------------------------------------------
 -- Drop (Z)
 
 -- {item, x, y}: one of the item from the main inventory into the entity at that spot if it takes
@@ -96,6 +128,9 @@ function M.drop(cmd)
       if ok and inserted > 0 then
         main.remove(stack)
         puppet.send_inventory_now()
+        if registry.BELT_SET[e.type] then
+          belt_lanes_changed({ e })
+        end
         return
       end
     end
@@ -103,6 +138,10 @@ function M.drop(cmd)
   main.remove(stack)
   c.surface.spill_item_stack({ position = at, stack = stack, allow_belts = true, max_radius = 0, use_start_position_on_failure = true })
   puppet.send_inventory_now()
+  local types = registry.belt_types()
+  if #types > 0 then
+    belt_lanes_changed(c.surface.find_entities_filtered({ position = at, type = types }))
+  end
 end
 
 ---------------------------------------------------------------------------------------------
@@ -135,9 +174,35 @@ end
 
 local BELTS = { ["transport-belt"] = true, ["underground-belt"] = true, splitter = true }
 
+local function quality_of(stack)
+  local ok, q = pcall(function() return stack.quality.name end)
+  return ok and q or "normal"
+end
+
+-- Takes `count` of the item out of the main inventory, from slot `hs` (the client's held stack)
+-- first: Factorio's Ctrl+click empties the cursor's stack, not another stack of the item (I1).
+local function remove_held(main, hs, item, count, quality)
+  local left = count
+  if hs and hs >= 1 and hs <= #main then
+    local st = main[hs]
+    if st.valid_for_read and st.name == item and quality_of(st) == quality then
+      local k = math.min(left, st.count)
+      if k >= st.count then
+        st.clear()
+      else
+        st.count = st.count - k
+      end
+      left = left - k
+    end
+  end
+  if left > 0 then
+    main.remove({ name = item, count = left, quality = quality })
+  end
+end
+
 -- Ctrl+click on a belt: its items into the character (half of each with `half`), or the held
 -- stack onto it, as many as its lanes take.
-local function belt_transfer(c, e, main, item, n, quality)
+local function belt_transfer(c, e, main, item, n, quality, hs)
   local lines = e.get_max_transport_line_index()
   if item ~= "" then
     local moved = 0
@@ -153,7 +218,7 @@ local function belt_transfer(c, e, main, item, n, quality)
     if moved == 0 then
       return puppet.message("No room on the belt")
     end
-    main.remove({ name = item, count = moved, quality = quality })
+    remove_held(main, hs, item, moved, quality)
     return
   end
   local moved = 0
@@ -174,10 +239,11 @@ local function belt_transfer(c, e, main, item, n, quality)
   end
 end
 
--- {u, p, x, y, item?, n?, q?, half}: with `item`, the held stack (`n` of it, else a full stack;
--- half of that with half = 1, in quality `q`) from the main inventory into the entity wherever
--- an inserter would put it; without, everything (half of each) out of its output or chest. On a
--- belt the items go on or come off its lanes.
+-- {u, p, x, y, item?, n?, q?, hs?, half}: with `item`, the held stack (`n` of it, else a full stack;
+-- half of that with half = 1, in quality `q`; `hs` the main inventory slot it is in, emptied first)
+-- from the main inventory into the entity wherever an inserter would put it; without, everything
+-- (half of each) out of its output or chest. On a belt the items go on or come off its lanes. The
+-- slots are sent at once, as the client's hand and sound follow them.
 function M.fast(cmd)
   local c = puppet.get()
   local e = c and target(c, cmd)
@@ -194,6 +260,7 @@ function M.fast(cmd)
   end
   local item = cmd.item and tostring(cmd.item) or ""
   local quality = type(cmd.q) == "string" and prototypes.quality[cmd.q] and cmd.q or "normal"
+  local hs = math.floor(tonumber(cmd.hs) or 0)
   if item ~= "" and not prototypes.item[item] then
     return
   end
@@ -208,11 +275,13 @@ function M.fast(cmd)
     else
       n = half and 1 or 0
     end
-    local ok, err = pcall(belt_transfer, c, e, main, item, n, quality)
+    local ok, err = pcall(belt_transfer, c, e, main, item, n, quality, hs)
     if not ok then
       log("[factorio-3d-bridge] belt fast transfer: " .. tostring(err))
     end
+    belt_lanes_changed({ e })
     puppet.send_inventory_now()
+    inventory.send_slots_now()
     return
   end
   if item ~= "" then
@@ -228,7 +297,7 @@ function M.fast(cmd)
     if not ok or inserted == 0 then
       return puppet.message("Can't put " .. item .. " in there")
     end
-    main.remove({ name = item, count = inserted, quality = quality })
+    remove_held(main, hs, item, inserted, quality)
   else
     local moved = 0
     for _, inv in ipairs(take_inventories(e)) do
@@ -252,6 +321,7 @@ function M.fast(cmd)
     end
   end
   puppet.send_inventory_now()
+  inventory.send_slots_now()
   screens.refresh()
 end
 
@@ -740,9 +810,47 @@ local function fluid_connections(proto)
   return #out > 0 and out or nil
 end
 
+-- A collision mask's tile kind as the client tells tiles apart: "w" water tiles, "g" ground
+-- tiles, "" neither (or none).
+local function tile_kind(mask)
+  local layers = type(mask) == "table" and mask.layers or nil
+  if type(layers) ~= "table" then
+    return ""
+  end
+  if layers.water_tile then
+    return "w"
+  end
+  if layers.ground_tile then
+    return "g"
+  end
+  return ""
+end
+
+-- [[x1, y1, x2, y2, need, avoid], ...] for the entity facing north: each rule's area, the tiles it
+-- needs all of and those it may have none of (tile_kind), or nil without rules.
+local function tile_rules(proto)
+  local ok, rules = pcall(function() return proto.tile_buildability_rules end)
+  if not (ok and type(rules) == "table") then
+    return nil
+  end
+  local out = {}
+  for _, r in pairs(rules) do
+    local a = r.area
+    local lt = a and (a.left_top or a[1])
+    local rb = a and (a.right_bottom or a[2])
+    local need, avoid = tile_kind(r.required_tiles), tile_kind(r.colliding_tiles)
+    if lt and rb and (need ~= "" or avoid ~= "") and #out < 8 then
+      local p, q = vec(lt), vec(rb)
+      out[#out + 1] = { p[1], p[2], q[1], q[2], need, avoid }
+    end
+  end
+  return #out > 0 and out or nil
+end
+
 -- What hover and the build cursor draw for a prototype besides its reach (`eprops`' fifth entry):
 -- an inserter's pickup and drop vectors, a roboport's logistic and construction radius, a mining
--- drill's mining radius and where it drops, fluid connections. nil when none.
+-- drill's mining radius and where it drops, fluid connections; its own mining sound (J11); where
+-- Alt-mode puts its icons (K1, K2). nil when none.
 local function overlay(proto)
   local t = proto.type
   local x = {}
@@ -750,6 +858,12 @@ local function overlay(proto)
     local ok, p, d = pcall(function() return proto.inserter_pickup_position, proto.inserter_drop_position end)
     if ok and p and d then
       x.ip, x.id = vec(p), vec(d)
+    end
+    -- Its hand's speeds at normal quality (turns and tiles a tick), for the client's swing model
+    -- (inserter_arms.gd): quality multiplies both.
+    local ok2, rs, es = pcall(function() return proto.get_inserter_rotation_speed(), proto.get_inserter_extension_speed() end)
+    if ok2 and rs and es then
+      x.rs, x.es = rs, es
     end
   elseif t == "roboport" then
     local ok, lr, cr = pcall(function() return proto.logistic_radius, proto.construction_radius end)
@@ -779,6 +893,16 @@ local function overlay(proto)
     local okw, ww = pcall(function() return proto.get_max_wire_distance() end)
     x.ww = okw and type(ww) == "number" and math.floor(ww * 10 + 0.5) / 10 or nil
   end
+  -- The tiles it must stand on and keep off (tile_buildability_rules: an offshore pump's water in
+  -- front and land under it), for the build cursor's red and green tiles (I10).
+  x.tb = tile_rules(proto)
+  -- Its own mining sound, the one each swing of the character's hand plays (J11, mining_sounds.lua).
+  x.ms = mining_sounds.of(proto.name)
+  -- Where Alt-mode draws its own icon and the rows of its modules and a lab's science packs (K1, K2).
+  x.ids = alt_mode.draw_spec(proto)
+  x.isq = alt_mode.sequences(proto)
+  -- And its repair sound, the one a repair pack mending it plays (K13).
+  x.rsd = mining_sounds.repair_of(proto.name)
   -- Assemblers' and drills' pipe connections show only while their recipe (resource) needs fluid.
   local ok, off = pcall(function() return proto.fluid_boxes_off_when_no_fluid_recipe end)
   if x.fb and ((ok and off) or t == "mining-drill") then

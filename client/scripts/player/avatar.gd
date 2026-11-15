@@ -8,6 +8,9 @@ const CharacterPose := preload("res://scripts/player/character_pose.gd")
 const CharacterAnim := preload("res://scripts/player/character_anim.gd")
 const GameClock := preload("res://scripts/world/game_clock.gd")
 const Rockets := preload("res://scripts/world/rockets.gd")
+const ItemCards := preload("res://scripts/world/item_cards.gd")
+const ItemIcons := preload("res://scripts/world/item_icons.gd")
+const GroundHeight := preload("res://scripts/world/ground_height.gd")
 
 const FOLLOW_RATE := 18.0
 
@@ -21,6 +24,15 @@ var craft_queue := 0
 ## Mining progress 0..100, or -1 when not mining.
 var mining := -1
 var mining_at := Vector2.ZERO
+## K13: the character repairs something with a repair pack (`me` `rp`), and where: it swings its tool as
+## it mines, and fx.gd plays the repair sound there.
+var repairing := false
+var repair_at := Vector2.ZERO
+## I20: the right button went down on something to mine (player_input.gd), before the bridge's
+## mining progress comes back: fx.gd starts the swing's sound from this, as Factorio does on the
+## click. -1 msec when there is none.
+var mine_hint_at := Vector2.ZERO
+var mine_hint_msec := -1
 ## The vehicle the character sits in (its unit number), or 0, and its speed in km/h.
 var vehicle := 0
 var vehicle_speed := 0.0
@@ -56,10 +68,55 @@ const ANGLE_HOLD := 10.0
 ## swinging arms passed in front of the flashlight, so the cone flickered with every stride).
 const SELF_LAYER := 1 << 19
 const NOT_SELF := 0xFFFFFFFF & ~SELF_LAYER
+## Nor do they cast belt items' shadows (ItemCards.BELT_LAYER): an item kind is one MultiMesh over the
+## whole square round the character, so at night every 3D item went through the flashlight's pass and
+## each lantern cube face it touched, for shadows a few pixels long. --item-light-shadows=on keeps them.
+static var item_light_shadows := "--item-light-shadows=on" in OS.get_cmdline_user_args()
 var _lantern := OmniLight3D.new()
 ## Factorio's character also lights a cone ahead of it at night (its `light`'s oriented cone,
 ## shifted 13 tiles forward): a flashlight.
 var _flashlight := SpotLight3D.new()
+## How high the lantern and the flashlight are over the ground under the character (the old
+## flashlight's; the new one stands BEAM_HEIGHT up: flashlight_height()).
+const LANTERN_HEIGHT := 2.5
+const FLASHLIGHT_HEIGHT := 3.0
+## The flashlight (V27; owner: "seems to be no flashlight"). Factorio's is a light picture drawn
+## over the world (core/graphics/light-cone.png: a triangle from the character's feet some 25 tiles
+## ahead, fading out), which no building stops. "new" (the default) draws it so: a spot BEAM_HEIGHT
+## over the character with nothing casting its shadow, the picture projected through it so that it
+## lands on the ground at Factorio's size and fade (beam_texture()). "old" (--flashlight=old) is
+## 0.2.1's: a spot 3 tiles up casting the buildings' shadows, so its beam stopped at the next
+## building. The Compatibility renderer draws no projectors: the old one there.
+static var flashlight_mode := _flashlight_mode()
+## Factorio's cone (the character's oriented light in entities.lua): a 200-pixel picture at scale 2,
+## the light's size 2, so 25 tiles square, its middle 13 tiles ahead (shift {0, -13}).
+const CONE_TILES := 25.0
+const CONE_AHEAD := 13.0
+## The new flashlight's spot: high enough that the ground far ahead isn't lit at a graze (its light
+## falls off as Factorio's picture does, so the picture has little to make up), pitched to put the
+## cone's far end and its point at the same angle off its axis, wide enough to hold them both, its
+## edge sharp (the picture is dark there anyway), its range past the cone's far corners.
+const BEAM_HEIGHT := 10.0
+const BEAM_PITCH := 50.0
+const BEAM_ANGLE := 45.0
+const BEAM_EDGE := 6.0
+const BEAM_RANGE := 40.0
+## The ground's light at the cone's brightest (light energy on a surface facing it): the old beam's
+## brightest was about 1.1, 5 to 8 tiles ahead, and 0.14 at 20; this one is 1.2 at 8 and 0.3 at 20.
+const BEAM_PEAK := 1.6
+## Its picture's texels a side.
+const BEAM_MASK_SIZE := 96
+## Nothing is lit this close ahead: the cone's point is a tile ahead, and the body stays dark.
+const BEAM_NEAREST := 1.0
+static var _beam_texture: ImageTexture
+static var _beam_image: Image
+## The spot's energy for BEAM_PEAK on the ground: the picture's lift for the spot's own falloff.
+static var _beam_gain := 1.0
+## The add-on's hills under the character (ground_height.gd), read each frame: its model is lifted
+## onto them in its shader, but its lights, the thrusters' smoke and flames are placed here, so they
+## are lifted by this (at the flat height the lantern sat inside ground more than 2.5 tiles up and
+## lit nothing, J19). 0 on flat ground.
+var lift := 0.0
 var _body: Array = []  # the nodes hidden while in a vehicle or seen from inside (first person)
 var _first_person := false
 ## The character model (Wube's, skinned: character_pose.gd), drawn as a one-instance MultiMesh
@@ -118,24 +175,45 @@ const DEMO_SPEED := 9.0
 
 func _ready() -> void:
 	# Factorio's character carries a light at night, so the player is never in the dark.
-	_lantern.light_color = Color(1.0, 0.92, 0.8)
+	# I22: warm white, as the owner sees Factorio's (its light is {1, 1, 1}, but drawn into a warm
+	# night it reads as an incandescent torch); the near-white before read blue-white against the
+	# night's blue ambient. About 3,300 K.
+	_lantern.light_color = Color(1.0, 0.86, 0.68)
 	_lantern.omni_range = 11.0
-	_lantern.position = Vector3(0, 2.5, 0)
+	_lantern.position = Vector3(0, LANTERN_HEIGHT, 0)
 	_lantern.light_energy = 0.0
 	_lantern.shadow_enabled = true
 	add_child(_lantern)
-	_flashlight.light_color = Color(1.0, 0.95, 0.88)
-	_flashlight.spot_range = 26.0
-	_flashlight.spot_angle = 24.0
-	_flashlight.spot_attenuation = 0.6
-	_flashlight.position = Vector3(0, 1.6, -0.3)
-	_flashlight.rotation.x = deg_to_rad(-8.0)  # down onto the ground ahead (forward is -Z)
+	_flashlight.light_color = Color(1.0, 0.83, 0.62)
+	var casters := NOT_SELF if item_light_shadows else NOT_SELF & ~ItemCards.BELT_LAYER
+	_lantern.shadow_caster_mask = casters
+	if flashlight_mode == "old":
+		# From the hand (1.6 tiles up, 8 degrees down) the beam met the matte ground at a graze and lit a
+		# faint patch two or three tiles long; from 3 tiles up, 14 degrees down, a wider cone that fades
+		# slower lights the ground some 12 tiles ahead, but the next building's shadow ends it.
+		_flashlight.spot_range = 26.0
+		_flashlight.spot_angle = 28.0
+		_flashlight.spot_attenuation = 0.3
+		_flashlight.position = Vector3(0, FLASHLIGHT_HEIGHT, 0.0)
+		_flashlight.rotation.x = deg_to_rad(-14.0)  # down onto the ground ahead (forward is -Z)
+		_flashlight.shadow_caster_mask = casters
+	else:
+		_flashlight.spot_range = BEAM_RANGE
+		_flashlight.spot_angle = BEAM_ANGLE
+		_flashlight.spot_angle_attenuation = BEAM_EDGE
+		_flashlight.spot_attenuation = 0.0  # no fall-off with distance but the range's: the picture fades it
+		_flashlight.position = Vector3(0, BEAM_HEIGHT, 0.0)
+		_flashlight.rotation.x = deg_to_rad(-BEAM_PITCH)
+		_flashlight.light_projector = beam_texture()
+		# Godot's scene shader projects a spot's picture through the spot's shadow matrix, so the shadow
+		# stays on, with nothing casting into it: no building stops the beam, as none stops Factorio's,
+		# and the character's own swinging arms can't flicker it (F7).
+		_flashlight.shadow_caster_mask = 0
+		_flashlight.light_specular = 0.25  # Factorio's light is a picture: no highlights to speak of
 	_flashlight.shadow_enabled = true
 	_flashlight.light_energy = 0.0
 	_flashlight.visible = false
 	add_child(_flashlight)
-	_lantern.shadow_caster_mask = NOT_SELF
-	_flashlight.shadow_caster_mask = NOT_SELF
 	for arg in OS.get_cmdline_user_args():
 		if arg.begins_with("--anim-pose="):
 			_demo = arg.get_slice("=", 1)
@@ -326,7 +404,7 @@ func snap_to(pos: Vector2) -> void:
 	_smooth_set = false
 
 
-## {t: "me", u, x, y, d, w, hp, q, mhp?, sh?, m?, mx?, my?, v?, vs?}
+## {t: "me", u, x, y, d, w, hp, q, mhp?, sh?, m?, mx?, my?, rp?, rx?, ry?, v?, vs?}
 func update_from(msg: Dictionary) -> void:
 	unit = int(msg.get("u", unit))
 	_target = Vector3(int(msg.get("x", 0)) / 256.0, 0.0, int(msg.get("y", 0)) / 256.0)
@@ -352,6 +430,36 @@ func update_from(msg: Dictionary) -> void:
 		mining_at = Vector2(int(msg.get("mx", 0)), int(msg.get("my", 0))) / 256.0
 	else:
 		mining = -1
+	repairing = int(msg.get("rp", 0)) == 1
+	if repairing:
+		repair_at = Vector2(int(msg.get("rx", 0)), int(msg.get("ry", 0))) / 256.0
+
+
+## The client asks the bridge to mine at `at` (the right button held on it).
+func mine_hint(at: Vector2) -> void:
+	if mine_hint_msec < 0 or at.distance_to(mine_hint_at) > 0.01:
+		mine_hint_msec = Time.get_ticks_msec()
+	mine_hint_at = at
+
+
+func mine_hint_clear() -> void:
+	mine_hint_msec = -1
+
+
+## Where the character is mining for its sounds: the bridge's place while it reports mining, else
+## the client's click for up to `window_msec` after it (the bridge's answer is on its way; a click
+## out of reach gets no answer and goes quiet). Vector2(INF, INF) when not mining.
+func mining_for_sound(window_msec := 800) -> Vector2:
+	if mining >= 0:
+		return mining_at
+	if mine_hint_msec >= 0 and Time.get_ticks_msec() - mine_hint_msec < window_msec:
+		return mine_hint_at
+	return Vector2(INF, INF)
+
+
+## Footfalls of the run cycle so far (character_anim.gd), for the steps' sounds.
+func footfalls() -> int:
+	return _anim.footfalls
 
 
 ## Which way the body faces for a `me`: an angled walk's line (`a`); else the 8-way direction,
@@ -391,7 +499,7 @@ func set_night(night: float) -> void:
 	_lantern.light_energy = 1.8 * night
 	_lantern.visible = night > 0.01
 	var cone := beam(night)
-	_flashlight.light_energy = 6.0 * cone
+	_flashlight.light_energy = (6.0 if flashlight_mode == "old" else BEAM_PEAK * _beam_gain) * cone
 	_flashlight.visible = cone > 0.01
 
 
@@ -401,8 +509,190 @@ static func beam(night: float) -> float:
 	return smoothstep(0.3, 0.5, night)
 
 
+## The flashlight's height over the ground under the character.
+static func flashlight_height() -> float:
+	return FLASHLIGHT_HEIGHT if flashlight_mode == "old" else BEAM_HEIGHT
+
+
+static func _flashlight_mode() -> String:
+	var mode := "new"
+	for arg in OS.get_cmdline_user_args():
+		if arg.begins_with("--flashlight="):
+			mode = "old" if arg.get_slice("=", 1) == "old" else "new"
+	if RenderingServer.get_current_rendering_method() == "gl_compatibility":
+		mode = "old"
+	return mode
+
+
+## The new flashlight's axes in the character's frame (forward is -Z): across, the spot's up, and
+## where it points (rotation.x = -BEAM_PITCH).
+static func _beam_axes() -> Array[Vector3]:
+	var p := deg_to_rad(BEAM_PITCH)
+	return [Vector3.RIGHT, Vector3(0.0, cos(p), -sin(p)), Vector3(0.0, -sin(p), -cos(p))]
+
+
+## Where a point in the character's frame (x across, y up from the ground under it, -z ahead) falls in
+## the new flashlight's picture, as Godot's scene shader projects a spot's picture: through the
+## spot's perspective, BEAM_ANGLE each way, the picture's top towards the spot's up. (-1, -1) behind it.
+static func beam_uv(p: Vector3) -> Vector2:
+	var axes := _beam_axes()
+	var v := p - Vector3(0.0, BEAM_HEIGHT, 0.0)
+	var along := v.dot(axes[2])
+	if along <= 0.001:
+		return Vector2(-1.0, -1.0)
+	var t := tan(deg_to_rad(BEAM_ANGLE)) * along
+	return Vector2(0.5 + 0.5 * v.dot(axes[0]) / t, 0.5 - 0.5 * v.dot(axes[1]) / t)
+
+
+## The light the new flashlight's spot itself puts on a surface at `p` (the character's frame) facing
+## `normal`, per unit of energy and before its picture: Godot's fall-off (the range's window, no decay,
+## the cone's edge to the power BEAM_EDGE) and the surface's slant to the spot.
+static func beam_spot_light(p: Vector3, normal := Vector3.UP) -> float:
+	var to := p - Vector3(0.0, BEAM_HEIGHT, 0.0)
+	var d := to.length()
+	if d < 0.001:
+		return 0.0
+	var window := pow(maxf(1.0 - pow(d / BEAM_RANGE, 4.0), 0.0), 2.0)
+	var edge := cos(deg_to_rad(BEAM_ANGLE))
+	var scos := maxf(to.dot(_beam_axes()[2]) / d, edge)
+	var rim := maxf(1e-4, (1.0 - scos) / (1.0 - edge))
+	return window * (1.0 - pow(rim, BEAM_EDGE)) * maxf(0.0, normal.dot(-to / d))
+
+
+## Factorio's flashlight picture, core/graphics/light-cone.png from the install (LA8, its light in
+## alpha), or without one a cone drawn to its measure: the point 0.2 tiles ahead, the sides 25 degrees
+## off the middle with half a tile of blur, the light 1.07 less 0.043 a tile ahead (its rows).
+static func cone_picture() -> Image:
+	var dir := ItemIcons.factorio_data_dir()
+	var path := dir.path_join("core/graphics/light-cone.png")
+	if dir != "" and FileAccess.file_exists(path):
+		var image := Image.load_from_file(path)
+		if image != null and not image.is_empty() and image.get_width() == image.get_height():
+			image.convert(Image.FORMAT_LA8)
+			return image
+	var side := 200
+	var px := side / CONE_TILES
+	var data := PackedByteArray()
+	data.resize(side * side * 2)
+	for y in side:
+		var ahead := CONE_AHEAD + CONE_TILES * 0.5 - (y + 0.5) / px
+		var light := clampf(1.07 - 0.043 * ahead, 0.0, 1.0)
+		var half := 0.466 * (ahead - 0.2)
+		for x in side:
+			var across := absf((x + 0.5) / px - CONE_TILES * 0.5)
+			var b := 0 if half <= 0.0 else roundi(light * clampf((half - across) / 0.5 + 0.5, 0.0, 1.0) * 255.0)
+			data[(y * side + x) * 2] = b
+			data[(y * side + x) * 2 + 1] = b
+	return Image.create_from_data(side, side, false, Image.FORMAT_LA8, data)
+
+
+## Factorio's light at a ground point `ahead` tiles in front of the character and `across` to its
+## side, 0 to 1, from the picture's alpha (`data`: an LA8 picture `side` pixels square).
+static func cone_at(data: PackedByteArray, side: int, ahead: float, across: float) -> float:
+	if ahead < BEAM_NEAREST:
+		return 0.0
+	var px := side / CONE_TILES
+	var u := (across + CONE_TILES * 0.5) * px - 0.5
+	var v := (CONE_AHEAD + CONE_TILES * 0.5 - ahead) * px - 0.5
+	var x0 := floori(u)
+	var y0 := floori(v)
+	if x0 < -1 or y0 < -1 or x0 >= side or y0 >= side:
+		return 0.0
+	var a := [0.0, 0.0, 0.0, 0.0]
+	for k in 4:
+		var x := x0 + (k & 1)
+		var y := y0 + (k >> 1)
+		if x >= 0 and y >= 0 and x < side and y < side:
+			a[k] = data[(y * side + x) * 2 + 1] / 255.0
+	var fx := u - x0
+	var fy := v - y0
+	return lerpf(lerpf(a[0], a[1], fx), lerpf(a[2], a[3], fx), fy)
+
+
+## The new flashlight's picture: for each texel, the ground point its ray from the spot meets,
+## Factorio's light there over the light the spot itself puts there (beam_spot_light), so that the
+## ground gets the picture's own fade; 1 at its brightest (_beam_gain puts that back in the spot's
+## energy), stored as sRGB, as Godot reads a projector. The picture is the same either side: half is
+## worked out and mirrored. Made once (about 9,000 rays).
+static func beam_texture() -> ImageTexture:
+	if _beam_texture != null:
+		return _beam_texture
+	var picture := cone_picture()
+	var side := picture.get_width()
+	var data := picture.get_data()
+	var n := BEAM_MASK_SIZE
+	var ratio := PackedFloat32Array()
+	ratio.resize(n * n)
+	var axes := _beam_axes()
+	var t := tan(deg_to_rad(BEAM_ANGLE))
+	var from := Vector3(0.0, BEAM_HEIGHT, 0.0)
+	var most := 0.0
+	for j in n:
+		var up := (1.0 - 2.0 * (j + 0.5) / n) * t
+		for i in range(n >> 1, n):
+			var ray: Vector3 = axes[0] * ((2.0 * (i + 0.5) / n - 1.0) * t) + axes[1] * up + axes[2]
+			if ray.y > -0.001:
+				continue
+			var ground := from + ray * (BEAM_HEIGHT / -ray.y)
+			var want := cone_at(data, side, -ground.z, ground.x)
+			if want <= 0.0:
+				continue
+			var own := beam_spot_light(ground)
+			if own < 0.001:
+				continue
+			var r := want / own
+			ratio[j * n + i] = r
+			ratio[j * n + n - 1 - i] = r
+			if want > 0.05:
+				most = maxf(most, r)
+	most = maxf(most, 0.001)
+	var out := PackedByteArray()
+	out.resize(n * n * 3)
+	for k in n * n:
+		var lin := clampf(ratio[k] / most, 0.0, 1.0)
+		var s := lin * 12.92 if lin <= 0.0031308 else 1.055 * pow(lin, 1.0 / 2.4) - 0.055
+		var b := roundi(s * 255.0)
+		out[k * 3] = b
+		out[k * 3 + 1] = b
+		out[k * 3 + 2] = b
+	_beam_image = Image.create_from_data(n, n, false, Image.FORMAT_RGB8, out)
+	var mipped := _beam_image.duplicate() as Image
+	mipped.generate_mipmaps()  # Godot's projector reads mipmaps (rendering/textures/light_projectors/filter)
+	_beam_texture = ImageTexture.create_from_image(mipped)
+	_beam_gain = most
+	return _beam_texture
+
+
+## The light the new flashlight puts on a surface at `p` (the character's frame) facing `normal`, as
+## Godot would draw it at full darkness: its energy, the picture's texel there (bilinear, read as
+## sRGB) and the spot's own fall-off. For the tests.
+static func beam_light_at(p: Vector3, normal := Vector3.UP) -> float:
+	beam_texture()
+	var uv := beam_uv(p)
+	if uv.x < 0.0 or uv.y < 0.0 or uv.x > 1.0 or uv.y > 1.0:
+		return 0.0
+	var n := _beam_image.get_width()
+	var u := uv.x * n - 0.5
+	var v := uv.y * n - 0.5
+	var x0 := clampi(floori(u), 0, n - 1)
+	var y0 := clampi(floori(v), 0, n - 1)
+	var x1 := mini(x0 + 1, n - 1)
+	var y1 := mini(y0 + 1, n - 1)
+	var fx := clampf(u - x0, 0.0, 1.0)
+	var fy := clampf(v - y0, 0.0, 1.0)
+	var top := lerpf(_beam_image.get_pixel(x0, y0).srgb_to_linear().r, _beam_image.get_pixel(x1, y0).srgb_to_linear().r, fx)
+	var bottom := lerpf(_beam_image.get_pixel(x0, y1).srgb_to_linear().r, _beam_image.get_pixel(x1, y1).srgb_to_linear().r, fx)
+	return BEAM_PEAK * _beam_gain * lerpf(top, bottom, fy) * beam_spot_light(p, normal)
+
+
 func ground_position() -> Vector2:
 	return Vector2(position.x, position.z)
+
+
+## How far the body is drawn over the ground under it, flying in mech armour (tiles; 0 otherwise): the
+## camera's centre rises with it (camera_rig.gd).
+func drawn_lift() -> float:
+	return _anim.drawn_lift() if _rig != null and vehicle == 0 else 0.0
 
 
 ## Remembers a sent position at game tick `k` (none when the message has no tick: then the avatar
@@ -482,8 +772,32 @@ func _process(delta: float) -> void:
 	var goal := _along_line(_drawn_target(delta), delta)
 	position = goal if _ticks.size() >= 2 and position.distance_to(goal) < 2.0 else position.lerp(goal, t)
 	rotation.y = lerp_angle(rotation.y, _body_yaw(), t)
+	_aim_flashlight()
+	_lift_lights()
 	if _rig != null:
 		_animate(delta)
+
+
+## K3 (owner: "flashlight should follow the mouse in first person"): in first person the flashlight
+## turns to where the crosshair looks (the camera's heading; the mouse turns the camera there), not
+## where the body faces; the cone stays Factorio's, on the ground ahead of that heading. Otherwise
+## it faces with the body. What the crosshair picks (player_input.gd) isn't touched.
+func _aim_flashlight() -> void:
+	var yaw := 0.0
+	if _first_person and is_inside_tree():
+		var cam := get_viewport().get_camera_3d()
+		if cam != null:
+			var ahead := -cam.global_transform.basis.z
+			if Vector2(ahead.x, ahead.z).length() > 0.01:
+				yaw = wrapf(atan2(-ahead.x, -ahead.z) - global_rotation.y, -PI, PI)
+	_flashlight.rotation.y = yaw
+
+
+## The lantern and flashlight over the hills under the character (one height read a frame).
+func _lift_lights() -> void:
+	lift = GroundHeight.at(position.x, position.z)
+	_lantern.position.y = LANTERN_HEIGHT + lift
+	_flashlight.position.y = flashlight_height() + lift
 
 
 ## Which way the legs face: where the character walks, except while shooting, when it faces
@@ -509,7 +823,7 @@ func _animate(delta: float) -> void:
 	var facing := -global_transform.basis.z
 	var distance := moved.dot(facing.normalized())
 	_anim.running = walking
-	_anim.mining = mining >= 0
+	_anim.mining = mining >= 0 or repairing
 	_anim.firing = firing
 	_anim.aiming = firing and aim_target != null
 	_anim.dead = _has_state and health <= 0
@@ -570,7 +884,7 @@ func _update_jets() -> void:
 	for jet in _jets:
 		var side: String = jet["side"]
 		var foot := _pose.point("shin" + side, _pose.tail_of("shin" + side))
-		var at := global_transform * foot
+		var at := global_transform * foot + Vector3(0.0, lift, 0.0)
 		var smoke: CPUParticles3D = jet["smoke"]
 		smoke.global_position = at
 		smoke.emitting = burn > 0.05

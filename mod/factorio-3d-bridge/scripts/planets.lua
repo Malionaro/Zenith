@@ -10,7 +10,8 @@
 --   fz       Aquilo: which machines near the focus are frozen
 --   rk, cp   rocket launches and cargo pods in flight; pst a platform arriving or leaving
 --   terr     Vulcanus' demolisher territories, each as its chunks, so the client draws their red
---            borders; on arrival and once a minute (territories grow as the planet is explored)
+--            borders; on arrival, once a minute (territories grow as the planet is explored) and
+--            when a demolisher dies (its territory is cleared and left out)
 -- and the `land` command, which lands the character from a platform the way a player goes down:
 -- in a cargo pod.
 --
@@ -25,6 +26,8 @@ local tracker = require("scripts.tracker")
 local platforms = require("scripts.platforms")
 local space = require("scripts.space")
 local rate = require("scripts.rate")
+local perf = require("scripts.perf")
+local movers = require("scripts.movers")
 
 local M = {}
 
@@ -48,6 +51,10 @@ local MAX_LIST = 2000
 local TERRITORY_INTERVAL = 3600
 local TERRITORY_PART = 1500  -- chunks a message carries at most
 local territories_due = false  -- only decides when they are sent, so module-local is fine
+-- How many segmented units the surface had at the last `seg` look: one fewer (a demolisher killed)
+-- sends the territories again at once, so its cleared territory's border goes (I16). Only decides
+-- when they are sent.
+local seg_count = nil
 
 local function near(p, f, r)
   return math.abs(p.x - f.x) <= r and math.abs(p.y - f.y) <= r
@@ -141,16 +148,46 @@ local function send_list(t, list)
 end
 
 -- Whether stream `t` (running every `interval` ticks while busy) looks this tick. Kept in
--- storage, like everything that decides what this module does, so every peer agrees.
-local function due(t, interval)
+-- storage, like everything that decides what this module does, so every peer agrees. `idle`,
+-- optional: the ticks between looks while it found nothing, instead of IDLE's.
+local function due(t, interval, idle)
   local busy = storage.f3d.planets_busy or {}
   storage.f3d.planets_busy = busy
   local now = game.tick
   if (busy[t] or -1) >= now then
     return now % interval == 0
   end
+  local every = idle or IDLE[t]
   local phase = settings.global["f3d-spread-jobs"].value and IDLE_PHASE[t] or 0
-  return now % IDLE[t] == phase % IDLE[t]
+  return now % every == phase % every
+end
+
+-- lightning_planets (perf.lua): lightning is looked for every IDLE.lt ticks only on the planets whose
+-- prototype has it (the data stage's zenith-planets list: Fulgora), elsewhere (another planet, a space
+-- platform) only every LIGHTNING_QUIET ticks, for a script's execute_lightning; one found makes it busy
+-- as anywhere. On Nauvis the look was a 3.4 ms search of the focus square every 12 ticks for nothing.
+-- Without the list (a data stage that failed) every surface is looked at as before. The set comes from
+-- prototypes alone (module-local is fine); `cache.set` false: no list.
+local LIGHTNING_QUIET = 300
+local lightning_cache = {}
+local function lightning_on(surface)
+  local set = lightning_cache.set
+  if set == nil then
+    set = false
+    local ok, list = pcall(function() return prototypes.mod_data["zenith-planets"].get("lightning") end)
+    if ok and type(list) == "table" then
+      set = {}
+      for _, name in pairs(list) do
+        set[name] = true
+      end
+    end
+    lightning_cache.set = set
+  end
+  if not set then
+    return true
+  end
+  local name = platforms.planet_of(surface)
+  return name ~= nil and set[name] == true
 end
 
 local function found(t, n)
@@ -164,6 +201,11 @@ end
 local function segments(surface, f)
   local out = {}
   local ok, units = pcall(function() return surface.get_segmented_units() end)
+  local n = ok and units and #units or 0
+  if seg_count and n < seg_count then
+    territories_due = true
+  end
+  seg_count = n
   for _, u in pairs(ok and units or {}) do
     local flat, close = {}, false
     for _, seg in ipairs(u.segments) do
@@ -322,6 +364,7 @@ local function feet_of(list)
   return feet
 end
 
+-- Returns the list and how many spiders were found (one_search: the movers' search's count, from storage).
 local function legs(surface, f)
   local out = {}
   local types = {}
@@ -331,10 +374,15 @@ local function legs(surface, f)
     end
   end
   if #types == 0 then
-    return out
+    return out, 0
   end
   local by_number -- unit number -> spider-leg entity, read once if a spider unit is near
-  for _, e in pairs(surface.find_entities_filtered({ area = area(f, f.r), type = types, limit = MAX_LIST })) do
+  local spiders, n = movers.found("legs", surface)
+  if not spiders then
+    spiders = surface.find_entities_filtered({ area = area(f, f.r), type = types, limit = MAX_LIST })
+  end
+  n = n or #spiders
+  for _, e in pairs(spiders) do
     local n = e.unit_number
     if n and e.type == "spider-vehicle" then
       local ok, list = pcall(function() return e.get_spider_legs() end)
@@ -364,7 +412,7 @@ local function legs(surface, f)
       end
     end
   end
-  return out
+  return out, n
 end
 
 -- Units of machines near the focus that are frozen (Aquilo).
@@ -394,13 +442,19 @@ local function destination_name(t)
   return destination_names[t] or ""
 end
 
--- [[unit, state, destination type, destination surface or ""], ...] for cargo pods near the focus.
+-- [[unit, state, destination type, destination surface or ""], ...] for cargo pods near the focus, and
+-- how many were found (one_search: the movers' search's count, from storage).
 local function cargo_pods(surface, f)
   local out = {}
   if not registry.has_type("cargo-pod") then
-    return out
+    return out, 0
   end
-  for _, e in pairs(surface.find_entities_filtered({ area = area(f, f.r), type = "cargo-pod", limit = MAX_LIST })) do
+  local pods, n = movers.found("cp", surface)
+  if not pods then
+    pods = surface.find_entities_filtered({ area = area(f, f.r), type = "cargo-pod", limit = MAX_LIST })
+  end
+  n = n or #pods
+  for _, e in pairs(pods) do
     local ok, state, dest = pcall(function() return e.cargo_pod_state, e.cargo_pod_destination end)
     if ok and e.unit_number then
       local to = dest and dest.surface
@@ -417,7 +471,7 @@ local function cargo_pods(surface, f)
       out[#out + 1] = row
     end
   end
-  return out
+  return out, n
 end
 
 -- For an agricultural tower's screen: {plants, ready} (plants it owns, how many are grown).
@@ -444,6 +498,7 @@ local function client()
 end
 
 function M.on_rocket_launch_ordered(event)
+  movers.wake()
   local silo = event.rocket_silo
   if client() and silo and silo.valid then
     local p = silo.position
@@ -461,6 +516,14 @@ end
 
 function M.register()
   script.on_event(defines.events.on_rocket_launch_ordered, M.on_rocket_launch_ordered)
+  -- (one_search: a pod setting off or arriving is found by the movers' next search at once.)
+  for _, name in ipairs({ "on_cargo_pod_started_ascending", "on_cargo_pod_finished_ascending",
+      "on_cargo_pod_finished_descending" }) do
+    local id = defines.events[name]
+    if id then
+      script.on_event(id, function() movers.wake() end)
+    end
+  end
   script.on_event(defines.events.on_space_platform_changed_state, M.on_platform_state)
   -- An agricultural tower's plants appear and go without the usual build and mine events.
   script.on_event(defines.events.on_tower_planted_seed, function(event) tracker.added(event.plant) end)
@@ -540,7 +603,8 @@ function M.tick()
   if rate.due("seg", SEG_INTERVAL) then
     send_list("seg", segments(surface, f))
   end
-  if due("lt", LIGHTNING_INTERVAL) then
+  local lt_idle = perf.on("lightning_planets") and not lightning_on(surface) and LIGHTNING_QUIET or nil
+  if due("lt", LIGHTNING_INTERVAL, lt_idle) then
     local new, any = lightning(surface, f)
     found("lt", any)
     if #new > 0 then
@@ -548,13 +612,13 @@ function M.tick()
     end
   end
   if due("legs", LEGS_INTERVAL) then
-    local list = legs(surface, f)
-    found("legs", #list)
+    local list, n = legs(surface, f)
+    found("legs", n)
     send_list("legs", list)
   end
   if due("cp", POD_INTERVAL) then
-    local list = cargo_pods(surface, f)
-    found("cp", #list)
+    local list, n = cargo_pods(surface, f)
+    found("cp", n)
     send_list("cp", list)
   end
   if territories_due or t % TERRITORY_INTERVAL == 0 then
@@ -576,16 +640,26 @@ function M.tick()
   end
 end
 
+-- A territory whose demolisher is dead is cleared: Factorio no longer draws its border (I16).
+-- One whose units can't be read counts as held.
+local function held(territory)
+  local ok, units = pcall(function() return territory.get_segmented_units() end)
+  return not ok or units == nil or #units > 0
+end
+
 -- `terr` {part, parts, si, l: [[x1, y1, x2, y2, ...], ...]}: every demolisher territory on the
--- world's surface (`si`) as its chunks (LuaSurface.get_territories, 2.1). Immediate and sent again
--- each minute, so a lost part is made good; an empty `l` clears them (a surface without any).
+-- world's surface (`si`) that a demolisher still holds, as its chunks (LuaSurface.get_territories,
+-- 2.1); `c`: how many cleared ones were left out. Immediate and sent again each minute, so a lost
+-- part is made good, and at once when a demolisher dies; an empty `l` clears them.
 function M.send_territories()
   local surface = world.surface()
   local ok, territories = pcall(function() return surface.get_territories() end)
-  local parts, current, count = {}, {}, 0
+  local parts, current, count, cleared = {}, {}, 0, 0
   for _, territory in pairs(ok and territories or {}) do
     local okc, chunks = pcall(function() return territory.get_chunks() end)
-    if okc and #chunks > 0 then
+    if okc and #chunks > 0 and not held(territory) then
+      cleared = cleared + 1
+    elseif okc and #chunks > 0 then
       local flat = {}
       for _, c in pairs(chunks) do
         flat[#flat + 1] = c.x
@@ -601,13 +675,14 @@ function M.send_territories()
   end
   parts[#parts + 1] = current
   for i, l in ipairs(parts) do
-    transport.send_now({ t = "terr", part = i, parts = #parts, si = surface.index, l = l })
+    transport.send_now({ t = "terr", part = i, parts = #parts, si = surface.index, l = l, c = cleared })
   end
 end
 
 -- On a surface change: the new surface's territories with the next tick.
 function M.territories_soon()
   territories_due = true
+  seg_count = nil
 end
 
 -- After a handshake: the planet again, and every stream sends once even if empty.

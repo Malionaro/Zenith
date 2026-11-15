@@ -421,7 +421,14 @@ func apply(env: Environment, sun: DirectionalLight3D, daytime: float, night: flo
 		"direction": sky_sun if warm > 0.0 else to_sun, "color": sun_color if warm > 0.0 else sun.light_color,
 		"ambient": env.ambient_light_color, "fog": sun_side.lerp(horizon, 0.35),
 	}
-	_shadow_quad.visible = not space and clouds_on and (float(_p["shadow"]) > 0.0 or float(_p["haze"]) > 0.0)
+	var cloudy := clouds_on and float(_p["cover"]) < 1.0
+	# Shadows fade as the light does; Factorio's clouds shade daylight, not the lamps' light.
+	var fades := float(m["cloud_shadow"]) if warm > 0.0 else 1.0 - night
+	var shadow_strength := float(_p["shadow"]) * fades if cloudy else 0.0
+	var haze_strength := float(_p["haze"]) * (1.0 - 0.6 * night)
+	# Hidden whenever it would draw nothing (at night on a planet without haze): its pixels read the
+	# depth and three textures before discarding every one of them.
+	_shadow_quad.visible = not space and clouds_on and (shadow_strength > 0.0 or haze_strength > 0.0)
 	if space:
 		return
 	sky_material.set_shader_parameter("zenith_color", zenith)
@@ -445,7 +452,6 @@ func apply(env: Environment, sun: DirectionalLight3D, daytime: float, night: flo
 		_water_tint = tint
 		Visuals.water_material().set_shader_parameter("sky_tint", tint)
 	sky_material.set_shader_parameter("flash", _flash)
-	var cloudy := clouds_on and float(_p["cover"]) < 1.0
 	sky_material.set_shader_parameter("cloud_alpha", (0.85 - 0.25 * night) if cloudy else 0.0)
 	# Lit by the sun by day, grey-blue shapes against the night sky.
 	var cc: Array = _p["clouds"]
@@ -462,10 +468,8 @@ func apply(env: Environment, sun: DirectionalLight3D, daytime: float, night: flo
 	sky_material.set_shader_parameter("cloud_shade", cloud_shade)
 	if _shadow_quad.visible:
 		_shadow_material.set_shader_parameter("sun_dir", to_sun)
-		# Shadows fade as the light does; Factorio's clouds shade daylight, not the lamps' light.
-		var fades := float(m["cloud_shadow"]) if warm > 0.0 else 1.0 - night
-		_shadow_material.set_shader_parameter("shadow_strength", float(_p["shadow"]) * fades if cloudy else 0.0)
-		_shadow_material.set_shader_parameter("haze_strength", float(_p["haze"]) * (1.0 - 0.6 * night))
+		_shadow_material.set_shader_parameter("shadow_strength", shadow_strength)
+		_shadow_material.set_shader_parameter("haze_strength", haze_strength)
 
 
 func _pair(key: String, night: float) -> Color:

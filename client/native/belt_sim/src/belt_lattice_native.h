@@ -50,6 +50,7 @@ public:
 	static constexpr i64 SLICES = 2;
 	static constexpr i64 MAX_STACK = 4;
 	static constexpr double PILE_TURN = 0.45;
+	static constexpr i64 IDS = (i64)1 << 20;
 	// belt_sim.gd's lane kinds
 	enum Kinds { STRAIGHT = 1, CURVE = 2, UG_VISIBLE = 3, UG_HIDDEN = 4, SPLIT_IN = 5, SPLIT_OUT = 6, LOADER = 7, OTHER = 8 };
 
@@ -63,8 +64,21 @@ private:
 		i64 v = 0;
 		i64 pend_v = -1;  // a new speed seen at pend_n checks in a row
 		i64 pend_n = 0;
+		i64 pend_t = 0;  // (settle) the tick pend_v was first seen at
+		i64 hole_at = -1;  // (settle) the tick of the newest hole cut in it while it stands (-1: none open)
+		i64 hole_v = 0;  // (settle) the speed the simulation has had the lane at since
 		std::vector<int> cells;
 		int stack = 1;
+		i64 who = 0;  // who the item at line position r0 is on tick t0 (modulo IDS)
+		i64 run = 0;  // its run's seed (modulo IDS)
+		i64 next = 0;  // the lane its items go on into when it was drawn, 0 none
+		i64 flow_q = 0;  // (creep) the running share of the time most of its items move, of FLOW_ONE
+		i64 flow_t = -1;  // (creep) the tick of its last share's update
+		i64 run_t = -1;  // (creep) the tick most of its items started moving, -1 while they stand
+		bool creeping = false;  // (creep) sliding at its share of the belt's speed
+		std::vector<int32_t> fu;  // (creep_flow) its recent front items' ids (low 31 bits), oldest first
+		i64 none_t = -1;  // (creep_flow) the tick the simulation was first seen with none on it, -1 while it has
+		bool gated = false;  // (creep_flow) stood for want of net flow: takes the simulation's speed again only with it
 	};
 	struct LKind {
 		int base = -1;
@@ -77,6 +91,7 @@ private:
 		bool full = false;
 		i64 item = -1;  // -1: none or mixed
 		int stack = 1;  // the read's most common
+		i64 front = -1;  // the front item's position at the last read or check (-1: none)
 	};
 	struct Meta {
 		int32_t m[9];
@@ -124,28 +139,71 @@ private:
 	bool planned_any = false;
 	i64 round_no = 0;
 	int planned_cap = -2;
+	std::unordered_map<i64, i64> feeds;  // lane key -> the drawn lane whose items go on into it
+	bool item_turns = true;  // belt_lattice.gd item_turns (set_item_turns)
+	double shown = -1.0;  // belt_lattice.gd shown (set_shown): the drawn clock when the update is first drawn
 
 	// --- this update
 	bool on = true;
 	bool world = true;
+	bool world_all = true;  // belt_lattice.gd world_all
+	bool standing_obs = true;  // belt_lattice.gd standing_obs
 	bool piles = true;
 	bool unison = true;  // belt_lattice.gd unison
+	bool settle = true;  // belt_lattice.gd settle (K19)
+	static constexpr i64 SETTLE_GAPS = 2;
+	static constexpr i64 HOLE_TICKS = 8;
+	i64 drawn_tick = -1;  // belt_lattice.gd drawn_tick
+	std::unordered_map<i64, i64> moving_since;  // belt_lattice.gd moving_since
+	void set_settle(bool v) { settle = v; }
+	bool creep = false;  // belt_lattice.gd creep
+	static constexpr i64 FLOW_ONE = 1024;
+	static constexpr i64 CREEP_TAU = 120;
+	static constexpr i64 CREEP_ON = 256;
+	static constexpr i64 CREEP_OFF = 102;
+	static constexpr i64 CREEP_RUN_GAPS = 4;
+	void set_creep(bool v) { creep = v; }
+	bool _creep(Lane *ln, i64 lv, i64 step, i64 tick, i64 pred, i64 f);
+	bool creep_flow = true;  // belt_lattice.gd creep_flow
+	static constexpr int FLOW_HIST = 16;
+	static constexpr i64 CREEP_FLOW_ON = 300;
+	static constexpr i64 CREEP_FLOW_OFF = 100;
+	static constexpr i64 NONE_TICKS = 30;
+	static constexpr i64 FLOW_GATE = 1000;
+	static constexpr i64 FLOW_GATE_TICKS = 120;
+	i64 _t_draw(i64 tick) const;
+	static i64 _phase_at(const Lane *ln, i64 t) { return beltn::posmod(ln->r0 - ln->v * (t - ln->t0), GAP); }
+	void set_creep_flow(bool v) { creep_flow = v; }
+	bool _creep_flow(Lane *ln, i64 lv, i64 u, i64 step, i64 tick, i64 pred, i64 f);
+	void _creep_stop(Lane *ln, i64 r0, i64 tick);
+	void set_drawn_tick(i64 t) { drawn_tick = t; }
 	bool dump_on = false;
 	std::unordered_map<i64, Look> known;
 	std::vector<i64> dump_ids;
 	std::vector<float> dump_recs;
 	std::vector<i64> dump_gone;
 	Array written;
+	// Lanes this update removed from the drawn ones and added to them (the drawing's lattice lanes: it parks
+	// and counts the items they hide, belt_draw_native.cpp _relattice).
+	std::vector<i64> removed_keys;
+	std::unordered_map<i64, bool> added_keys;
 
 	static i64 _uid(i64 key, i64 k) { return -(key * 8 + k + 1); }
 	static bool _drawn_kind(int kind);
 	static i64 _kind_key(i64 item, int model_cap) { return model_cap < 0 ? item : -item - 1; }
 	static i64 _world_phase(const int32_t *m);
+	static i64 _world_tau(const int32_t *m);
+	static i64 _world_run(const int32_t *m);
+	static i64 _fdiv(i64 a, i64 b) { return (a - beltn::posmod(a, b)) / b; }
+	void _set_motion(Lane *ln, i64 r0, i64 v, i64 tick);
+	i64 _lag(i64 dv, i64 tick) const { return shown >= 0.0 && dv != 0 ? beltn::roundi((double)dv * (shown - (double)tick)) : 0; }
+	void _identify(i64 key, Lane *ln, const int32_t *m, i64 tick);
 	Vector4 _point(i64 key, double pos) const;
 	Ends _ends(i64 key, i64 length) const;
 	Vector4 _along(i64 key, double pos, i64 length, const Ends &ends) const;
 	i64 _wanted(i64 key);
 	int _stack_of(i64 key);
+	i64 _obs_front(i64 key);
 	void _remove(i64 key);
 	void _write_lane(i64 key, Lane *ln, const int32_t *m, const Look &look, int stack);
 	void _drop_slot(i64 key, Lane *ln, LKind *kd);
@@ -157,13 +215,18 @@ protected:
 
 public:
 	void set_sim(Object *p_sim);
+	void set_small_pages(bool on) { records.set_small(on); }
+	void set_item_turns(bool on) { item_turns = on; }
+	void set_shown(double t) { shown = t; }
 	void set_lane(i64 key, const PackedInt32Array &meta, const PackedFloat64Array &arc);
 	void note_read(i64 key, i64 length, const PackedInt64Array &items);
 	void note_check(i64 key, i64 length, i64 count, i64 front, i64 back);
 	void drop(i64 key);
 	Dictionary update(i64 tick, const Rect2 &view, bool view_all, const Dictionary &known_looks, int model_cap, bool full,
-			bool dump, double records_base, double items_height, bool lattice_on, bool world_phase, bool pile_slots, bool unison_on);
+			bool dump, double records_base, double items_height, bool lattice_on, bool world_phase, bool pile_slots, bool unison_on,
+			bool world_all_phase, bool standing_from_obs);
 	PackedInt64Array clear();
+	Dictionary hole(i64 key, i64 at, i64 pos, bool dump);  // (--inserter-handoff) belt_lattice.gd hole
 	Array drawn_lattice(i64 kind_key, double t);
 	Array kind_keys();
 	i64 drawn_speed(i64 key);  // a drawn lane's lattice speed (1/256 a tick), -1 when not drawn (tests)

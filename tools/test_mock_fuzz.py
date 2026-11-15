@@ -16,6 +16,10 @@ import traceback
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import mock_server  # noqa: E402
 
+# A FAIL line can hold any character: on Windows, output to a file or pipe is in the system's code page,
+# and one character it lacks stopped the run with UnicodeEncodeError.
+sys.stdout.reconfigure(errors="backslashreplace")
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SESSION = (ROOT / "mod" / "factorio-3d-bridge" / "scripts" / "session.lua").read_text()
 COMMANDS = sorted(set(re.findall(r"handlers\.([a-z_0-9]+) =", SESSION)) | set(re.findall(r"function handlers\.([a-z_0-9]+)", SESSION)))

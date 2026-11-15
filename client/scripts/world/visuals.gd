@@ -111,7 +111,19 @@ static func terrain_material() -> ShaderMaterial:
 	if _terrain_material == null:
 		_terrain_material = ShaderMaterial.new()
 		_terrain_material.shader = TerrainShader
+		if "--relief-fade=off" in OS.get_cmdline_user_args():
+			_terrain_material.set_shader_parameter("relief_fades", false)
 	return _terrain_material
+
+
+## The ground's bumps and crevices from its own picture (terrain.gdshader ground_relief): three more
+## texture reads a ground pixel, twice with SSAO. Off at Settings > Graphics > Level of detail Low
+## (the Low preset), on otherwise (main.gd); --ground-relief=on or off wins.
+static func set_ground_relief(on: bool) -> void:
+	for arg in OS.get_cmdline_user_args():
+		if arg.begins_with("--ground-relief="):
+			on = arg.get_slice("=", 1) != "off"
+	terrain_material().set_shader_parameter("ground_relief", on)
 
 
 ## Water tiles: animated ripples and shore foam (vertex alpha marks corners touching land).

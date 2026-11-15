@@ -116,6 +116,7 @@ func reset() -> void:
 	_goal_res = 0
 	_last_full = -1e9
 	model.map_charts.clear()
+	model.map_stamps.clear()
 	model.map_overlays.clear()
 	model.map_tags.clear()
 	model.tags_changed.emit()
@@ -278,6 +279,12 @@ func _send(block: Rect2i, now: float, retry := false) -> void:
 func _on_chart(chunk: Vector2i) -> void:
 	if _pending.erase(chunk):
 		_last_arrival = _now()
+	if model.map_chart_same:
+		# The picture held is still the chunk's (`same`): only its overlay and pollution came.
+		if _charted.has(chunk):
+			_charted[chunk] = _now()
+		updated.emit()
+		return
 	var image: Image = model.map_charts.get(chunk)
 	if image == null:
 		if not _charted.has(chunk):

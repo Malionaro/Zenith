@@ -38,8 +38,13 @@ var info_panel := PlatformInfo.new()
 ## The logistic networks window is open: its frames take the Surfaces panel's place, and the title
 ## bar has only back / forward and close, as Factorio's.
 var networks_open := false
+## Where the panels down the left start (screen pixels): under the title bar, and under anything of
+## Zenith's in that corner (factorio_ui.gd's Show in Factorio button). 0: right under the title bar.
+var left_top := 0.0
 
 var title_bar := PanelContainer.new()
+## "Remote view", the title bar's caption.
+var title_label: Label
 
 
 func _ready() -> void:
@@ -52,6 +57,7 @@ func _ready() -> void:
 	title_bar.mouse_filter = Control.MOUSE_FILTER_STOP
 	add_child(title_bar)
 	var bar := Kit.title_bar("Remote view", true)
+	title_label = bar.get_child(0) as Label
 	(bar.get_child(bar.get_child_count() - 1) as Button).pressed.connect(func() -> void: close_requested.emit())
 	for spec in [["Search", "icons/search.png", "Search the map", false], ["Reset", "icons/mip/reset-white.png", "Back to the character", true],
 			["Back", "icons/mip/backward-arrow.png", "Back", false], ["Forward", "icons/mip/forward-arrow.png", "Forward", false]]:
@@ -76,6 +82,11 @@ func _ready() -> void:
 		map_view.surfaces_panel.reparent(self, false)
 		map_view.panel.reparent(self, false)
 		map_view.panel.set_anchors_preset(Control.PRESET_TOP_LEFT)
+
+
+## The title bar's bottom (screen pixels): TITLE_HEIGHT, or more where its frame needs it (48 at 1x).
+func title_bottom() -> float:
+	return maxf(Kit.px(TITLE_HEIGHT), title_bar.get_combined_minimum_size().y)
 
 
 ## Shows it around the map ("map"), the world ("world") or the space map ("space"), or hides it ("").
@@ -105,7 +116,7 @@ func _process(_delta: float) -> void:
 			tb.visible = not networks_open
 	if map_view != null and map_view.surfaces_panel.get_parent() == self:
 		map_view.surfaces_panel.visible = not networks_open and not map_view.model.map_surfaces.is_empty()
-		map_view.surfaces_panel.position = Vector2(Kit.px(BORDER) + Kit.px(4), Kit.px(TITLE_HEIGHT) + Kit.px(4))
+		map_view.surfaces_panel.position = Vector2(Kit.px(BORDER) + Kit.px(4), maxf(Kit.px(TITLE_HEIGHT) + Kit.px(4), left_top))
 		var settings_panel: Control = map_view.panel
 		settings_panel.visible = mode == "map"
 		settings_panel.reset_size()

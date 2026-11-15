@@ -15,6 +15,8 @@ if env["platform"] == "windows" and not env.get("use_mingw"):
 lib_env = env.Clone()
 if env["platform"] == "windows" and not env.get("use_mingw"):
 	lib_env.Append(CCFLAGS=["/Zi", "/FS"], LINKFLAGS=["/DEBUG", "/OPT:REF", "/OPT:ICF", "/MAP"])
+if env["platform"] == "windows":
+	lib_env.Append(LIBS=["ws2_32"])  # UdpSocketNative (udp_socket_native.cpp)
 sources = Glob("src/*.cpp")
 name = "belt_sim{}{}".format(env["suffix"], env["SHLIBSUFFIX"])
 library = lib_env.SharedLibrary("../bin/" + name, source=sources)

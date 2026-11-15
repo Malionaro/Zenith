@@ -18,11 +18,15 @@ extends Node3D
 ##
 ## Attacks come from the mod's `en` (units in range of their attack target, worms with a shooting
 ## target); with a mod too old to send it, one that stands still near the player's character
-## counts as attacking. Biters bite with their family's `-attack` pose once per cooldown, spitters
-## brace in theirs and spit (the acid stream itself is a stream entity, drawn with the projectiles).
-## Where an enemy dies it falls the way its corpse lies over its corpse's dying time, then that
-## `-corpse` pose (one of four, by the direction it faced) lies for Factorio's 15 minutes and sinks
-## into the ground. Worms fall out of their holes the same way, Gleba's spawners slump, Nauvis's
+## counts as attacking. Biters rear into their family's `-attack` pose and back once per cooldown,
+## over Factorio's 11 attack frames (the pose is frame 5, the top of the bite), spitters rise into
+## theirs and settle over the 14 frames forward and back and spit (the acid stream itself is a
+## stream entity, drawn with the projectiles). Both are drawn with the walking model, its legs
+## blended into the pose's in the shader (creature_models.gd POSE_SLOTS) and its body turned here
+## the way the pose's body moved, so nothing jumps between models. Where an enemy dies it falls the
+## way its corpse lies over its corpse's dying time, its legs folding into the corpse's the same
+## way, then that `-corpse` model (one of four, by the direction it faced), in the same pose, lies
+## for Factorio's 15 minutes and sinks into the ground. Worms fall out of their holes the same way, Gleba's spawners slump, Nauvis's
 ## leave their corpse at once (`died_at`, from main.gd's `died`).
 ##
 ## Fights stay cheap to draw. A creature model is 7,000-9,000 triangles, and with every MultiMesh
@@ -38,6 +42,7 @@ const CreatureModels := preload("res://scripts/world/creature_models.gd")
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
 const ModelLods := preload("res://scripts/world/model_lods.gd")
 const MoverRecords := preload("res://scripts/world/mover_records.gd")
+const GroundHeight := preload("res://scripts/world/ground_height.gd")
 const MoverShader := preload("res://shaders/factorio_material_mover.gdshader")
 const MoverAlphaShader := preload("res://shaders/factorio_material_mover_alpha.gdshader")
 
@@ -60,13 +65,26 @@ const ATTACK_RANGE := {"biter": 3.0, "spitter": 16.0}
 const BITER_ATTACK_SECONDS := {
 	"small-biter": 35.0 / 60.0, "medium-biter": 35.0 / 60.0,
 	"big-biter": 35.0 / 60.0, "behemoth-biter": 50.0 / 60.0,
+	"small-wriggler-pentapod": 26.0 / 60.0, "medium-wriggler-pentapod": 26.0 / 60.0,
+	"big-wriggler-pentapod": 26.0 / 60.0, "small-wriggler-pentapod-premature": 26.0 / 60.0,
+	"medium-wriggler-pentapod-premature": 26.0 / 60.0, "big-wriggler-pentapod-premature": 26.0 / 60.0,
 }
+## Gleba's wrigglers bite like biters, with their own strike (tools/models/creature_pose.py
+## WRIGGLER_STRIKE): 19 frames at 0.48 a tick, rearing to the `-attack` pose at frame 3 with the
+## front legs up and back on them by frame 12.
+const WRIGGLER_STRIKE_SECONDS := 19.0 / 0.48 / 60.0
+const WRIGGLER_STRIKE_TOP := 3.0 / 19.0
+const WRIGGLER_STRIKE_BACK := 12.0 / 19.0
 const SPITTER_ATTACK_SECONDS := 100.0 / 60.0
 const COOLDOWN_DEVIATION := 0.15
 ## How long the attack animations run: the biter's 11 frames at 0.4 a tick; the spitter's 14
 ## frames forward-then-backward (27 steps) at 0.4.
 const BITE_SECONDS := 11.0 / 0.4 / 60.0
 const SPIT_SECONDS := 27.0 / 0.4 / 60.0
+## The bite's top (the `-attack` pose, frame 5 of 11), as a share of the bite.
+const BITE_TOP := 5.0 / 11.0
+## The bite's last frames stand back in the walk's stance (frames 9 and 10 of 11).
+const BITE_BACK := 9.0 / 11.0
 ## How far into its attack a spitter swaps to its `-attack` stance (and back at the end).
 const SPIT_SWAP := 0.1
 ## An attack lapses when its unit hasn't been in `en` for this long (it comes every 10 ticks).
@@ -80,6 +98,9 @@ const DYING_SECONDS := {
 	"small-spitter": 0.89, "medium-spitter": 1.01, "big-spitter": 1.13, "behemoth-spitter": 1.18,
 	# Gleba's: their corpses' dying_speed 0.015.
 	"gleba-spawner": 1.11, "gleba-spawner-small": 1.11,
+	"small-wriggler-pentapod": 1.11, "medium-wriggler-pentapod": 1.11, "big-wriggler-pentapod": 1.11,
+	"small-wriggler-pentapod-premature": 1.11, "medium-wriggler-pentapod-premature": 1.11,
+	"big-wriggler-pentapod-premature": 1.11,
 	# Worms' corpses: dying_speed 0.01; the worm falls out of its hole.
 	"small-worm-turret": 1.67, "medium-worm-turret": 1.67, "big-worm-turret": 1.67, "behemoth-worm-turret": 1.67,
 }
@@ -88,8 +109,10 @@ const DEFAULT_DYING := 1.0
 ## body's middle at rest ("at") and fallen ("to"), the turn and the scale. The dying animation
 ## turns the live model that way, so the corpse that replaces it lies where it fell.
 const POSES_PATH := "res://data/creature_poses.json"
-## Factorio's corpses stay 54,000 ticks (time_before_removed), then this sinks them.
+## Factorio's corpses stay 54,000 ticks (time_before_removed), then this sinks them; a wriggler's
+## 3,600.
 const CORPSE_SECONDS := 900.0
+const WRIGGLER_CORPSE_SECONDS := 60.0
 const CORPSE_SINK := 5.0
 const MAX_CORPSES := 300
 ## Corpses are drawn per square cell this many tiles wide (see the top).
@@ -127,6 +150,7 @@ class Creature:
 	var walker: Layer
 	var index := -1
 	var at := Vector3.ZERO  # its newest position (placed)
+	var attack_model := ""  # name + "-attack", made once
 
 
 ## Live creatures of one model in one LIVE_CELL square: the walkers' instances (kept, written when
@@ -154,6 +178,7 @@ class Corpse:
 	var model := ""
 	var xform := Transform3D.IDENTITY
 	var born := 0.0  # _clock when it lay down
+	var life := CORPSE_SECONDS  # how long it lies before it sinks
 	var puddle := -1  # its blood puddle's variation, or -1 for none
 	var size := 1.0
 	var cell := Vector2i.ZERO
@@ -213,6 +238,7 @@ var _guess_wait := 0.0
 var _missing := {}  # model names without a mesh
 var _falls := {}  # corpse model -> {at, to, turn, scale} (POSES_PATH), loaded on first use
 var _falls_loaded := false
+var _fall_names := {}  # pose or corpse model -> its entry of _falls (or {}), looked up once
 var _puddle_meshes: Array[PlaneMesh] = []  # one per variation, empty without an install
 ## prewarm(): 1 asked, 2 done. The first corpse cell made the renderer compile the puddles'
 ## pipelines and stall 300-600 ms mid-fight; a hidden corpse drawn under the ground before the
@@ -491,9 +517,10 @@ func died_at(name: String, at: Vector3) -> void:
 	_add_corpse(name + "-corpse", Transform3D(Basis.IDENTITY, at))
 
 
-func _add_corpse(model: String, xform: Transform3D, puddle := -1, size := 1.0) -> void:
+func _add_corpse(model: String, xform: Transform3D, puddle := -1, size := 1.0, life := CORPSE_SECONDS) -> void:
 	var corpse := Corpse.new()
 	corpse.model = model
+	corpse.life = life
 	corpse.xform = xform
 	corpse.puddle = puddle
 	corpse.size = size
@@ -597,9 +624,13 @@ func _process(delta: float) -> void:
 		d.age += delta
 		if d.age >= d.seconds:
 			_dying.remove_at(i)
-			_add_corpse(d.corpse if d.corpse != "" else d.name + "-corpse", d.xform, randi() % PUDDLE_VARIATIONS if CreatureModels.walks(d.name) else -1, _scale_of(d.name))
+			# A wriggler's corpse has a puddle of its own in Factorio (not drawn here), not Nauvis's blood.
+			var wriggler := d.name.contains("wriggler")
+			var puddle := randi() % PUDDLE_VARIATIONS if CreatureModels.walks(d.name) and not wriggler else -1
+			_add_corpse(d.corpse if d.corpse != "" else d.name + "-corpse", d.xform, puddle, _scale_of(d.name),
+				WRIGGLER_CORPSE_SECONDS if wriggler else CORPSE_SECONDS)
 			continue
-		_push(d.name, _collapse(d), d.phase, 0.0)
+		_push(d.name, _collapse(d), d.phase, 0.0, _pose_code(d.corpse, _fall_amount(d)))
 	var t3 := Time.get_ticks_usec()
 	_age_corpses(delta)
 	if not _attacks.is_empty() and Engine.get_process_frames() % 60 == 0:
@@ -617,10 +648,18 @@ func _age_corpses(delta: float) -> void:
 	_expiry_wait -= delta
 	if _expiry_wait <= 0.0:
 		_expiry_wait = 1.0
-		while not _corpses.is_empty() and _clock - _corpses[0].born > CORPSE_SECONDS + CORPSE_SINK:
+		while not _corpses.is_empty() and _clock - _corpses[0].born > _corpses[0].life + CORPSE_SINK:
 			_drop_corpse(_corpses.pop_front())
+		# Shorter-lived corpses (wrigglers') further back in the list.
+		var gone: Array[Corpse] = []
+		for corpse in _corpses:
+			if corpse.life < CORPSE_SECONDS and _clock - corpse.born > corpse.life + CORPSE_SINK:
+				gone.append(corpse)
+		for corpse in gone:
+			_corpses.erase(corpse)
+			_drop_corpse(corpse)
 		for cell: CorpseCell in _cells.values():
-			cell.sinking = cell.corpses.any(func(c: Corpse) -> bool: return _clock - c.born > CORPSE_SECONDS)
+			cell.sinking = cell.corpses.any(func(c: Corpse) -> bool: return _clock - c.born > c.life)
 			for mmi: MultiMeshInstance3D in cell.layers.values():
 				_use_lods(mmi)
 	for key in _cells.keys():
@@ -654,7 +693,7 @@ func _append_cell(cell: CorpseCell) -> void:
 		if corpse.puddle >= 0 and corpse.puddle < _puddle_meshes.size():
 			var at := corpse.xform.origin
 			var k := corpse.size
-			var lift := at.y + PUDDLE_HEIGHT + 0.0012 * posmod(hash(Vector2i(roundi(at.x * 4.0), roundi(at.z * 4.0))), 4)
+			var lift := _puddle_lift(at)
 			cell.puddle_buffers[corpse.puddle].append_array([k, 0.0, 0.0, at.x, 0.0, 1.0, 0.0, lift, 0.0, 0.0, k, at.z])
 			puddled = true
 	cell.pending.clear()
@@ -663,6 +702,14 @@ func _append_cell(cell: CorpseCell) -> void:
 	if puddled:
 		for v in cell.puddles.size():
 			_fill(cell.puddles[v].multimesh, cell.puddle_buffers[v], 12)
+
+
+## How high a corpse's puddle lies: a step apart by place, so overlapping puddles don't flicker
+## against each other, over an add-on's hills (ground_height.gd). The corpse's model is lifted onto
+## them in its shader, the puddle's plain material isn't, so its height is read here, as it is laid.
+static func _puddle_lift(at: Vector3) -> float:
+	return at.y + PUDDLE_HEIGHT + 0.0012 * posmod(hash(Vector2i(roundi(at.x * 4.0), roundi(at.z * 4.0))), 4) \
+		+ GroundHeight.at(at.x, at.z)
 
 
 ## Writes one cell's corpses and puddles into its MultiMeshes.
@@ -678,7 +725,7 @@ func _build_cell(cell: CorpseCell, key: Vector2i) -> void:
 			continue
 		waiting = waiting or (puddles_coming and corpse.puddle >= 0)
 		var xf := corpse.xform
-		var sink := clampf((_clock - corpse.born - CORPSE_SECONDS) / CORPSE_SINK, 0.0, 1.0)
+		var sink := clampf((_clock - corpse.born - corpse.life) / CORPSE_SINK, 0.0, 1.0)
 		xf.origin.y -= sink * 0.6
 		if not by_model.has(corpse.model):
 			by_model[corpse.model] = PackedFloat32Array()
@@ -686,8 +733,7 @@ func _build_cell(cell: CorpseCell, key: Vector2i) -> void:
 		if corpse.puddle >= 0 and corpse.puddle < _puddle_meshes.size() and sink < 1.0:
 			var at := corpse.xform.origin
 			var k := corpse.size * (1.0 - sink)
-			# A step apart by place, so overlapping puddles don't flicker against each other.
-			var lift := at.y + PUDDLE_HEIGHT + 0.0012 * posmod(hash(Vector2i(roundi(at.x * 4.0), roundi(at.z * 4.0))), 4)
+			var lift := _puddle_lift(at)
 			puddles[corpse.puddle].append_array([k, 0.0, 0.0, at.x, 0.0, 1.0, 0.0, lift, 0.0, 0.0, k, at.z])
 	cell.dirty = waiting  # a model still being made on a worker thread: built again next frame
 	var bounds := AABB(Vector3(key.x * CORPSE_CELL - 4.0, -1.0, key.y * CORPSE_CELL - 4.0), Vector3(CORPSE_CELL + 8.0, 6.0, CORPSE_CELL + 8.0))
@@ -810,11 +856,28 @@ func _step(c: Creature, delta: float, focus: Vector3, reported: bool) -> bool:
 	var size := _scale_of(c.name)
 	var forward := -xf.basis.z
 	if family == "biter":
-		var bite := _bite_pulse(c.lunge / BITE_SECONDS) if c.lunge < BITE_SECONDS else 0.0
+		if c.attack_model == "":
+			c.attack_model = c.name + "-attack"
+		var pose_model := c.attack_model
+		# A wriggler's strike runs longer than its cooldown: squeezed into it.
+		var wriggler := c.name.contains("wriggler")
+		var seconds := minf(WRIGGLER_STRIKE_SECONDS, c.cycle) if wriggler else BITE_SECONDS
+		if CreatureModels.pose_slot(pose_model) >= 0:
+			# Rears up into the pose and comes down on its target (Factorio's 11 frames: the walk's
+			# stance at the first and last, the top at frame 5), quicker down than up; a wriggler
+			# rears with its front legs up (frame 3 of 19) and is back on them by frame 12.
+			var amount := 0.0
+			if c.lunge < seconds:
+				amount = _bite_amount(c.lunge / seconds, WRIGGLER_STRIKE_TOP, WRIGGLER_STRIKE_BACK) if wriggler \
+					else _bite_amount(c.lunge / seconds)
+			xf = _posed_body(xf, pose_model, amount, size)
+			_push(c.name, xf, c.phase, 0.0, _pose_code(pose_model, amount))
+			return false
+		var bite := _bite_pulse(c.lunge / seconds) if c.lunge < seconds else 0.0
 		xf.origin += forward * bite * 0.14 * size
 		xf.origin.y += maxf(bite, 0.0) * 0.035 * size
 		xf.basis = xf.basis * Basis(Vector3.RIGHT, -bite * 0.08)
-		_push(c.name + "-attack" if _has_model(c.name + "-attack") else c.name, xf, c.phase, 0.0)
+		_push(pose_model if _has_model(pose_model) else c.name, xf, c.phase, 0.0)
 		return false
 	# Spitters brace on their legs, throw the head forward and spit, then settle (Factorio's
 	# attack runs forward then backward). The `-attack` model is that stance, legs planted wide
@@ -822,6 +885,18 @@ func _step(c: Creature, delta: float, focus: Vector3, reported: bool) -> bool:
 	# model over the attack, nodding up a little at the top. Without one the walking model rears.
 	var rise := _spit_pulse(c.lunge / SPIT_SECONDS) if c.lunge < SPIT_SECONDS else 0.0
 	var spit := maxf(0.0, 1.0 - absf(c.lunge / SPIT_SECONDS - 0.5) * 8.0)
+	if c.attack_model == "":
+		c.attack_model = c.name + "-attack"
+	var stance := c.attack_model
+	if CreatureModels.pose_slot(stance) >= 0:
+		# Factorio's 14 frames forward, then back: it rises into the stance (frame 13, the pose) and
+		# settles, its head thrown forward a little as it spits at the top.
+		var up := _rise_amount(c.lunge / SPIT_SECONDS) if c.lunge < SPIT_SECONDS else 0.0
+		xf = _posed_body(xf, stance, up, size)
+		xf.origin += forward * spit * 0.06 * size
+		xf.basis = Basis(xf.basis.x.normalized(), spit * 0.06) * xf.basis
+		_push(c.name, xf, c.phase, 0.0, _pose_code(stance, up))
+		return false
 	var pivot := -forward * 0.45 * size  # the back legs
 	var reared := rise > SPIT_SWAP and _has_model(c.name + "-attack")
 	var tilt := Basis(xf.basis.x.normalized(), rise * (0.08 if reared else 0.32))
@@ -895,19 +970,40 @@ func _collapse(d: Dying) -> Transform3D:
 		# Slumps flat and spreads a little, as the spawner's corpse picture lies.
 		xf.basis = xf.basis * Basis.from_scale(Vector3(1.0 + 0.15 * t, 1.0 - 0.85 * t, 1.0 + 0.15 * t))
 		return xf
-	var fall := _fall(d.corpse if d.corpse != "" else d.name + "-corpse")
-	if not fall.is_empty():
-		# Falling: slow to start, quick at the end (Factorio's dying frames are much the same).
-		var f := _smooth01(d.age / d.seconds) * clampf(d.age / d.seconds, 0.0, 1.0)
-		var k := _scale_of(d.name)
-		var at: Vector3 = fall["at"] * k
-		var to: Vector3 = fall["to"] * k
-		var turn := Basis(Quaternion.IDENTITY.slerp(fall["turn"], f)).scaled(Vector3.ONE * lerpf(1.0, fall["scale"], f))
-		return xf * Transform3D(turn, at.lerp(to, f) - turn * at)
+	var corpse := d.corpse if d.corpse != "" else d.name + "-corpse"
+	if not _fall(corpse).is_empty():
+		return _posed_body(xf, corpse, _fall_amount(d), _scale_of(d.name))
 	var side := 1.0 if int(d.phase * 7.0) % 2 == 0 else -1.0
 	xf.basis = Basis(-xf.basis.z.normalized(), t * 0.6 * side) * xf.basis
 	xf.origin.y -= t * 0.12 * _scale_of(d.name)
 	return xf
+
+
+## How far into its fall a dying creature is: slow to start, quick at the end (Factorio's dying
+## frames are much the same).
+func _fall_amount(d: Dying) -> float:
+	return _smooth01(d.age / d.seconds) * clampf(d.age / d.seconds, 0.0, 1.0)
+
+
+## A creature's transform turned `amount` of the way its pose model's body lies (creature_poses.json:
+## the body's middle at rest and posed, its turn and scale), at a tier's size `k`.
+func _posed_body(xf: Transform3D, pose_model: String, amount: float, k: float) -> Transform3D:
+	var fall := _fall(pose_model)
+	if fall.is_empty() or amount <= 0.0:
+		return xf
+	var at: Vector3 = fall["at"] * k
+	var to: Vector3 = fall["to"] * k
+	var turn := Basis(Quaternion.IDENTITY.slerp(fall["turn"], amount)).scaled(Vector3.ONE * lerpf(1.0, fall["scale"], amount))
+	return xf * Transform3D(turn, at.lerp(to, amount) - turn * at)
+
+
+## INSTANCE_CUSTOM.a for the walking model with its legs `amount` of the way into a pose model's
+## (creature_models.gd), or 1 (none) where the family has no legs for it.
+static func _pose_code(pose_model: String, amount: float) -> float:
+	var slot := CreatureModels.pose_slot(pose_model)
+	if slot < 0:
+		return 1.0
+	return 2.0 + float(slot) + clampf(amount, 0.0, 1.0) * CreatureModels.POSE_SCALE
 
 
 ## Factorio's dying sheets take turns with four falls round the 16 directions (direction d falls the
@@ -947,9 +1043,15 @@ func _fall(corpse: String) -> Dictionary:
 					"to": Vector3(float(b[0]), float(b[1]), float(b[2])),
 					"turn": Quaternion(float(q[0]), float(q[1]), float(q[2]), float(q[3])).normalized(),
 					"scale": float(e.get("scale", 1.0))}
+	# Asked every frame for every biting, spitting or dying creature: each name looked up once.
+	var known: Variant = _fall_names.get(corpse)
+	if known != null:
+		return known
 	var model := CreatureModels.base_model(corpse)
 	var found = _falls.get(model if model != "" else corpse)
-	return found if found is Dictionary else {}
+	var out: Dictionary = found if found is Dictionary else {}
+	_fall_names[corpse] = out
+	return out
 
 
 ## A quick jaw/body strike over the bite animation: ease back, snap forward, recoil and rest.
@@ -963,6 +1065,24 @@ func _bite_pulse(phase: float) -> float:
 	if phase < 0.75:
 		return 1.0 - _smooth01((phase - 0.45) / 0.3)
 	return 0.0
+
+
+## The biter's bite as a share of its pose: up to the top at frame 5 of 11, down to the walk's
+## stance by frame 9 (a wriggler's strike: `top` and `back` its own).
+static func _bite_amount(phase: float, top := BITE_TOP, back := BITE_BACK) -> float:
+	if phase < top:
+		return _smoothstep01(phase / top)
+	return 1.0 - _smoothstep01((phase - top) / (back - top))
+
+
+## The spitter's rise as a share of its stance: Factorio's 14 frames forward to it, then back.
+static func _rise_amount(phase: float) -> float:
+	return _smoothstep01(phase * 2.0) if phase < 0.5 else _smoothstep01((1.0 - phase) * 2.0)
+
+
+static func _smoothstep01(value: float) -> float:
+	var t := clampf(value, 0.0, 1.0)
+	return t * t * (3.0 - 2.0 * t)
 
 
 ## Rearing to spit: up over the first part, held at the top, down at the end.
@@ -1027,13 +1147,13 @@ static func _ensure(layer: Layer, n: int) -> void:
 	layer.dirty = true
 
 
-func _push(model: String, xf: Transform3D, phase: float, gait: float) -> void:
+func _push(model: String, xf: Transform3D, phase: float, gait: float, pose := 1.0) -> void:
 	var layer := _layer(model, _cell_of(xf.origin))
 	if layer == null:
 		return
 	# Appended in place: taking the packed array out into a variable and putting it back copied the
 	# whole buffer for every creature.
-	_append_instance(layer.posed, xf, phase, gait)
+	_append_instance(layer.posed, xf, phase, gait, pose)
 	layer.low = layer.low.min(xf.origin)
 	layer.high = layer.high.max(xf.origin)
 	if _stepping != null:
@@ -1057,13 +1177,14 @@ static func _append_drawn(b: PackedFloat32Array, drawn: PackedFloat32Array) -> v
 	b.append_array(drawn)
 
 
-## MultiMesh buffer: a 3x4 transform (rows) then the custom data.
-static func _append_instance(b: PackedFloat32Array, xf: Transform3D, phase: float, gait: float) -> void:
+## MultiMesh buffer: a 3x4 transform (rows) then the custom data (phase, gait, 0, the pose: 1 none,
+## else _pose_code's).
+static func _append_instance(b: PackedFloat32Array, xf: Transform3D, phase: float, gait: float, pose := 1.0) -> void:
 	var x := xf.basis.x
 	var y := xf.basis.y
 	var z := xf.basis.z
 	var o := xf.origin
-	b.append_array([x.x, y.x, z.x, o.x, x.y, y.y, z.y, o.y, x.z, y.z, z.z, o.z, phase, gait, 0.0, 1.0])
+	b.append_array([x.x, y.x, z.x, o.x, x.y, y.y, z.y, o.y, x.z, y.z, z.z, o.z, phase, gait, 0.0, pose])
 
 
 func _new_layer(model: String) -> MultiMeshInstance3D:

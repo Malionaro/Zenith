@@ -118,6 +118,9 @@ func _initialize() -> void:
 	sim.split_wake = split_wake
 	sim.emit_changes = bench
 	sim.profile = bench
+	# (A recording has no `lm` next: a tunnel's next 0 here says nothing, not "no exit". The fixture's entrance 50704
+	# has its exit outside the recording; the dead end (ug_guard) held its items at the entrance, 0.879% off.)
+	sim.set("next_named", false)
 	var keys := PackedInt64Array()
 	var kinds := PackedInt32Array()
 	keys.resize(metas.size() + 1)

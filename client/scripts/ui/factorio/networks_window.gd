@@ -32,6 +32,14 @@ var _items := GridContainer.new()
 var _right_frame: PanelContainer
 var _timer := 0.0
 var _sig := ""
+## The two frames side by side, at the top left under the remote view's title bar.
+var _frames_row := HBoxContainer.new()
+
+
+## Puts the frames' top at `y` (screen pixels) when that is under the title bar's: under anything of
+## Zenith's in the top left corner (factorio_ui.gd's Show in Factorio button). 0: right under it.
+func set_top(y: float) -> void:
+	_frames_row.position.y = maxf(Kit.px(40), y)
 
 
 func _ready() -> void:
@@ -41,7 +49,7 @@ func _ready() -> void:
 	visible = false
 	# Factorio 2.1 draws two frames at the top left of the screen (in its remote view): the list,
 	# and the selected network beside it.
-	var row := HBoxContainer.new()
+	var row := _frames_row
 	row.add_theme_constant_override("separation", Kit.px(4))
 	row.position = Kit.pxv(12, 40)  # under the remote view's title bar, as Factorio's
 	add_child(row)

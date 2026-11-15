@@ -961,6 +961,21 @@ func _cinematic_shaders(fake) -> void:
 	check(vp.use_taa and not game_looks.own_clouds(), "cinematic shaders: changing a Graphics setting leaves the look's TAA and clouds as they are")
 	check(Looks.looks.has(node.LOOK) and float(Looks.looks[node.LOOK].get("roughness_min", 0.0)) > 0.3,
 		"cinematic shaders: its look asks for a roughness floor")
+	# 0.4.5: the clouds' pattern drawn once into a texture the grade reads, not noise on every pixel.
+	var params: Dictionary = (Looks.looks[node.LOOK]["passes"][0] as Dictionary).get("params", {})
+	var field: SubViewport = node.get_node_or_null("CloudField")
+	var field_shader: Shader = null
+	if field != null and field.get_child_count() > 0:
+		field_shader = ((field.get_child(0) as ColorRect).material as ShaderMaterial).shader
+	check(params.get("cloud_field") is Texture2D and is_equal_approx(float(params.get("cloud_period", 0.0)), float(node.FIELD_PERIOD))
+		and field != null and field.size == Vector2i(node.FIELD_SIZE, node.FIELD_SIZE) and field.use_hdr_2d
+		and field_shader != null and field_shader.get_mode() == Shader.MODE_CANVAS_ITEM,
+		"cinematic shaders: its clouds read a pattern drawn once by a 16-bit viewport of its own (cloud_field.gdshader)")
+	node.api.settings.set_value("clouds", 0.0, false)
+	var cloudless: Dictionary = (Looks.looks[node.LOOK]["passes"][0] as Dictionary).get("params", {})
+	check(not cloudless.has("cloud_field") and node.get_node_or_null("CloudField") == field,
+		"cinematic shaders: with its clouds off the grade gets no pattern, and the one drawn is kept for later")
+	node.api.settings.set_value("clouds", 1.0, false)
 	host.set_enabled("cinematic-shaders", false)
 	await get_tree().process_frame
 	check(str(Settings.get_value("graphics", "look")) == "classic" and game_looks.current == "classic" and not vp.use_taa and game_looks.own_clouds(),
@@ -1199,6 +1214,13 @@ func _terrain(api, host) -> void:
 	t.clear()
 	check(not t.is_on() and t.height_at(0, 0) == 0.0, "terrain: cleared")
 	check(early.extra_cull_margin == 0.0 and late.extra_cull_margin == 0.0 and quad.extra_cull_margin == 16384.0, "terrain: flat again, the margins go")
+	# A field that says its own range (Terrain Elevation 0.1.5) isn't measured: its word is taken, rounded out.
+	var told := img.duplicate() as Image
+	told.set_meta(&"lift_range", Vector2(-0.2, 7.3))
+	t.set_heights(told, Vector2(-8, -8), 4.0)
+	check(GroundHeight.lift_range() == Vector2(-0.5, 7.5) and not GroundHeight.measuring() and late.extra_cull_margin == 7.5,
+		"terrain: a field's own lift_range is taken instead of measuring it: %s" % [GroundHeight.lift_range()])
+	t.clear()
 	early.queue_free()
 	late.queue_free()
 	quad.queue_free()

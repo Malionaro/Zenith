@@ -31,6 +31,22 @@ const SPLIT_BUFFER := 51  # a splitter input's end lies this far into its output
 const FAR := -1000000000
 const WALK := 4096  # how far ahead (1/256) a line looks for the item in front
 const NEVER := 1 << 40
+## (handoff) What an inserter's take or put did (out_hand_why): taken off the lane; not looked for, a read
+## of the belt's lanes as of that tick or later came first (it took the item off itself); nothing of the
+## kind within TAKE_REACH of the hand; put on the lane; already there (a read put it); its lane not known.
+const HAND_TAKEN := 0
+const HAND_READ := 1
+const HAND_NONE := 2
+const HAND_PUT := 3
+const HAND_HAD := 4
+const HAND_NO_LANE := 5
+## (handoff) How far (1/256 tile) from the hand an item taken may be: the hand closes on the item, but the
+## mod reads its position at its check (up to a tick after the grab with `chase` 2: the hand moved on).
+const TAKE_REACH := 160
+## (take_first) How many ticks a pick may be stamped after the hand closed (the mod sees it at its check), and
+## how long after a take a read that pushed its item back may still be the one that took it.
+const TAKE_LEAD := 3
+const RESCUE_WINDOW := 60
 
 ## Lane kinds (`lm`).
 const STRAIGHT := 1
@@ -101,6 +117,73 @@ var shift_keep := true
 ## item's record again (half the reads at -62,-26 were such). n_same (probes): reads skipped.
 var read_skip_same := true
 var n_same := 0
+## A read of a lane an inserter's hand took from on its tick (the bridge sends `bs` before `ie` in a tick,
+## and the mod sees a pick at its check, up to TAKE_LEAD ticks after the hand closed) used to come before the
+## take: it found the item missing behind its own (or the lane empty) and pushed it back out of the lane as one
+## the simulation had run on into it (_rescue), so the taken item stood again at the start of the belt and the
+## items behind it were pushed back with it; the take then found the lane read and did nothing (owner, K9).
+## Now a read first makes the takes queued for its belt up to TAKE_LEAD ticks on, of the items it hasn't on its
+## lane (each take's own choice: nearest its hand, of its kind), gone on the take's tick (_takes_first); and a
+## take that came after a read as of its tick takes the item that read moved instead (_take_rescued). Items
+## behind keep their places and close the gap at their belt's speed. Off: as before.
+var take_first := true
+## A take is made before the reads of its tick, and of the item the game took (owner, K19: "belt items all of
+## a sudden jump around", an inserter taking from a line backed up to its end). The bridge sends an update's lane reads before the tick's hand events, so on
+## the take's own tick the reads came first. The read of the lane BEHIND the pickup lane found its items a
+## step on (the line closing the hole) and moved the packed run in front with them (_shift_packed), the taken
+## item too, across the belt's edge onto the next belt; the pickup lane's own read then found the lane as it
+## should be, and the take, finding its belt read and the item no longer on it, did nothing. The item stayed
+## (one the game hasn't), the line behind it a gap out, and each later read of that line moved long runs a
+## whole gap one way or the other until they agreed again: a quarter tile, dozens of items at once, the
+## line's front items past its end. And a take stamped a tick or two after the hand closed (the mod looks at
+## a hand that waited long at its belt every 3 or 4 ticks) carries the hand's place that far into its swing,
+## a tenth of a tile a tick along the belt: the item nearest it was the neighbour. Now:
+##  - what is queued is applied by tick, a tick's takes first, then as it came (_apply_queue): the game's
+##    hand took before the bridge read the lanes that tick;
+##  - a take takes the item its belt's next read hasn't, when that read has come already (_take_known:
+##    the read of the pickup lane as of the take, queued; _qload), the nearest the hand as before otherwise.
+## Off (--belt-sim-take-line=off): as before.
+var take_line := true
+var n_take_known := 0  # (probes) takes made of the item the belt's queued read hasn't (take_line)
+## (take_line) lane key -> reads queued and not applied yet: [[tick, items], ...] in the order they came.
+var _qload := {}
+## A take's item may be looked for in a read of its belt this many ticks after it (the bridge reads an
+## inserter's belt when it sees the hand changed: within an update, sometimes the one after).
+const TAKE_EVIDENCE := 12
+## A take at a belt's front edge, made late (the `ie` pick comes a few ticks after the hand took): the lines
+## had run the item on over the edge onto the next belt, so the take didn't look for it there and found
+## nothing. The read of the next belt's lane, without it, then put it back at that lane's entry (_rescue: the
+## game's hasn't arrived yet), where it stood in for nothing: on the line-end scene (tools/belt_line_end.py,
+## seed 1) item 168, taken at tick 102455, lived on for 372 ticks and left six items behind it a gap off. On
+## (the default): a take looks for its item that far past its belt's front edge too, as far as the lanes run
+## in the ticks since the take (and TAKE_LEAD's slack), on the line that runs on from it (_take_cands); and,
+## with take_first, among what a read of the lane ahead moved back to its entry (_take_rescued: the reads came
+## an update before the pick).
+## Off (--belt-sim-take-edge=off): only on the belt's own lanes, as before.
+var take_edge := true
+## An underground's hidden lane the bridge sends no next for (`lm` next 0) was linked by geometry like a belt:
+## with no entrance at its end it side-loaded onto whatever straight belt ran beside its exit. On s272_out an
+## express underground's tunnel (lane 35360348) fed a turbo belt half a tile west (34533394): items the game
+## held at the entrance ran 14 tiles down that belt and stood at its end as phantoms, taken back by each read
+## of the entrance and let go again (thousands of ticks without one). On (the default): a hidden lane's
+## geometric next is only an underground's visible half (an exit's lane, another underground), and it never
+## side-loads; with none it leads nowhere, and its entrance ends at its own end (an underground with no exit:
+## the game's items stand there, they don't go into the ground). Off (--belt-sim-ug-guard=off): as before.
+## A tunnel whose exit the bridge names (`lm` next the exit's key, or minus it when the exit is outside what is
+## sent) leads on whether the exit is loaded or not: its items go into the tunnel and stand at its end, or leave
+## by the out edge, as the game's do (the dead end held them at the entrance: an exit outside the square, or
+## belt_sim_replay's recording, whose next 0 says nothing).
+var ug_guard := true
+## (ug_guard) The lanes' metas say each tunnel's exit (the bridge's `lm` next): next 0 is an underground with no
+## exit, its entrance a dead end. False: lanes made without the bridge's next (tests/belt_sim_replay.gd's
+## recordings), where 0 says nothing: no dead end.
+var next_named := true
+var _takes := {}  # (take_first) unit -> takes queued, not made yet: [seq, tick, item, n left, hx, hy, inserter], by seq
+## (take_first) lane index -> what its last read's _rescue moved: [read tick, uids, items, stacks, positions
+## in the lane before].
+var _rescued := {}
+var n_take_read := 0  # (probes) items a read that came first took for a queued take (take_first)
+var n_take_rescued := 0  # (probes) items a take took back from a read's _rescue (take_first)
 const TURN_FOLLOW := 8  # (_turns_from_read) lanes followed on from a splitter's other output
 
 ## The tick the state is at (-1: not started).
@@ -131,6 +214,9 @@ var l_x0 := PackedInt32Array()  # exit (line position 0)
 var l_y0 := PackedInt32Array()
 var l_x1 := PackedInt32Array()  # entry (line position length)
 var l_y1 := PackedInt32Array()
+var l_xm := PackedInt32Array()  # (handoff) its middle (line position length / 2)
+var l_ym := PackedInt32Array()
+var l_read := PackedInt64Array()  # (handoff) the tick of its newest read applied (-1 none)
 var l_seq := PackedInt64Array()  # when it was set: sim.py's lane order
 var l_xnext := PackedInt64Array()  # the bridge's next lane key (0: by geometry)
 var l_next := PackedInt32Array()
@@ -235,6 +321,19 @@ var _pending: Array = []  # [lane, pos in lane, uid, item, stack] from dissolved
 var _out_keys := {}
 ## lane key -> [[tick, front uid (0: the lane was empty, everything runs off), its position], ...]
 var _walls := {}
+## (dead_walls) --belt-sim-dead-walls=on (off by default: as before): a lane that leads nowhere here (no
+## next by geometry, none named, not side-loading, not a splitter's input) though the bridge didn't say it
+## leads out of what is sent is walled as such a lane is (set_wall) by a read that finds its front item
+## where the read before did: the game's front stood there, short of the lane's end, held by an item on a
+## belt not sent. Any other read of it takes the walls away (its front runs to its end, EDGE_STOP, as
+## before). At -62,-26 the bridge sent a bus's last belts (lm next 0) without the belt they feed: the
+## simulation ran the front item up to the lane's end, each read put the packed line back a fraction of a
+## gap and the next steps ran it on again, the whole line behind with it (186 drawn items' jumps over half
+## a tile a second offline, 39 with this). Off by default: the bridge's own fix of its `lm` next marks
+## (/f3d-bs lane_next) covers the cause; this is the client's side of it.
+var dead_walls := false
+var _dead_last := {}  # (dead_walls) lane key -> [tick, front uid, position] of its last read
+const DEAD_KEEP := 4  # (dead_walls) walls a lane not leading out keeps
 ## Splitter inputs the bridge saw stand as their last read left them (`sh`): lane index -> the tick from
 ## which their items don't cross into the outputs, until the lane's next read (hold_inputs).
 var _in_holds := {}
@@ -282,6 +381,21 @@ var out_gone := PackedInt64Array()
 var out_gone_tick := PackedInt64Array()  # the tick it went on
 var out_gone_at := PackedInt32Array()  # the changes before it (in out_uid): the order of the two
 var out_mismatch := PackedInt64Array()
+var out_mismatch_n := PackedInt32Array()  # per mismatch: 1 the count differed (or a lane linked up), 0 places or ids only
+## Counts the relinks that worked links out again (the reline-only ones, switched belts, leave next_of as it
+## was): the drawing (belt_items.gd's later queue) tries its held changes again when it moves.
+var links_ver := 0
+## (handoff: take_at, put_at) What each inserter's take or put did, in the order applied: the item's uid
+## (0: none), the event's tick, the inserter, the lane and the item's line position on it (as of the tick
+## applied), and what happened (HAND_*).
+var out_hand_uid := PackedInt64Array()
+var out_hand_tick := PackedInt64Array()
+var out_hand_ins := PackedInt64Array()
+var out_hand_key := PackedInt64Array()
+var out_hand_pos := PackedInt32Array()
+var out_hand_why := PackedInt32Array()
+## (probes) Takes and puts by what happened (HAND_*).
+var n_hand := PackedInt64Array([0, 0, 0, 0, 0, 0])
 
 # Scratch for a step's movement runs.
 var _seg_i := PackedInt32Array()
@@ -292,11 +406,13 @@ var _seg_v := PackedInt32Array()
 
 ## A lane (`lm`): key = belt unit * 8 + line index. p0, pm, p1: its exit, middle and entry on the
 ## map (1/256 tile). next_key: the lane items go on into, when the bridge says (0: by geometry).
-func set_lane(key: int, kind: int, length: int, step: int, p0: Vector2i, _pm: Vector2i, p1: Vector2i,
+func set_lane(key: int, kind: int, length: int, step: int, p0: Vector2i, pm: Vector2i, p1: Vector2i,
 		extra: int, next_key: int = 0) -> void:
 	_marking = "set_lane"
 	var i: int = _key_idx.get(key, -1)
 	if i >= 0:
+		l_xm[i] = pm.x
+		l_ym[i] = pm.y
 		if l_kind[i] == kind and l_len[i] == length and l_step[i] == step and l_x0[i] == p0.x \
 				and l_y0[i] == p0.y and l_x1[i] == p1.x and l_y1[i] == p1.y and l_extra[i] == extra \
 				and l_xnext[i] == next_key:
@@ -316,6 +432,7 @@ func set_lane(key: int, kind: int, length: int, step: int, p0: Vector2i, _pm: Ve
 		l_side[i] = -1
 		l_sp0[i] = -1
 		l_sp1[i] = -1
+		l_read[i] = -1
 		l_feeders[i] = PackedInt32Array()
 		l_sideins[i] = PackedInt32Array()
 		var w: Variant = _xnext_wait.get(key)
@@ -330,6 +447,8 @@ func set_lane(key: int, kind: int, length: int, step: int, p0: Vector2i, _pm: Ve
 	l_y0[i] = p0.y
 	l_x1[i] = p1.x
 	l_y1[i] = p1.y
+	l_xm[i] = pm.x
+	l_ym[i] = pm.y
 	if l_xnext[i] != next_key:
 		_wait_remove(i)
 		l_xnext[i] = next_key
@@ -381,7 +500,10 @@ func drop_lane(key: int) -> void:
 	_unlink(i)
 	_out_keys.erase(key)
 	_walls.erase(key)
+	_dead_last.erase(key)
 	_in_holds.erase(i)
+	_rescued.erase(i)
+	_qload.erase(key)
 	l_alive[i] = 0
 	_key_idx.erase(key)
 	_free_lanes.append(i)
@@ -390,6 +512,10 @@ func drop_lane(key: int) -> void:
 
 ## The lane's items are exactly these at `tick` (`sl`: [uid, item, pos, stack] * n, front first).
 func load_lane(key: int, at_tick: int, items: PackedInt64Array) -> void:
+	if take_line:
+		var ql: Array = _qload.get(key, [])
+		ql.append([at_tick, items])
+		_qload[key] = ql
 	_enqueue(at_tick, 0, [key, items])
 
 
@@ -403,16 +529,26 @@ func check_lane(key: int, at_tick: int, count: int, front: int, back: int, front
 func set_out_edge(key: int, on: bool) -> void:
 	if on:
 		_out_keys[key] = true
-	else:
-		_out_keys.erase(key)
+	elif _out_keys.erase(key):
 		_walls.erase(key)
 
 
 ## A lane leading out: at `at_tick` its front item was `uid` (0: none) at line position `pos` (the
 ## lane's `sl`, set as its items are handled, before stepping to that tick).
 func set_wall(key: int, at_tick: int, uid: int, pos: int) -> void:
-	if not _out_keys.has(key):
-		return
+	var out := _out_keys.has(key)
+	if not out:
+		if not dead_walls:
+			return
+		# (dead_walls) A read finding the front where the read before did walls it; any other, none.
+		var last: Array = _dead_last.get(key, [])
+		_dead_last[key] = [at_tick, uid, pos]
+		if uid == 0 or last.is_empty() or int(last[1]) != uid or int(last[2]) != pos:
+			if _walls.erase(key) and _dead_end(key):
+				var i0: int = _key_idx.get(key, -1)
+				if l_line[i0] >= 0 and _lines[l_line[i0]] != null:
+					_wake(_lines[l_line[i0]])
+			return
 	var w: Array = _walls.get(key, [])
 	var j := w.size()
 	while j > 0 and int(w[j - 1][0]) > at_tick:
@@ -421,10 +557,29 @@ func set_wall(key: int, at_tick: int, uid: int, pos: int) -> void:
 		w[j - 1] = [at_tick, uid, pos]
 	else:
 		w.insert(j, [at_tick, uid, pos])
+	if not out and w.size() > DEAD_KEEP:
+		w.remove_at(0)
 	_walls[key] = w
+	if not out and not _dead_end(key):
+		return
 	var i: int = _key_idx.get(key, -1)
 	if i >= 0 and l_line[i] >= 0 and _lines[l_line[i]] != null:
 		_wake(_lines[l_line[i]])
+
+
+## (dead_walls) Whether a lane the bridge didn't say leads out leads nowhere here: walled by its reads.
+func _dead_end(key: int) -> bool:
+	if not dead_walls:
+		return false
+	var i: int = _key_idx.get(key, -1)
+	return i >= 0 and l_next[i] < 0 and l_side[i] < 0 and l_xnext[i] == 0 and l_kind[i] != SPLIT_IN 		and l_kind[i] != UG_HIDDEN and not _ug_back_half(i)
+
+
+## Whether a lane's front follows its walls (set_wall): one leading out of what is sent, or (dead_walls)
+## one leading nowhere here that a read walled.
+func _walled(key: int) -> bool:
+	return (not _out_keys.is_empty() and _out_keys.has(key)) or (dead_walls and not _walls.is_empty() and _walls.has(key)
+		and _dead_end(key))
 
 
 ## The wall in effect stepping to tick t: the first at or after t, else the last (it holds); older
@@ -545,16 +700,45 @@ func take_item(uid: int, gone := true) -> void:
 	_touched(L, tick)
 
 
+## (--inserter-handoff) An inserter's hand took from belt `unit` on `at_tick` (the bridge's `ie` picked):
+## the `n` items (counting stacks) of kind `item` (0: any) nearest the hand at (hx, hy) (map position, 1/256
+## tile) on the belt's lanes, within TAKE_REACH, go then (gone on that tick: the drawing takes them off as
+## the hand closes). Not when a read of one of its lanes as of that tick or later came first (the read
+## took it off already). Advisory: the lane reads after it correct a wrong guess (an item taken that the
+## game still has comes back with the read, the one the game took goes).
+func take_at(at_tick: int, unit: int, item: int, n: int, hx: int, hy: int, inserter: int) -> void:
+	if take_first:
+		var list: Array = _takes.get(unit, [])
+		list.append([_qseq, at_tick, item, n, hx, hy, inserter])
+		_takes[unit] = list
+	_enqueue(at_tick, 5, [unit, item, n, hx, hy, inserter])
+
+
+## (--inserter-handoff) An inserter put item `uid` (the bridge found it on the lane after the drop) on lane
+## `key` at line position `pos` on `at_tick`: on the lane then, unless the simulation has it already.
+func put_at(at_tick: int, key: int, uid: int, item: int, stack: int, pos: int, inserter: int) -> void:
+	_enqueue(at_tick, 6, [key, uid, item, stack, pos, inserter])
+
+
 ## Changes since the last call: per change parallel arrays uid, item, stack, key (lane), pos (line
 ## position on that lane at `tick`), tick, speed (1/256 a tick from then; 0 standing), reach (how far
 ## it can go at that speed before its motion must change: along its straight run of one speed);
 ## `gone`: uids that left, `gone_tick` the tick each went on and `gone_at` how many of the changes
 ## came before it (an item can go and come back, or come and go, between two calls); `mismatch`:
-## lanes whose drift check failed (for `bre`).
+## lanes whose drift check failed (for `bre`), and `mismatch_n` for each whether its count differed (1;
+## a lane that linked up too) or only where its items are (0).
 func take_changes() -> Dictionary:
 	var d := {"uid": out_uid, "item": out_item, "stack": out_stack, "key": out_key, "pos": out_pos,
 		"tick": out_tick, "speed": out_speed, "reach": out_reach, "run": out_run, "gone": out_gone,
-		"gone_tick": out_gone_tick, "gone_at": out_gone_at, "mismatch": out_mismatch}
+		"gone_tick": out_gone_tick, "gone_at": out_gone_at, "mismatch": out_mismatch, "mismatch_n": out_mismatch_n,
+		"hand_uid": out_hand_uid, "hand_tick": out_hand_tick, "hand_ins": out_hand_ins, "hand_key": out_hand_key,
+		"hand_pos": out_hand_pos, "hand_why": out_hand_why}
+	out_hand_uid = PackedInt64Array()
+	out_hand_tick = PackedInt64Array()
+	out_hand_ins = PackedInt64Array()
+	out_hand_key = PackedInt64Array()
+	out_hand_pos = PackedInt32Array()
+	out_hand_why = PackedInt32Array()
 	out_uid = PackedInt64Array()
 	out_item = PackedInt32Array()
 	out_stack = PackedInt32Array()
@@ -568,7 +752,14 @@ func take_changes() -> Dictionary:
 	out_gone_tick = PackedInt64Array()
 	out_gone_at = PackedInt32Array()
 	out_mismatch = PackedInt64Array()
+	out_mismatch_n = PackedInt32Array()
 	return d
+
+
+## Whether the next relink will work links out again (lanes changed since): next_of may then answer
+## otherwise than it did (belt_items.gd's later queue tries its held changes again).
+func links_pending() -> bool:
+	return _dirty_any and not _dirty.is_empty()
 
 
 ## The lane items leaving lane `key` at its exit go on into (by geometry or the bridge's next), or 0:
@@ -596,7 +787,11 @@ func run_of(key: int) -> int:
 ## integers a key: its position on the lane (-1 and 0 0 when the lane has none), its speed (1/256 a tick:
 ## its line's when the line flows, its record's otherwise) and the lane's items. Reads only: nothing is
 ## worked out ahead (materialized), so asking changes nothing in the simulation.
-func lane_fronts(keys: PackedInt64Array) -> PackedInt32Array:
+## speed_of 0: each lane's speed is its front item's (as before); 1 (belt_lattice.gd creep): the
+## speed most of its items move at (more than half of them moving: the fastest of those), else 0. A lane
+## whose front waits at its exit while the items behind it close up (a stop-and-go or creeping lane) moves.
+## 2 (belt_lattice.gd creep_flow): as 1, with the front item's unique id (its low 31 bits) for the count.
+func lane_fronts(keys: PackedInt64Array, speed_of := 0) -> PackedInt32Array:
 	_relink()
 	var out := PackedInt32Array()
 	out.resize(keys.size() * 3)
@@ -623,6 +818,14 @@ func lane_fronts(keys: PackedInt64Array) -> PackedInt32Array:
 		fv.resize(nl)
 		var cnt := PackedInt32Array()
 		cnt.resize(nl)
+		var mv := PackedInt32Array()  # (speed_of 1, 2) items moving, and the fastest, a lane
+		var mvv := PackedInt32Array()
+		var fu := PackedInt32Array()  # (speed_of 2) the front item's id
+		if speed_of >= 1:
+			mv.resize(nl)
+			mvv.resize(nl)
+		if speed_of == 2:
+			fu.resize(nl)
 		var d := maxi(tick - L.ft, 0)
 		var pos := L.f - (L.s * d if L.mode == 1 else 0)
 		var li := 0
@@ -635,8 +838,7 @@ func lane_fronts(keys: PackedInt64Array) -> PackedInt32Array:
 			while li + 1 < nl and pos >= L.base[li + 1]:
 				li += 1
 			cnt[li] += 1
-			if cnt[li] == 1:
-				first[li] = pos - L.base[li]
+			if cnt[li] == 1 or speed_of >= 1:
 				var v := 0
 				if L.mode == 1:
 					v = L.s
@@ -646,7 +848,14 @@ func lane_fronts(keys: PackedInt64Array) -> PackedInt32Array:
 					while r + 1 < L.rs.size() and L.rs[r + 1] <= j:
 						r += 1
 					v = maxi(L.rv[r], 0) if r < L.rv.size() else 0
-				fv[li] = v
+				if cnt[li] == 1:
+					first[li] = pos - L.base[li]
+					fv[li] = v
+					if speed_of == 2:
+						fu[li] = L.uid[j] & 0x7fffffff
+				if speed_of >= 1 and v > 0:
+					mv[li] += 1
+					mvv[li] = maxi(mvv[li], v)
 		var want: PackedInt32Array = by_line[id]
 		for w in range(0, want.size(), 2):
 			var q := want[w]
@@ -654,8 +863,8 @@ func lane_fronts(keys: PackedInt64Array) -> PackedInt32Array:
 			if li2 < 0 or cnt[li2] == 0:
 				continue
 			out[q * 3] = first[li2]
-			out[q * 3 + 1] = fv[li2]
-			out[q * 3 + 2] = cnt[li2]
+			out[q * 3 + 1] = fv[li2] if speed_of == 0 else (mvv[li2] if 2 * mv[li2] > cnt[li2] else 0)
+			out[q * 3 + 2] = fu[li2] if speed_of == 2 else cnt[li2]
 	return out
 
 
@@ -722,11 +931,30 @@ func _apply_queue(now: int) -> void:
 			_queue.erase(t)
 	if due.is_empty():
 		return
-	due.sort_custom(func(a: Array, b: Array) -> bool: return a[1] < b[1])
+	if take_line:
+		# (By tick, a tick's takes first, then as they came.)
+		due.sort_custom(func(a: Array, b: Array) -> bool:
+			if a[0] != b[0]:
+				return a[0] < b[0]
+			var ta: bool = a[2] == 5
+			if ta != (b[2] == 5):
+				return ta
+			return a[1] < b[1])
+	else:
+		due.sort_custom(func(a: Array, b: Array) -> bool: return a[1] < b[1])
 	for q in due:
 		var data: Array = q[3]
 		match int(q[2]):
 			0:
+				if not _qload.is_empty():
+					var ql: Array = _qload.get(int(data[0]), [])
+					if not ql.is_empty():
+						ql.remove_at(0)
+						if ql.is_empty():
+							_qload.erase(int(data[0]))
+				var li: int = _key_idx.get(int(data[0]), -1)
+				if li >= 0 and int(q[0]) > l_read[li]:
+					l_read[li] = int(q[0])
 				_apply_load(int(data[0]), data[1])
 			1:
 				_apply_check(int(data[0]), int(data[1]), int(data[2]), int(data[3]), int(data[4]), int(data[5]))
@@ -737,6 +965,384 @@ func _apply_queue(now: int) -> void:
 				set_out_edge(int(data[0]), bool(data[9]))
 			4:
 				_apply_hold(int(data[0]), data[1])
+			5:
+				var nt := _take_left(int(data[0]), int(q[1]), int(data[2])) if take_first else int(data[2])
+				if nt > 0:
+					_apply_take(int(q[0]), int(data[0]), int(data[1]), nt, int(data[3]), int(data[4]), int(data[5]))
+			6:
+				_apply_put(int(q[0]), int(data[0]), int(data[1]), int(data[2]), int(data[3]), int(data[4]), int(data[5]))
+
+
+## (take_at) The take, on the tick it is applied at (its own, or later when it came late: an item that moved
+## on since is looked for that much further on too).
+func _apply_take(at: int, unit: int, item: int, n: int, hx: int, hy: int, ins: int) -> void:
+	var got := _take_rescued(at, unit, item, n, hx, hy, ins) if take_first else 0
+	if got >= maxi(n, 1):
+		return
+	if take_line and not _qload.is_empty():
+		got += _take_known(at, unit, item, maxi(n, 1) - got, hx, hy, ins)
+		if got >= maxi(n, 1):
+			return
+	var nc := _take_cands(at, unit, item, hx, hy)
+	if nc < 0:
+		if got == 0:
+			_hand_out(0, at, ins, l_key[_tc_lane], 0, HAND_READ)
+		return
+	if nc == 0:
+		if got == 0:
+			_hand_out(0, at, ins, l_key[_tc_lane] if _tc_lane >= 0 else 0, 0, HAND_NONE)
+		return
+	for k in nc:
+		if got >= maxi(n, 1):
+			break
+		_take_one(_tc_u[k], at)
+		_hand_out(_tc_u[k], at, ins, l_key[_tc_l[k]], _tc_p[k], HAND_TAKEN)
+		got += maxi(_tc_s[k], 1)
+
+
+## (take_line) The take by what the game says: the first read of each of the belt's lanes that is queued
+## for the take's tick or up to TAKE_EVIDENCE ticks on (the bridge reads an inserter's belt when its hand
+## changed) lists the lane without the taken item. Of the lane's items of the take's kind that such a read
+## hasn't, within the hand's reach as the take's own search has them, the nearest the hand go, up to `n`
+## (counting stacks). Returns how many it took: 0 when no such read has come, or it lacks nothing there.
+func _take_known(at: int, unit: int, item: int, n: int, hx: int, hy: int, ins: int) -> int:
+	var known := {}  # lane index -> {uid: true} the read's items
+	for ln in range(1, 9):
+		var ql: Array = _qload.get(unit * 8 + ln, [])
+		for e: Array in ql:
+			if int(e[0]) < at or int(e[0]) > at + TAKE_EVIDENCE:
+				continue
+			var i: int = _key_idx.get(unit * 8 + ln, -1)
+			if i >= 0:
+				var has := {}
+				var its: PackedInt64Array = e[1]
+				for k in its.size() / 4:
+					has[its[k * 4]] = true
+				known[i] = has
+			break
+	if known.is_empty():
+		return 0
+	var nc := _take_cands(at, unit, item, hx, hy, true)
+	var us := PackedInt64Array()
+	var ss := PackedInt32Array()
+	var ls := PackedInt32Array()
+	var ps := PackedInt32Array()
+	for k in nc:
+		if known.has(_tc_l[k]) and not (known[_tc_l[k]] as Dictionary).has(_tc_u[k]):
+			us.append(_tc_u[k])
+			ss.append(_tc_s[k])
+			ls.append(_tc_l[k])
+			ps.append(_tc_p[k])
+	var got := 0
+	for k in us.size():
+		if got >= n:
+			break
+		_take_one(us[k], at)
+		_hand_out(us[k], at, ins, l_key[ls[k]], ps[k], HAND_TAKEN)
+		n_take_known += 1
+		got += maxi(ss[k], 1)
+	return got
+
+
+## (--inserter-handoff) The items take_at would take on `at_tick` as the lines stand now (a tick still to
+## come: each looked for where it will be by then, at its lane's speed), changing nothing: the drawing hides
+## them as the hand closes even when the simulation gets to that tick only after the drawn clock does (the
+## take on its tick is what counts: one it took instead is shown again).
+func peek_take(at_tick: int, unit: int, item: int, n: int, hx: int, hy: int) -> PackedInt64Array:
+	var out := PackedInt64Array()
+	var nc := _take_cands(at_tick, unit, item, hx, hy)
+	var got := 0
+	for k in maxi(nc, 0):
+		if got >= maxi(n, 1):
+			break
+		out.append(_tc_u[k])
+		got += maxi(_tc_s[k], 1)
+	return out
+
+
+## (take_at, peek_take) The items of kind `item` (0: any) within TAKE_REACH of the hand at (hx, hy) on belt
+## `unit`'s lanes on tick `at` (the lines stand at `tick`: an item is looked for where it was or will be
+## then, moved at its lane's speed), nearest first (then by uid: the same in both twins), in _tc_u (uid),
+## _tc_s (stack), _tc_l (lane), _tc_p (line position on it now). Returns how many; -1 when a read of one
+## of the lanes as of `at` or later was applied (_tc_lane that lane; not with `ignore_read`: _takes_first);
+## _tc_lane the first lane looked at.
+var _tc_u := PackedInt64Array()
+var _tc_s := PackedInt32Array()
+var _tc_l := PackedInt32Array()
+var _tc_p := PackedInt32Array()
+var _tc_lane := -1
+func _take_cands(at: int, unit: int, item: int, hx: int, hy: int, ignore_read := false) -> int:
+	_relink()
+	_tc_u = PackedInt64Array()
+	_tc_s = PackedInt32Array()
+	_tc_l = PackedInt32Array()
+	_tc_p = PackedInt32Array()
+	_tc_lane = -1
+	var lanes := PackedInt32Array()
+	for ln in range(1, 9):
+		var i: int = _key_idx.get(unit * 8 + ln, -1)
+		if i < 0 or l_alive[i] == 0 or l_kind[i] == UG_HIDDEN or l_line[i] < 0 or _lines[l_line[i]] == null:
+			continue
+		if l_read[i] >= at and not ignore_read:
+			_tc_lane = i
+			return -1
+		lanes.append(i)
+	if not lanes.is_empty():
+		_tc_lane = lanes[0]
+	var dt := tick - at
+	var cd := PackedFloat64Array()
+	var reach2 := float(TAKE_REACH) * float(TAKE_REACH)
+	for i in lanes:
+		_project(i, float(hx), float(hy))
+		var ph := _pj_pos
+		var dl2 := _pj_d2
+		if dl2 > reach2:
+			continue
+		var moved := float(dt * l_step[i])
+		var L: Line = _lines[l_line[i]]
+		_materialize(L, tick)
+		var lo := l_base[i]
+		var hi := lo + l_len[i]
+		# (take_edge) And the items the line ran on over the belt's front edge since the take's tick (with
+		# TAKE_LEAD ticks' slack): on it then.
+		var back := l_step[i] * (maxi(dt, 0) + TAKE_LEAD) if take_edge else 0
+		var pos := L.f
+		for j in L.uid.size():
+			if j > 0:
+				pos += L.gap[j]
+			if pos < lo - back:
+				continue
+			if pos >= hi:
+				break
+			if item > 0 and L.itm[j] != item:
+				continue
+			var p := float(pos - lo)
+			var da := absf(p - ph)
+			if dt != 0:
+				da = minf(da, absf(p - (ph - moved)))
+			var d2 := dl2 + da * da
+			if d2 > reach2:
+				continue
+			var k := cd.size()
+			while k > 0 and (cd[k - 1] > d2 or (cd[k - 1] == d2 and _tc_u[k - 1] > L.uid[j])):
+				k -= 1
+			cd.insert(k, d2)
+			_tc_u.insert(k, L.uid[j])
+			_tc_s.insert(k, L.stk[j])
+			_tc_l.insert(k, i)
+			_tc_p.insert(k, maxi(pos - lo, 0))
+	return cd.size()
+
+
+## (put_at) The put, on the tick it is applied at (later when it came late: moved on as far as its lane
+## goes meanwhile).
+func _apply_put(at: int, key: int, uid: int, item: int, stack: int, pos: int, ins: int) -> void:
+	if _uid_line.has(uid):
+		_hand_out(uid, at, ins, key, pos, HAND_HAD)
+		return
+	_relink()
+	var i: int = _key_idx.get(key, -1)
+	if i < 0 or l_alive[i] == 0 or l_line[i] < 0 or _lines[l_line[i]] == null:
+		_hand_out(uid, at, ins, key, pos, HAND_NO_LANE)
+		return
+	var p := clampi(pos - maxi(0, tick - at) * l_step[i], 0, maxi(l_len[i] - 1, 0))
+	put_item(key, uid, item, stack, p)
+	_hand_out(uid, at, ins, key, p, HAND_PUT)
+
+
+## Where (hx, hy) (1/256 tile) is along lane i (by its exit, middle and entry): _pj_pos the line position
+## on the lane, _pj_d2 the squared distance from it (floats: doubles, as the C++ twin's).
+var _pj_pos := 0.0
+var _pj_d2 := 0.0
+func _project(i: int, hx: float, hy: float) -> void:
+	var half := float(l_len[i]) * 0.5
+	_pj_pos = 0.0
+	_pj_d2 = INF
+	for s in 2:
+		var ax := float(l_x0[i] if s == 0 else l_xm[i])
+		var ay := float(l_y0[i] if s == 0 else l_ym[i])
+		var bx := float(l_xm[i] if s == 0 else l_x1[i])
+		var by := float(l_ym[i] if s == 0 else l_y1[i])
+		var dx := bx - ax
+		var dy := by - ay
+		var ll := dx * dx + dy * dy
+		var t := 0.0
+		if ll > 0.0:
+			t = clampf(((hx - ax) * dx + (hy - ay) * dy) / ll, 0.0, 1.0)
+		var qx := ax + dx * t - hx
+		var qy := ay + dy * t - hy
+		var d2 := qx * qx + qy * qy
+		if d2 < _pj_d2:
+			_pj_pos = half * (float(s) + t)
+			_pj_d2 = d2
+
+
+## (take_at) One item off the belts, gone on tick `at`.
+func _take_one(uid: int, at: int) -> void:
+	var id: int = _uid_line.get(uid, -1)
+	if id < 0:
+		return
+	var L: Line = _lines[id]
+	_materialize(L, tick)
+	var j := L.uid.find(uid)
+	if j >= 0:
+		_remove_at(L, j)
+	_uid_line.erase(uid)
+	L.holds.erase(uid)
+	if emit_changes:
+		out_gone.append(uid)
+		out_gone_tick.append(at)
+		out_gone_at.append(out_uid.size())
+	_touched(L, tick)
+
+
+## (take_first) A queued take (its seq) being applied: how many items it has left to take (0: a read that came
+## first made it), and it leaves the list; `n` when it isn't listed (queued with take_first off).
+func _take_left(unit: int, seq: int, n: int) -> int:
+	var list: Array = _takes.get(unit, [])
+	for k in list.size():
+		var e: Array = list[k]
+		if int(e[0]) == seq:
+			list.remove_at(k)
+			if list.is_empty():
+				_takes.erase(unit)
+			return int(e[3])
+	return n
+
+
+## (take_first) Before a read of lane i (its items `items`, at this tick): the takes queued for its belt up to
+## TAKE_LEAD ticks on take, as each would choose, those of the lane's items the read hasn't: the game's hand
+## took them before the bridge read the lane. Gone on the take's tick; the take keeps what is left of its count.
+func _takes_first(i: int, items: PackedInt64Array) -> void:
+	var unit := _unit(l_key[i])
+	if not _takes.has(unit):
+		return
+	var loaded := {}
+	for k in items.size() / 4:
+		loaded[items[k * 4]] = true
+	for e: Array in (_takes[unit] as Array):
+		var left := int(e[3])
+		var at := int(e[1])
+		if left <= 0 or at > tick + TAKE_LEAD:
+			continue
+		var nc := _take_cands(at, unit, int(e[2]), int(e[4]), int(e[5]), true)
+		var got := 0
+		for k in nc:
+			if got >= maxi(left, 1):
+				break
+			if _tc_l[k] != i or loaded.has(_tc_u[k]):
+				continue
+			_take_one(_tc_u[k], at)
+			_hand_out(_tc_u[k], at, int(e[6]), l_key[i], _tc_p[k], HAND_TAKEN)
+			n_take_read += 1
+			got += maxi(_tc_s[k], 1)
+		if got > 0:
+			e[3] = maxi(left, 1) - got
+
+
+## (take_first) Lane i's read just moved these items out of it (_rescue: P against `before`): kept for a take of
+## its belt that comes after it (_take_rescued).
+func _note_rescued(i: int, L: Line, P: PackedInt32Array, before: PackedInt32Array, lo: int) -> void:
+	var u := PackedInt64Array()
+	var it := PackedInt32Array()
+	var st := PackedInt32Array()
+	var p := PackedInt32Array()
+	for j in P.size():
+		if P[j] != before[j]:
+			u.append(L.uid[j])
+			it.append(L.itm[j])
+			st.append(L.stk[j])
+			p.append(before[j] - lo)
+	if u.is_empty():
+		_rescued.erase(i)
+	else:
+		_rescued[i] = [tick, u, it, st, p]
+
+
+## (take_first) A take whose belt was read as of its tick or later before it came (or a tick or two before it,
+## stamped late): the items those reads moved out of their lanes (_rescue) that the hand was near, nearest
+## first, up to its count, wherever they are now. Returns how many it took (counting stacks).
+func _take_rescued(at: int, unit: int, item: int, n: int, hx: int, hy: int, ins: int) -> int:
+	if _rescued.is_empty():
+		return 0
+	_relink()
+	var reach2 := float(TAKE_REACH) * float(TAKE_REACH)
+	var cd := PackedFloat64Array()
+	var cu := PackedInt64Array()
+	var cs := PackedInt32Array()
+	var cl := PackedInt32Array()
+	var cp := PackedInt32Array()
+	for ln in range(1, 9):
+		var i: int = _key_idx.get(unit * 8 + ln, -1)
+		if i < 0:
+			continue
+		# (take_edge) And what a read of the lane ahead (another belt's) moved back out of it that was on this belt
+		# at the take's tick, the lines having run it on over the edge: its places there less that lane's length
+		# are this lane's, past its front.
+		var srcs := PackedInt32Array([i])
+		if take_edge and l_next[i] >= 0 and _unit(l_key[l_next[i]]) != unit:
+			srcs.append(l_next[i])
+		for src in srcs:
+			if not _rescued.has(src):
+				continue
+			var r: Array = _rescued[src]
+			var rt: int = r[0]
+			if rt < at - TAKE_LEAD or rt > at + RESCUE_WINDOW:
+				continue
+			_project(i, float(hx), float(hy))
+			var ph := _pj_pos
+			var dl2 := _pj_d2
+			if dl2 > reach2:
+				continue
+			var off := 0 if src == i else -l_len[src]
+			var back := l_step[i] * (maxi(rt - at, 0) + TAKE_LEAD)
+			var moved := float((rt - at) * l_step[i])
+			var ru: PackedInt64Array = r[1]
+			var ri: PackedInt32Array = r[2]
+			var rs: PackedInt32Array = r[3]
+			var rp: PackedInt32Array = r[4]
+			for k in ru.size():
+				if item > 0 and ri[k] != item or not _uid_line.has(ru[k]):
+					continue
+				var q := rp[k] + off
+				if src != i and q < -back:
+					continue
+				var p := float(q)
+				var da := absf(p - ph)
+				if rt != at:
+					da = minf(da, absf(p - (ph - moved)))
+				var d2 := dl2 + da * da
+				if d2 > reach2:
+					continue
+				var x := cd.size()
+				while x > 0 and (cd[x - 1] > d2 or (cd[x - 1] == d2 and cu[x - 1] > ru[k])):
+					x -= 1
+				cd.insert(x, d2)
+				cu.insert(x, ru[k])
+				cs.insert(x, rs[k])
+				cl.insert(x, i)
+				cp.insert(x, rp[k] if src == i else maxi(q, 0))
+	var got := 0
+	for k in cd.size():
+		if got >= maxi(n, 1):
+			break
+		_take_one(cu[k], at)
+		_hand_out(cu[k], at, ins, l_key[cl[k]], cp[k], HAND_TAKEN)
+		n_take_rescued += 1
+		got += maxi(cs[k], 1)
+	return got
+
+
+func _hand_out(uid: int, at: int, ins: int, key: int, pos: int, why: int) -> void:
+	n_hand[why] += 1
+	if not emit_changes:
+		return
+	out_hand_uid.append(uid)
+	out_hand_tick.append(at)
+	out_hand_ins.append(ins)
+	out_hand_key.append(key)
+	out_hand_pos.append(pos)
+	out_hand_why.append(why)
 
 
 ## (hold_input) Put back as its last read had it, if the simulation has it otherwise; then held.
@@ -792,6 +1398,8 @@ func _apply_load(key: int, items: PackedInt64Array) -> void:
 	if _fresh_tick != tick:
 		_fresh.clear()
 		_fresh_tick = tick
+	if take_first and not _takes.is_empty():
+		_takes_first(i, items)
 	if read_skip_same and _lane_is(i, items):
 		n_same += 1
 		for k in items.size() / 4:
@@ -870,7 +1478,12 @@ func _apply_load(key: int, items: PackedInt64Array) -> void:
 	for j in between:
 		gone_between[j] = true
 	if read_conserve and n > 0:
+		var before := P.duplicate() if take_first else PackedInt32Array()
 		_rescue(L, P, RV, idx, items, lo, hi, gone_between)
+		if take_first:
+			_note_rescued(i, L, P, before, lo)
+	elif take_first:
+		_rescued.erase(i)
 	var past: Array = []  # (read_bound) [uid, item, stack, how far past the back end]: carried back
 	if total >= 0:
 		for j in n:
@@ -1641,6 +2254,7 @@ func _apply_check(key: int, count: int, front: int, back: int, front_uid := 0, b
 	# (A packed lane a whole gap off has the same count, front and back: its items' ids tell.)
 	if c != count or f != front or b != back or (front_uid != 0 and (fu != front_uid or bu != back_uid)):
 		out_mismatch.append(key)
+		out_mismatch_n.append(1 if c != count else 0)
 
 
 func _apply_off(unit: int, off: bool) -> void:
@@ -1690,6 +2304,9 @@ func _new_lane() -> int:
 	l_y0.resize(i + 1)
 	l_x1.resize(i + 1)
 	l_y1.resize(i + 1)
+	l_xm.resize(i + 1)
+	l_ym.resize(i + 1)
+	l_read.resize(i + 1)
 	l_next.resize(i + 1)
 	l_side.resize(i + 1)
 	l_side_at.resize(i + 1)
@@ -1861,7 +2478,16 @@ func _link(a: int) -> void:
 					# (Only an entrance's own visible half feeds its hidden line, which the bridge names
 					# as its next; an exit's lines 3-4 take nothing from the belt.)
 					if b != a and l_kind[b] != UG_HIDDEN and not _ug_back_half(b) and _near(l_x0[a], l_y0[a], l_x1[b], l_y1[b]):
+						# (ug_guard) A tunnel comes out only into an underground's visible half.
+						if ug_guard and kind == UG_HIDDEN and (l_kind[b] != UG_VISIBLE or _unit(l_key[b]) == _unit(l_key[a])):
+							continue
 						nxt = b
+	# (ug_guard) An entrance whose tunnel leads nowhere (no exit: the bridge names none and no underground's
+	# visible half starts at its end) ends at its own end, as the game's items stand there; nor does it side-load.
+	var dead_end := false
+	if ug_guard and kind == UG_VISIBLE and nxt >= 0 and l_kind[nxt] == UG_HIDDEN and not _tunnel_leads_on(nxt):
+		nxt = -1
+		dead_end = true
 	if kind == SPLIT_IN:
 		nxt = -1
 	l_next[a] = nxt
@@ -1871,6 +2497,8 @@ func _link(a: int) -> void:
 		l_feeders[nxt] = f
 	if nxt >= 0 or kind == SPLIT_IN:
 		return  # (a splitter's outputs side-load like belts; its inputs go into its outputs)
+	if ug_guard and (kind == UG_HIDDEN or dead_end):
+		return  # (ug_guard: a tunnel never side-loads, nor an entrance whose tunnel leads nowhere)
 	# Side-loads: a lane whose exit is level with the middle of a straight lane in front, across it.
 	var best_d := 0.0
 	var best := -1
@@ -1916,6 +2544,25 @@ func _link(a: int) -> void:
 		var f2: PackedInt32Array = l_sideins[best]
 		f2.append(a)
 		l_sideins[best] = f2
+
+
+## (ug_guard) Whether tunnel lane h leads on: the bridge names its exit (loaded or not), or (named none) an
+## underground's visible half (another's) starts at its end; or no next to go by (next_named off).
+func _tunnel_leads_on(h: int) -> bool:
+	if l_xnext[h] != 0 or not next_named:
+		return true  # (its exit named, loaded or not; or no next to go by)
+	var cx := _floordiv(l_x0[h], 32)
+	var cy := _floordiv(l_y0[h], 32)
+	for dx in [-1, 0, 1]:
+		for dy in [-1, 0, 1]:
+			var arr: Variant = _entry_grid.get(Vector2i(cx + dx, cy + dy))
+			if arr == null:
+				continue
+			for b in arr:
+				var other_exit: bool = b != h and l_kind[b] == UG_VISIBLE and _unit(l_key[b]) != _unit(l_key[h])
+				if other_exit and not _ug_back_half(b) and _near(l_x0[h], l_y0[h], l_x1[b], l_y1[b]):
+					return true
+	return false
 
 
 static func _round_half_even(x: float) -> int:
@@ -2006,9 +2653,17 @@ func _relink() -> void:
 	if _dirty.is_empty():
 		_reline()
 		return
+	links_ver += 1
 	for i in _relines:
 		_dirty[i] = true
 	_relines.clear()
+	if ug_guard:
+		# (ug_guard) A tunnel relinked: its entrance too (whether the tunnel leads on decides the entrance's next).
+		for i in _dirty.keys():
+			if l_kind[i] == UG_HIDDEN:
+				var e: int = _key_idx.get(l_key[i] - 2, -1)
+				if e >= 0 and not _dirty.has(e):
+					_dirty[e] = true
 	var lanes: Array = _dirty.keys()
 	_dirty.clear()
 	var touched := {}
@@ -2068,6 +2723,7 @@ func _relink() -> void:
 			asked[L.id] = true
 			for x in L.lanes:
 				out_mismatch.append(l_key[x])
+				out_mismatch_n.append(1)
 
 
 ## Lines made again round lanes switched off or on: their own and those feeding them.
@@ -2727,7 +3383,7 @@ func _step_line(A: Line, t: int) -> void:
 	# A lane leading out: its wall (set_wall). wall_i: the wall item's index when items run off ahead of it.
 	var wall_i := -1
 	var wall_p := 0
-	var wall_on := nx < 0 and not sidesplit and not _out_keys.is_empty() and _out_keys.has(l_key[l0])
+	var wall_on := nx < 0 and not sidesplit and _walled(l_key[l0])
 	if wall_on:
 		lk = 1
 		var w: Variant = _wall_at(l_key[l0], t)
@@ -3556,7 +4212,7 @@ func _schedule(A: Line, t: int) -> void:
 			Ka = NEVER if v >= s else 0
 		K = mini(K, Ka)
 	# A lane leading out (set_wall): stepped every tick until its front stands at a wall no later one moves.
-	var wall_lane := nx < 0 and not sidesplit and not _out_keys.is_empty() and _out_keys.has(l_key[l0])
+	var wall_lane := nx < 0 and not sidesplit and _walled(l_key[l0])
 	var wall_blocked := false
 	if wall_lane:
 		K = 0

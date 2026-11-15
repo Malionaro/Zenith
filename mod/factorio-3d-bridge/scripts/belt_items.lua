@@ -32,6 +32,7 @@ local world = require("scripts.world")
 local map = require("scripts.map")
 local rate = require("scripts.rate")
 local belt_sim = require("scripts.belt_sim")
+local perf = require("scripts.perf")
 
 local M = {}
 
@@ -1255,6 +1256,18 @@ function M.far_tick()
     return
   end
   local far = far_state()
+  -- (far_lanes, perf.lua) A belt-simulating client draws lane icons only between the simulation's square
+  -- and the far distance, round the square's middle: once the square reaches that far there is nothing
+  -- to read (with the belt item distance equal to the far one, the client's own, every chunk once
+  -- loaded). Joining, after a jump or with the square cut the icons fill in as before.
+  local bs_lanes = s.client and s.client.bs and perf.on("far_lanes")
+  local cover = bs_lanes and belt_sim.covered()
+  if cover and cover[3] >= r then
+    if far.cur or far.next <= #far.queue then
+      far.queue, far.next, far.cur = {}, 1, nil
+    end
+    return
+  end
   if far.next > #far.queue and not far.cur then
     if far.started and game.tick - far.started < FAR_ROUND_TICKS * rate.factor("lanes") then
       return
@@ -1267,15 +1280,24 @@ function M.far_tick()
     -- Chunks whose every belt is inside the square the last belt items update covered (bi fx, fy,
     -- fr, less a tile) aren't read: their items move there, and the client draws no icons inside
     -- it. Forgotten as sent, so they are sent again once the square leaves them.
-    local sq = (s.bi and s.bi.sq) or belt_sim.square()
+    local sq = (s.bi and s.bi.sq) or (bs_lanes and cover) or belt_sim.square()
+    -- (far_lanes: for a belt-simulating client, whose icons are drawn round the square's middle, the
+    -- chunks wholly past the far distance from it are left out, not read for a margin.)
+    local cx0, cy0 = sq and sq[1] or f.x, sq and sq[2] or f.y
     for key, c in pairs(s.subs) do
       local dx, dy = c[1] * 32 + 16 - f.x, c[2] * 32 + 16 - f.y
       local x0, y0 = c[1] * 32, c[2] * 32
+      local outside = false
+      if bs_lanes then
+        local nx = math.max(x0 - cx0, 0, cx0 - x0 - 32)
+        local ny = math.max(y0 - cy0, 0, cy0 - y0 - 32)
+        outside = nx * nx + ny * ny > r * r
+      end
       if sq and x0 + 0.5 > sq[1] - sq[3] + 1 and x0 + 31.5 < sq[1] + sq[3] - 1
         and y0 + 0.5 > sq[2] - sq[3] + 1 and y0 + 31.5 < sq[2] + sq[3] - 1 then
         far.sent[key] = nil
         M.counts.far_skipped = M.counts.far_skipped + 1
-      elseif dx * dx + dy * dy <= (r + FAR_MARGIN) * (r + FAR_MARGIN) then
+      elseif not outside and dx * dx + dy * dy <= (r + FAR_MARGIN) * (r + FAR_MARGIN) then
         far.queue[#far.queue + 1] = { key, c, dx * dx + dy * dy }
       end
     end

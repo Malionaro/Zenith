@@ -33,6 +33,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.dirname(os.path.dirname(HERE))
 OUT = os.path.join(REPO_DIR, "docs", "tracker", "github.json")
 HISTORY = os.path.join(REPO_DIR, "art-src", "tracker", "github_history.json")
+# A sentence or two per issue on the problem and its fix, written by hand (the dashboard's GitHub tab shows them).
+NOTES = os.path.join(REPO_DIR, "docs", "tracker", "issue_notes.json")
 PORTAL = "https://mods.factorio.com/api/mods/factorio-3d-bridge"
 
 
@@ -163,9 +165,18 @@ def main():
         rows.append({"kind": "referrer", "referrer": r["referrer"], "views": r["count"], "uniques": r["uniques"]})
     for p in paths[:10]:
         rows.append({"kind": "path", "path": p["path"], "views": p["count"], "uniques": p["uniques"]})
+    notes = {}
+    if os.path.exists(NOTES):
+        with open(NOTES, encoding="utf-8") as f:
+            notes = json.load(f)
     for i in issues:
-        rows.append({"kind": "issue", "number": i["number"], "title": i["title"], "state": i["state"],
-                     "created": day_of(i["created_at"]), "closed": day_of(i["closed_at"])})
+        row = {"kind": "issue", "number": i["number"], "title": i["title"], "state": i["state"],
+               "created": day_of(i["created_at"]), "closed": day_of(i["closed_at"])}
+        note = notes.get(str(i["number"]), {})
+        for k in ("problem", "fix"):
+            if note.get(k):
+                row[k] = note[k]
+        rows.append(row)
     rows.append({
         "kind": "summary", "stars": info["stargazers_count"], "forks": info["forks_count"],
         "watchers": info.get("subscribers_count"), "open_issues": sum(1 for i in issues if i["state"] == "open"),

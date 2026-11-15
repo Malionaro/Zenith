@@ -33,8 +33,13 @@ const FactorioLeafShader := preload("res://shaders/factorio_material_leaf.gdshad
 const CHUNK := 32
 ## A chunk is merged once its nearest point is this far from the camera (tiles), or the sun's shadow
 ## distance if that is further (past it shadows fade out, so the simpler shapes casting them don't
-## show), and drawn in full again once nearer than that less SLACK.
+## show), but no further than MERGE_CAP, and drawn in full again once nearer than that less SLACK.
 const MERGE_FROM := 128.0
+## The furthest the shadow distance pushes the merge out (tiles): with Settings > Graphics > Shadow
+## distance at 400 the fitted distance ran to 250-400 zoomed out, so nothing in view was merged there.
+## Between the cap and the shadows' end a merged chunk casts the merged mesh's shadow, simplified by
+## a pixel or two there (CELL). --far-merge-cap=<tiles> sets it, 0 as before 0.2.1 (no cap).
+const MERGE_CAP := 192.0
 const SLACK := 24.0
 ## Chunks within this distance of the focus (tiles) are always drawn in full: the character's
 ## surroundings animate and are what the player works on, however far the camera is pulled back.
@@ -63,6 +68,7 @@ enum { IDLE, ASKED, GATHERING, WAITING, MERGING }
 var enabled := true
 ## --far-merge-from=<tiles>: merge from this distance instead (screenshots of merged buildings up close).
 var merge_from := 0.0
+var merge_cap := MERGE_CAP
 var world  # world.gd
 
 ## Per mesh: its Bake (done or not), and whether it can be merged at all.
@@ -453,6 +459,8 @@ func _ready() -> void:
 	for arg in OS.get_cmdline_user_args():
 		if arg.begins_with("--far-merge-from="):
 			merge_from = float(arg.get_slice("=", 1))
+		elif arg.begins_with("--far-merge-cap="):
+			merge_cap = float(arg.get_slice("=", 1))
 
 
 func _exit_tree() -> void:
@@ -670,7 +678,8 @@ func _decide(delta: float) -> void:
 	_pass_focus = world.focus()
 	_pass_from = MERGE_FROM
 	if world.sun != null:
-		_pass_from = maxf(_pass_from, world.sun.directional_shadow_max_distance)
+		var shadows: float = world.sun.directional_shadow_max_distance
+		_pass_from = maxf(_pass_from, minf(shadows, merge_cap) if merge_cap > 0.0 else shadows)
 	if merge_from > 0.0:
 		_pass_from = merge_from
 	_far_count = 0

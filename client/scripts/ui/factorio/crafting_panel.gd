@@ -183,16 +183,20 @@ func _tip_lines(r: Dictionary) -> Array:
 	return recipe_tip_lines(model, r)
 
 
-static func recipe_tip_lines(m, r: Dictionary) -> Array:
+## `inventory`: measured against the character's inventory (hand-crafting, the queue). An ingredient
+## is red, as have/need, only when it is neither held nor hand-craftable from what is held (J16:
+## ui_model.short_ingredients); a Total raw item red, as have/need, when fewer are held than one
+## craft breaks down to. Without (an assembler's recipe chooser, J14) nothing is red.
+static func recipe_tip_lines(m, r: Dictionary, inventory := true) -> Array:
 	var lines: Array = []
+	var short: Dictionary = m.short_ingredients(r) if inventory else {}
 	if not r.get("ingredients", []).is_empty():
 		lines.append(["Ingredients:"])
 		for ing in r["ingredients"]:
 			if ing is Array and ing.size() >= 2:
-				var have: int = m.count_of(str(ing[0]))
-				var short := have < float(ing[1])
-				var amount := ("%d/%s" % [have, _amount(float(ing[1]))]) if short else _amount(float(ing[1]))
-				lines.append(["%s × %s" % [amount, Kit.pretty(str(ing[0]))], str(ing[0]), Kit.RED_TEXT if short else Kit.WHITE])
+				var missing := short.has(str(ing[0]))
+				var amount := ("%d/%s" % [int(short[str(ing[0])]), _amount(float(ing[1]))]) if missing else _amount(float(ing[1]))
+				lines.append(["%s × %s" % [amount, Kit.pretty(str(ing[0]))], str(ing[0]), Kit.RED_TEXT if missing else Kit.WHITE])
 	if float(r.get("energy", -1.0)) >= 0.0:
 		lines.append(["⏱ %s s Crafting time" % str(snappedf(float(r["energy"]), 0.01))])
 	var products: Array = r.get("products", [])
@@ -201,7 +205,7 @@ static func recipe_tip_lines(m, r: Dictionary) -> Array:
 		for p in products:
 			if p is Array and p.size() >= 2:
 				lines.append(["%s × %s" % [_amount(float(p[1])), Kit.pretty(str(p[0]))], str(p[0])])
-	var raw: Dictionary = m.total_raw(str(r.get("name", "")))
+	var raw: Dictionary = m.total_raw(str(r.get("name", "")), r)
 	if bool(raw["too_complex"]):
 		lines.append(["Total raw:"])
 		lines.append(["Too complex to calculate", "", Kit.DISABLED_TEXT])
@@ -212,7 +216,12 @@ static func recipe_tip_lines(m, r: Dictionary) -> Array:
 		var names: Array = raw["items"].keys()
 		names.sort()
 		for item in names:
-			lines.append(["%s × %s" % [_amount(float(raw["items"][item])), Kit.pretty(str(item))], str(item)])
+			var need := float(raw["items"][item])
+			var have: int = m.count_of(str(item)) if inventory else 0
+			if inventory and have < need:
+				lines.append(["%d/%s × %s" % [have, _amount(need), Kit.pretty(str(item))], str(item), Kit.RED_TEXT])
+			else:
+				lines.append(["%s × %s" % [_amount(need), Kit.pretty(str(item))], str(item)])
 	return lines
 
 
@@ -221,11 +230,16 @@ static func _amount(v: float) -> String:
 
 
 ## Red when the inventory can't make it (only known with ingredient data), with the count it can.
+## The tooltip's lines are worked out as it opens (J16 follows intermediates: too much to do for
+## every slot on each inventory change).
 func _style_recipe(s: Slot, r: Dictionary) -> void:
 	var n: int = r["craftable"]
 	s.theme_type_variation = "FRedSlotButton" if n == 0 else "FSlotButton"
 	s.count = n if n > 0 else -1
-	s.set_tip("%s (Recipe)" % Kit.recipe_name(str(r["name"])), _tip_lines(r))
+	var name := str(r["name"])
+	s.set_tip("%s (Recipe)" % Kit.recipe_name(name))
+	if not s.tip_fn.is_valid():
+		s.tip_fn = func() -> Array: return _tip_lines(model.recipe(name))
 	s.queue_redraw()
 
 

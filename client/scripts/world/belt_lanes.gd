@@ -126,6 +126,8 @@ var covered := Vector3(0.0, 0.0, -1.0)
 var sync := false
 
 var _chunks := {}  # Vector2i -> Node3D (a MultiMeshInstance3D per item)
+## Counts the chunks made and dropped: belt_items.gd lists built_chunks() for its jobs only when it moved.
+var chunks_ver := 0
 ## belt_items.gd's hand-over (hand_over()): chunks whose icons stay hidden while near items still
 ## wait in them, and item ids whose near look isn't made yet (their icons aren't left out).
 var _held := {}
@@ -260,7 +262,46 @@ class IconJob:
 			textures[item] = ItemIcons.load_uncached(names[item])
 
 
+## --belt-lanes-dump=<file> (a diagnostic, tools/belt_quirks.py): a JSON line each time a chunk's icons
+## are made ("c", "i": item id -> [icon x, z, belt x, z, ...]) or dropped ("d"), the shader's square
+## and distance change ("p": [centre x, y, near, far], "held", "unknown"), and every DUMP_CAM_USEC the
+## camera's whole ground view ("g": its four corners, not cut at belt_items.gd's VIEW_FAR), each with
+## the time ("u", Time.get_ticks_usec, as draw.bin.apply.jsonl's).
+var _dump: FileAccess = null
+var _dump_cam_usec := 0
+const DUMP_CAM_USEC := 250000
+
+
+func _dump_line(d: Dictionary) -> void:
+	d["u"] = Time.get_ticks_usec()
+	_dump.store_line(JSON.stringify(d))
+
+
+func _dump_cam() -> void:
+	var cam := get_viewport().get_camera_3d() if is_inside_tree() else null
+	if cam == null:
+		return
+	var vp := get_viewport().get_visible_rect().size
+	var g: Array = []
+	for c in [Vector2.ZERO, Vector2(vp.x, 0.0), vp, Vector2(0.0, vp.y)]:
+		var ro := cam.project_ray_origin(c)
+		var n := cam.project_ray_normal(c)
+		var hit: Vector3
+		if n.y < -1e-4 and (0.0 - ro.y) / n.y <= 4000.0:
+			hit = ro + n * ((0.0 - ro.y) / n.y)
+		else:
+			var h := Vector2(n.x, n.z)
+			h = h.normalized() if h.length() > 1e-6 else Vector2(1.0, 0.0)
+			hit = Vector3(ro.x + h.x * 4000.0, 0.0, ro.z + h.y * 4000.0)
+		g.append_array([snappedf(hit.x, 0.01), snappedf(hit.z, 0.01)])
+	_dump_line({"g": g, "cam": [snappedf(cam.global_position.x, 0.01), snappedf(cam.global_position.y, 0.01), snappedf(cam.global_position.z, 0.01)],
+		"fps": Engine.get_frames_per_second(), "process_ms": snappedf(Performance.get_monitor(Performance.TIME_PROCESS) * 1000.0, 0.01)})
+
+
 func _ready() -> void:
+	for a in OS.get_cmdline_user_args():
+		if a.begins_with("--belt-lanes-dump="):
+			_dump = FileAccess.open(a.substr(len("--belt-lanes-dump=")), FileAccess.WRITE)
 	_quad.size = Vector2(ICON, ICON)
 	_quad.orientation = PlaneMesh.FACE_Y
 	# The first material made with the lane shader cost 21 ms on the main thread (Godot sets the
@@ -335,6 +376,10 @@ func _process(_delta: float) -> void:
 	# queues the material's uniforms to be sent again), while the square moves once an update.
 	if [hand_over_centre(), near_edge(), distance, _materials.size(), _model_materials.size()] != _params_key:
 		_set_params()
+	if _dump != null and Time.get_ticks_usec() - _dump_cam_usec >= DUMP_CAM_USEC:
+		_dump_cam_usec = Time.get_ticks_usec()
+		_dump_cam()
+		_dump.flush()
 
 
 ## Automatic: once a second, from the frames' time over the last second or two (their slowest
@@ -387,6 +432,11 @@ func _set_params() -> void:
 	var centre := hand_over_centre()
 	var edge := near_edge()
 	_params_key = [centre, edge, distance, _materials.size(), _model_materials.size()]
+	if _dump != null:
+		var held: Array = []
+		for c in _held:
+			held.append_array([c.x, c.y])
+		_dump_line({"p": [centre.x, centre.y, edge, float(distance)], "held": held, "unknown": _unknown.keys()})
 	for mats: Dictionary in [_materials, _model_materials]:
 		for item in mats:
 			var m: ShaderMaterial = mats[item]
@@ -564,8 +614,11 @@ func _apply_some(usec: int) -> void:
 
 
 func _make(c: Vector2i, by_item: Dictionary) -> void:
-	_drop(c)
+	var had := _chunks.has(c)
+	_drop(c, false)
 	if by_item.is_empty() or (world != null and not world.chunks.has(c)):
+		if had:
+			chunks_ver += 1
 		return
 	var node := Node3D.new()
 	node.name = "Lanes %d,%d" % [c.x, c.y]
@@ -587,6 +640,17 @@ func _make(c: Vector2i, by_item: Dictionary) -> void:
 		node.add_child(inst)
 	node.visible = not _held.has(c)
 	add_child(node)
+	if _dump != null:
+		var icons := {}
+		for item in by_item:
+			var buf: PackedFloat32Array = by_item[item]
+			var flat: Array = []
+			for k in range(0, buf.size(), STRIDE):
+				flat.append_array([snappedf(buf[k + 3], 0.01), snappedf(buf[k + 11], 0.01), snappedf(buf[k + 12], 0.01), snappedf(buf[k + 13], 0.01)])
+			icons[str(item)] = flat
+		_dump_line({"c": [c.x, c.y], "i": icons})
+	if not had:
+		chunks_ver += 1
 	_chunks[c] = node
 
 
@@ -600,11 +664,15 @@ func icons_in(c: Vector2i) -> int:
 	return n
 
 
-func _drop(c: Vector2i) -> void:
+func _drop(c: Vector2i, count := true) -> void:
 	var node: Node3D = _chunks.get(c)
 	if node != null:
 		node.queue_free()
 		_chunks.erase(c)
+		if count:
+			chunks_ver += 1
+		if _dump != null:
+			_dump_line({"d": [c.x, c.y]})
 
 
 func _model_material(item: int) -> ShaderMaterial:

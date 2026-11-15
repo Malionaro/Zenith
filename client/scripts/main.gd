@@ -29,11 +29,15 @@ extends Node3D
 ## Settings (user://settings.cfg) and the menu's own options: scripts/menu/settings.gd, front_end.gd.
 
 const ModelLods := preload("res://scripts/world/model_lods.gd")
+const Visuals := preload("res://scripts/world/visuals.gd")
 const WorldMirror := preload("res://scripts/world/world.gd")
 const MomentHold := preload("res://scripts/world/moment_hold.gd")
 const UpsGovernor := preload("res://scripts/world/ups_governor.gd")
+const Probing := preload("res://scripts/debug/probing.gd")
+const ShaderWarmup := preload("res://scripts/world/shader_warmup.gd")
 const MoverLayer := preload("res://scripts/world/movers.gd")
 const RemoteFog := preload("res://scripts/world/remote_fog.gd")
+const Pollution := preload("res://scripts/world/pollution.gd")
 const BeltItemLayer := preload("res://scripts/world/belt_items.gd")
 const BeltLaneLayer := preload("res://scripts/world/belt_lanes.gd")
 const GroundItemLayer := preload("res://scripts/world/ground_items.gd")
@@ -79,7 +83,7 @@ const InterfaceState := preload("res://scripts/ui/interface_state.gd")
 const ViewPriority := preload("res://scripts/world/view_priority.gd")
 
 ## Options that start a game at once, without the menu.
-const DIRECT_OPTIONS := ["--factorio-port=", "--port=", "--open=", "--ui=", "--ui-sample", "--ui-hold=",
+const DIRECT_OPTIONS := ["--factorio-port=", "--factorio-host=", "--port=", "--open=", "--ui=", "--ui-sample", "--ui-hold=",
 	"--ui-craft=", "--ui-hover=", "--ui-press=", "--camera=", "--fx-demo", "--no-menu"]
 const PlatformPanel := preload("res://scripts/ui/factorio/platform_panel.gd")
 const PlayerTags := preload("res://scripts/world/player_tags.gd")
@@ -87,6 +91,7 @@ const PlanetSky := preload("res://scripts/world/sky.gd")
 const PlanetSpin := preload("res://scripts/world/planet_spin.gd")
 const Looks := preload("res://scripts/world/looks.gd")
 const BeltBlur := preload("res://scripts/world/belt_blur.gd")
+const PickUp := preload("res://scripts/world/pick_up.gd")
 const VrSession := preload("res://scripts/vr/vr_session.gd")
 const SPACE_SKY := preload("res://shaders/space_sky.gdshader")
 ## Roughly each planet's colour from orbit, for the space backdrop.
@@ -98,6 +103,7 @@ const PLANET_COLORS := {
 var world: WorldMirror
 var movers: MoverLayer
 var remote_fog: RemoteFog
+var pollution: Pollution  # dying trees, green lakes and smog where the chunks are polluted (I15)
 var belt_items: BeltItemLayer
 var belt_lanes: BeltLaneLayer
 var ground_items: GroundItemLayer
@@ -203,6 +209,11 @@ func _ready() -> void:
 	# monitor, so a resize (or the window going to another monitor) can change them.
 	get_tree().root.size_changed.connect(func() -> void: Settings.apply_window_scales(get_tree().root))
 	Settings.apply_window_scales(get_tree().root)
+	# Godot's own levels of detail count the window's real pixels, up to ModelLods.max_lines.
+	get_tree().root.size_changed.connect(func() -> void: ModelLods.fit_lines(get_tree().root))
+	# --warm-shaders=loaded|all: the world's shaders used once now, so the first item, robot, clutter
+	# and character don't wait for their shaders' compiles in the frame they appear (shader_warmup.gd).
+	ShaderWarmup.start(self)
 
 	Bridge.welcomed.connect(_on_welcome)
 	Bridge.message_received.connect(_on_message)
@@ -237,8 +248,9 @@ func _ready() -> void:
 			direct = true
 	if direct:
 		start_game()
-		Bridge.connect_to("127.0.0.1", Bridge.factorio_port, Bridge.listen_port)
-		front_end.open_direct("127.0.0.1:%d" % Bridge.factorio_port)
+		# --factorio-host=<another PC>: through the relay there (bridge.gd); else this PC's bridge.
+		Bridge.connect_to(Bridge.factorio_host, Bridge.factorio_port, Bridge.listen_port)
+		front_end.open_direct("%s:%d" % [Bridge.factorio_host, Bridge.factorio_port])
 	else:
 		front_end.open_menu()
 
@@ -295,14 +307,28 @@ func _land_later(delay: float) -> void:
 
 ## A console command from the chat (/...): over RCON when this client started the server.
 func _run_command(command: String) -> String:
-	if not _has_rcon():
-		return "Commands need RCON: start the server from this client's menu"
-	return await front_end.launcher.rcon.run(get_tree(), command)
+	var rcon = _rcon()
+	if rcon == null:
+		return "Commands need RCON: start the server from this client's menu, or give the RCON password when connecting to a server on another PC whose relay carries it"
+	return await rcon.run(get_tree(), command)
 
 
 func _has_rcon() -> bool:
-	var launcher = front_end.launcher if front_end != null else null
-	return launcher != null and launcher.is_running() and launcher.rcon.is_open()
+	return _rcon() != null
+
+
+## The server's RCON when open: the menu's own server's, or a server on another PC's through its relay
+## (front_end.gd remote_rcon); null when there is none.
+func _rcon():
+	if front_end == null:
+		return null
+	var launcher = front_end.launcher
+	if launcher != null and launcher.is_running() and launcher.rcon.is_open():
+		return launcher.rcon
+	var remote = front_end.remote_rcon
+	if remote != null and remote.is_open():
+		return remote
+	return null
 
 
 func in_game() -> bool:
@@ -332,7 +358,7 @@ func start_game() -> void:
 
 	ups_governor = UpsGovernor.new()
 	ups_governor.name = "UpsGovernor"
-	ups_governor.changed.connect(_apply_game_settings)
+	ups_governor.changed.connect(_on_governor_changed)
 	ups_governor.budget_changed.connect(Bridge.set_work_budget)
 	_game.add_child(ups_governor)
 
@@ -340,6 +366,9 @@ func start_game() -> void:
 	remote_fog.name = "RemoteFog"
 	_game.add_child(remote_fog)
 	movers.fog = remote_fog
+	pollution = Pollution.new()
+	pollution.name = "Pollution"
+	_game.add_child(pollution)
 	for arg in OS.get_cmdline_user_args():
 		if arg.begins_with("--robot-probe="):
 			var probe: Node = preload("res://scripts/debug/robot_probe.gd").new()
@@ -431,6 +460,7 @@ func start_game() -> void:
 	arms.name = "InserterArms"
 	arms.protos = world.protos
 	arms.world = world
+	arms.belts = belt_items  # drawn at the belts' tick
 	_game.add_child(arms)
 
 	lamps = LampLayer.new()
@@ -501,6 +531,7 @@ func start_game() -> void:
 	hud.ui.has_rcon = _has_rcon
 	hud.ui.debug_menu.main = self  # its benchmarks and tests drive the world, camera and probes
 	remote_fog.model = hud.ui.model  # roboports reveal under the remote view's fog too (H13)
+	arms.eprops = hud.ui.model.eprops  # inserters' pickup/drop vectors and hand speeds, for the swing model
 
 	rockets = RocketLayer.new()
 	rockets.name = "Rockets"
@@ -581,6 +612,7 @@ func start_game() -> void:
 	input.combat = combat
 	input.avatar = avatar
 	input.movers = movers
+	input.ground_items = ground_items
 	input.wires = wires
 	input.predicted = predicted
 	_game.add_child(input)
@@ -680,6 +712,17 @@ func loaded_chunks() -> int:
 	return world.loaded_chunk_count() if world != null else 0
 
 
+## What the join's loading screen still waits for (world.gd join_left): 0 when ready to play.
+func join_left() -> int:
+	return world.join_left() if world != null else 0
+
+
+## The join's loading screen is up (front_end.gd) or gone.
+func set_joining(on: bool) -> void:
+	if world != null:
+		world.set_joining(on)
+
+
 ## Factorio's UI scale keys work everywhere, in the menus too (Ctrl+= / Ctrl+- / Ctrl+0).
 func _unhandled_key_input(event: InputEvent) -> void:
 	if not event.is_pressed() or event.is_echo():
@@ -725,51 +768,95 @@ func _apply_clouds(_look := "") -> void:
 func _apply_game_settings() -> void:
 	if _game == null:
 		return
+	var tp := Time.get_ticks_usec()
 	looks.lift()
 	Settings.apply_environment(_env)
+	Probing.add("gs_env", tp)
+	tp = Time.get_ticks_usec()
 	_sun.shadow_enabled = Settings.shadow_size() > 0
 	if _sun.shadow_enabled:
 		# Atlas, splits, distance (fitted to the view), blending and filter by quality (sun_shadows.gd).
 		sun_shadows.distance_cap = clampf(float(Settings.get_value("graphics", "shadow_distance")), 0.0, 1000.0)
 		sun_shadows.apply_quality(str(Settings.get_value("graphics", "shadows")))
 	Settings.apply_ssao(_env)
+	Probing.add("gs_shadows_ssao", tp)
+	tp = Time.get_ticks_usec()
 	ContactShade.set_enabled(bool(Settings.get_value("graphics", "contact_shading")), world.chunks.values())
+	Probing.add("gs_contact", tp)
+	tp = Time.get_ticks_usec()
 	looks.settle(str(Settings.get_value("graphics", "look")))
+	Probing.add("gs_look", tp)
+	tp = Time.get_ticks_usec()
 	_apply_clouds()
-	# Every distance the bridge works for in the game's tick, under the player's own setting while the
-	# UPS governor holds it back (ups_governor.gd).
-	var held := ups_governor
-	world.view_radius = clampi(int(held.limit("view", float(Settings.get_value("graphics", "view_radius")))), 1, WorldMirror.MAX_VIEW_RADIUS)
+	Probing.add("gs_clouds", tp)
+	tp = Time.get_ticks_usec()
 	ModelLods.apply_quality(str(Settings.get_value("graphics", "lod_quality")), get_viewport())
+	Visuals.set_ground_relief(str(Settings.get_value("graphics", "lod_quality")) != "low")
 	world.far_chunks.enabled = bool(Settings.get_value("graphics", "merge_far"))
 	var animate_cards := bool(Settings.get_value("graphics", "animate_mod_buildings"))
 	if SpriteStandins.animate != animate_cards:
 		SpriteStandins.animate = animate_cards
 		SpriteStandins.clear()  # the cards are made again, still or moving
-	belt_lanes.distance = clampi(int(held.limit("far", float(Settings.get_value("graphics", "belt_distance")))), 0, 640)
-	# Items move as far out as the cap allows, within the distance (an add-on may ask for less: near).
-	belt_lanes.near = clampi(int(held.limit("near", float(belt_lanes.distance))), 0, BeltLaneLayer.MOVING_MAX)
-	belt_lanes.cap = BeltLaneLayer.cap_of(held.limit("updates", BeltLaneLayer.cap_wanted(float(Settings.get_value("graphics", "belt_updates")))))
+	Probing.add("gs_models", tp)
+	tp = Time.get_ticks_usec()
 	# Automatic: belt_lanes.gd moves its own cap with the room there is, under the governor's hold.
 	belt_lanes.auto = int(Settings.get_value("graphics", "belt_updates")) == BeltLaneLayer.AUTO
-	belt_lanes.updates_hold = held.limit("updates", BeltLaneLayer.UNLIMITED)
-	belt_lanes.governor = held
-	belt_lanes.smooth = bool(Settings.get_value("graphics", "belt_smooth")) and held.limit("smooth", 1.0) >= 1.0
+	belt_lanes.governor = ups_governor
+	Probing.add("gs_belts", tp)
+	tp = Time.get_ticks_usec()
 	decoratives.set_options(bool(Settings.get_value("graphics", "decoratives")), float(Settings.get_value("graphics", "decorative_density")))
 	decoratives.distance = clampf(float(Settings.get_value("graphics", "decorative_distance")), 32.0, 320.0)
 	decoratives.set_grass(str(Settings.get_value("graphics", "grass_3d")))
 	Bridge.decoratives = decoratives.enabled
+	Bridge.decorative_distance = int(decoratives.distance)
 	Bridge.mod_windows = bool(Settings.get_value("interface", "mod_windows"))
-	world.set_focus_radius(clampi(int(held.limit("entity", float(Settings.get_value("graphics", "entity_radius")))), 16, 256))
-	hud.ui.map_cache.refresh_scale = held.limit("map", 1.0)
-	Bridge.set_update_rate(int(held.limit("rate", 0.0)))
-	Settings.fps_hold = int(held.limit("fps", 0.0))
-	Engine.max_fps = Settings.fps_limit()
+	InserterArmLayer.read_flags(OS.get_cmdline_user_args())
+	Bridge.inserter_events = InserterArmLayer.hello_ie()
+	Bridge.inserter_handoff = InserterArmLayer.wants_handoff()
+	Probing.add("gs_decoratives", tp)
+	_apply_held()
+	tp = Time.get_ticks_usec()
 	if Bridge.world_ready:
 		_apply_priority()
 	hud.help.visible = bool(Settings.get_value("interface", "show_help"))
 	hud.ui.debug_overlay = bool(Settings.get_value("interface", "debug_overlay"))
 	rig.apply_settings()
+	Probing.add("gs_rest", tp)
+
+
+## Every distance and rate the bridge works for in the game's tick, under the player's own setting
+## while the UPS governor holds it back (ups_governor.gd): what a governor step changes. A step used
+## to apply every setting again (_apply_game_settings: the look, environment, shadows, clouds, contact
+## shading over every chunk, the models' quality...): a 2.5 s frame once a join at -62,-26, when the
+## governor stepped down while the world was still loading. --governor-apply=all does that still.
+func _apply_held() -> void:
+	var tp := Time.get_ticks_usec()
+	var held := ups_governor
+	world.view_radius = clampi(int(held.limit("view", float(Settings.get_value("graphics", "view_radius")))), 1, WorldMirror.MAX_VIEW_RADIUS)
+	belt_lanes.distance = clampi(int(held.limit("far", float(Settings.get_value("graphics", "belt_distance")))), 0, 640)
+	# Items move as far out as the cap allows, within the distance (an add-on may ask for less: near).
+	belt_lanes.near = clampi(int(held.limit("near", float(belt_lanes.distance))), 0, BeltLaneLayer.MOVING_MAX)
+	belt_lanes.cap = BeltLaneLayer.cap_of(held.limit("updates", BeltLaneLayer.cap_wanted(float(Settings.get_value("graphics", "belt_updates")))))
+	belt_lanes.updates_hold = held.limit("updates", BeltLaneLayer.UNLIMITED)
+	belt_lanes.smooth = bool(Settings.get_value("graphics", "belt_smooth")) and held.limit("smooth", 1.0) >= 1.0
+	Probing.add("gs_held_belts", tp)
+	tp = Time.get_ticks_usec()
+	world.set_focus_radius(clampi(int(held.limit("entity", float(Settings.get_value("graphics", "entity_radius")))), 16, 256))
+	hud.ui.map_cache.refresh_scale = held.limit("map", 1.0)
+	Bridge.set_update_rate(int(held.limit("rate", 0.0)))
+	Settings.fps_hold = int(held.limit("fps", 0.0))
+	Engine.max_fps = Settings.fps_limit()
+	Probing.add("gs_held_rest", tp)
+
+
+## The governor stepped (ups_governor.changed).
+func _on_governor_changed() -> void:
+	if _game == null:
+		return
+	if Settings.arg_value("--governor-apply=") == "all":
+		_apply_game_settings()
+	else:
+		_apply_held()
 
 
 ## Screenshots saved so far (--screenshot): reading the frame back and encoding the PNG stalls that
@@ -826,40 +913,132 @@ func _forward_while_joining() -> void:
 		GameSwap.show_client(false)
 
 
+## A server on another PC: its mods' graphics are read from this PC's copies (mod_files.gd: Factorio's own
+## mods folder, or --factorio-mods=<folder>), which a server elsewhere doesn't share. Said once a game,
+## once the bridge's list of mods has been looked for here: their buildings without a copy are drawn as
+## stand-ins (or not at all).
+var _mods_told := ""
+
+
+func _tell_missing_mods() -> void:
+	var waited := 0
+	while not ModFiles.is_ready() and waited < 600:
+		await get_tree().process_frame
+		waited += 1
+	if _game == null or not ModFiles.is_ready():
+		return
+	var missing: PackedStringArray = ModFiles.missing_mods()
+	var key := ",".join(missing)
+	if missing.is_empty() or key == _mods_told:
+		return
+	_mods_told = key
+	var names := ", ".join(missing.slice(0, 5)) + (" and %d more" % (missing.size() - 5) if missing.size() > 5 else "")
+	print("The server's mods not found on this PC (%d): %s. Looked in: %s" % [missing.size(), ", ".join(missing), ", ".join(ModFiles.mods_dirs())])
+	hud.show_message("The server is on another PC and %d of its mods aren't on this one (%s): what they add is drawn without their graphics. Install them in Factorio here, or copy the server's mods folder and start Zenith with --factorio-mods=<folder>." % [missing.size(), names])
+
+
 ## Settings > Graphics > Give the server the CPU first (`--server-first=on|off`, on): with the server on
-## this PC (connected to 127.0.0.1, localhost or ::1), the client's process runs at below-normal priority
+## this PC (connected to 127.0.0.1, localhost or ::1; not a server on another PC through its relay, which
+## takes nothing from this PC's cores), the client's process runs at below-normal priority
 ## from the welcome on, so Factorio's tick gets a core first whenever every core is busy. Measured on
 ## the owner's 4-core PC at -62,-26 (tmp_ups probe, docs/RUNNING.md): the join's first 75 s (the bridge's
 ## first load, the client's chunks and movers; Godot's main thread at 85% of a core, the four cores at 90%)
 ## ran the game at 34 UPS median at normal priority and 56 below; steady 59-60 either way, the client's
 ## frame rate unchanged (60, vsync). Hold 60 UPS then steps the bridge down less during the join.
-## Windows: wmic (below normal 16384, normal 32); elsewhere renice. Off puts it back to normal.
+## Elsewhere renice. Windows: a hidden PowerShell sets the process's PriorityClass. It was wmic, which
+## current Windows 11 no longer has: the setting did nothing there and the log said it had (the 0.2.0
+## baseline: the client stayed AboveNormal; set below normal by hand, the bridge took about 1 ms less a
+## tick and the game ran 58.5 UPS instead of 56.3). PowerShell takes a few hundred milliseconds to start,
+## so it isn't waited for: its answer is read from its pipe a few times a second, and the log says what
+## Windows reports once it has. Off puts back the class the process had before (Godot's own, AboveNormal
+## on that PC), else Normal. A change of the setting while one runs waits for it.
 var _priority_low := false
+var _priority_job := {}  # the PowerShell asked (OS.execute_with_pipe), {} when none runs
+var _priority_was := ""  # the class Windows reported before the first change ("": not known yet)
+## What Windows last reported ("" before an answer, "failed" when it couldn't be set): for probes.
+var priority_class := ""
+const PRIORITY_ANSWER_MSEC := 15000
 
 
 func _apply_priority() -> void:
 	var want := bool(Settings.get_value("graphics", "server_first")) and Settings.arg_value("--server-first=") != "off" \
-		and Bridge.factorio_host in ["127.0.0.1", "localhost", "::1"]
+		and Bridge.server_on_this_pc()
 	if want == _priority_low:
 		return
 	_priority_low = want
-	var pid := OS.get_process_id()
 	if OS.get_name() == "Windows":
-		OS.create_process("wmic", ["process", "where", "processid=%d" % pid, "call", "setpriority", "16384" if want else "32"], false)
-	else:
-		OS.create_process("renice", ["-n", "5" if want else "0", "-p", str(pid)], false)
+		if _priority_job.is_empty():
+			_set_priority_windows()
+		return
+	OS.create_process("renice", ["-n", "5" if want else "0", "-p", str(OS.get_process_id())], false)
 	print("server on this PC: the client's process priority %s (Settings > Graphics > Give the server the CPU first)"
 		% ("below normal" if want else "back to normal"))
+
+
+## Asks Windows for the priority class _priority_low says, then again if the setting changed meanwhile.
+func _set_priority_windows() -> void:
+	var low := _priority_low
+	var target := "BelowNormal" if low else (_priority_was if _priority_was != "" else "Normal")
+	# One line back: "ok <class before> <class now>" or "error <why>".
+	var script := ("try { $p = Get-Process -Id %d -ErrorAction Stop; $was = $p.PriorityClass; $p.PriorityClass = '%s'; "
+		+ "$p.Refresh(); 'ok {0} {1}' -f $was, $p.PriorityClass } catch { 'error ' + $_.Exception.Message }") \
+		% [OS.get_process_id(), target]
+	var job := OS.execute_with_pipe("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], false)
+	if job.is_empty():
+		priority_class = "failed"
+		print("server on this PC: PowerShell couldn't be started, so the client's process priority stays as it is "
+			+ "(Settings > Graphics > Give the server the CPU first)")
+		return
+	_priority_job = job
+	print("server on this PC: asking Windows for the client's process priority %s (Settings > Graphics > Give the server the CPU first)" % target)
+	var pid := int(job.get("pid", -1))
+	var io: FileAccess = job.get("stdio")
+	var started := Time.get_ticks_msec()
+	var out := ""
+	while true:
+		await get_tree().create_timer(0.25).timeout
+		var running := OS.is_process_running(pid)
+		# (Non-blocking pipe: "" means nothing more yet. Read once more after it ended, for what it left.)
+		for _i in 16:
+			var line := io.get_line() if io != null else ""
+			if line == "":
+				break
+			out += line
+		if not running:
+			break
+		if Time.get_ticks_msec() - started > PRIORITY_ANSWER_MSEC:
+			OS.kill(pid)
+			out = "error no answer in %d s" % (PRIORITY_ANSWER_MSEC / 1000)
+			break
+	_priority_job = {}
+	var parts := out.strip_edges().split(" ", false)
+	if parts.size() >= 3 and parts[0] == "ok":
+		if _priority_was == "":
+			_priority_was = parts[1]
+		priority_class = parts[2]
+		print("server on this PC: the client's process priority is %s (was %s)%s" % [parts[2], parts[1],
+			"" if parts[2] == target else ", not the %s asked for" % target])
+	else:
+		priority_class = "failed"
+		var why := out.strip_edges().trim_prefix("error ").strip_edges()
+		print("server on this PC: the client's process priority couldn't be set to %s: %s" % [target,
+			why if why != "" else "PowerShell said nothing (exit code %d)" % OS.get_process_exit_code(pid)])
+	if _priority_low != low:
+		_set_priority_windows()
 
 
 func _on_welcome(msg: Dictionary) -> void:
 	if _game == null:
 		return
 	_apply_priority()
+	if not Bridge.server_on_this_pc():
+		_tell_missing_mods()
 	# Started by Ctrl+F9 in Factorio (server/factorio-with-zenith.ps1): come to the front over it.
 	if "--from-factorio" in OS.get_cmdline_user_args() and not _came_from_factorio:
 		_came_from_factorio = true
 		GameSwap.show_client(bool(Settings.get_value("factorio", "minimize_factorio")))
+	# A new handshake (maybe another game): the map's stamps no longer say what the bridge has (`map` h).
+	hud.ui.model.map_stamps.clear()
 	world.reset()
 	world.surface_index = int(msg.get("si", -1))
 	world.replay_dec = decoratives.handle
@@ -874,6 +1053,7 @@ func _on_welcome(msg: Dictionary) -> void:
 	fluids_power.reset()
 	wires.reset()
 	ghosts.reset()
+	pollution.clear()
 	predicted.reset()
 	combat.reset()
 	fx.reset()
@@ -914,6 +1094,7 @@ func _on_surface(msg: Dictionary) -> void:
 	fluids_power.reset()
 	wires.reset()
 	ghosts.reset()
+	pollution.clear()
 	predicted.reset()
 	combat.reset()
 	fx.reset()
@@ -984,6 +1165,11 @@ func _on_message(msg: Dictionary) -> void:
 		"ih":
 			if Bridge.world_ready:
 				arms.handle(msg)
+		"ie":
+			if Bridge.world_ready:
+				arms.handle_events(msg)
+				if InserterArmLayer.wants_handoff():
+					belt_items.handle(msg)
 		"gi":
 			if Bridge.world_ready:
 				ground_items.handle(msg)
@@ -1022,12 +1208,33 @@ func _on_message(msg: Dictionary) -> void:
 		"fl", "pw", "ht":
 			if Bridge.world_ready:
 				fluids_power.handle(msg)
+		"mnd":
+			# J20: what the character just mined, ahead of its `del`: gone from the world now, its items flying
+			# to the character.
+			if Bridge.world_ready:
+				world.mined(msg)
+				hud.ui.mined(msg)
+				if int(msg.get("g", 0)) == 1 and int(msg.get("gi", 0)) != 1:
+					_belt_change(msg, "del")
+		"pku":
+			# Issue #18: what F took, the tick the game gave it: off the ground at once, off a belt by the
+			# inserters' own take on that tick (pick_up.gd), flying to the character.
+			if Bridge.world_ready:
+				for at in PickUp.ground_spots(msg):
+					ground_items.take(at)
+				var takes := PickUp.belt_takes(msg)
+				if not takes.is_empty():
+					belt_items.handle(takes)
+				hud.ui.picked(msg)
 		"surface":
 			_on_surface(msg)
 		"raise":
 			GameSwap.show_client(bool(Settings.get_value("factorio", "minimize_factorio")))
 		"cov":
 			remote_fog.handle(msg)
+		"pol":
+			if int(msg.get("si", -1)) == world.surface_index or world.surface_index < 0:
+				pollution.handle(msg)
 		"plat":
 			platform_panel.handle(msg)
 			if msg.has("k"):
@@ -1043,14 +1250,37 @@ func _on_message(msg: Dictionary) -> void:
 		"gui":
 			hud.screen.handle(msg)
 		"msg":
-			# A research notification names the technology, so it can be shown in the player's language.
+			# A bridge before `rdone` named a finished research here: said the same way (the chime,
+			# the console line, the research panel).
 			if msg.has("tech"):
-				hud.show_message("Research completed: %s" % LocaleNames.technology(str(msg["tech"])))
+				hud.ui.model.handle({"t": "rdone", "l": [[str(msg["tech"]), 0]], "k": msg.get("k", 0)})
 			else:
 				hud.show_message(str(msg.get("text", "")))
 		_:
 			if not hud.ui.model.handle(msg):  # UI data (scripts/ui/factorio/ui_model.gd)
+				var t := str(msg.get("t", ""))
+				if t == "del" or t == "add":
+					_belt_change(msg, t)
 				world.handle(msg)
+
+
+## (K22) A belt taken away (`del`, `mnd`) or built (`add`, not a ghost): the belt layer takes a removed belt's lanes
+## and the items it drew on them away in its next job, unless a belt is built on its tile meanwhile (a fast-replace:
+## the game keeps the items, the bridge's `bs` hands them to the new lanes).
+func _belt_change(msg: Dictionary, t: String) -> void:
+	if t == "del":
+		var p = world.protos.entity(int(msg.get("p", 0)))
+		if p != null and InserterArmLayer.BELT_TYPES.has(p.type):
+			belt_items.belt_removed(int(msg.get("u", 0)), int(msg.get("x", 0)), int(msg.get("y", 0)))
+		return
+	var e = msg.get("e")
+	if not (e is Array and e.size() >= 5):
+		return
+	if e.size() > 5 and e[5] is Dictionary and (e[5] as Dictionary).has("gh"):
+		return
+	var q = world.protos.entity(int(e[1]))
+	if q != null and InserterArmLayer.BELT_TYPES.has(q.type):
+		belt_items.belt_built(int(e[2]), int(e[3]))
 
 
 func _on_connection_lost() -> void:
@@ -1071,6 +1301,7 @@ func _process(delta: float) -> void:
 	# Factorio's remote view: dark fog where no radar sees, and nothing drawn there.
 	world.set_remote_view(hud.ui.remote)
 	remote_fog.update(hud.ui.remote, rig.focus_point())
+	pollution.update(rig.focus_point(), _sky_darkness, delta)
 	_update_sky(delta)
 	_update_planet(delta)
 	_sync_sky_view()
@@ -1162,14 +1393,16 @@ func _update_status(elapsed: float) -> void:
 	_ups_overlay()
 	if Bridge.bind_error != OK:
 		hud.status.text = "Can't open UDP port %d. Is another client already running?" % Bridge.listen_port
+	elif not Bridge.connected and Bridge.via_relay:
+		hud.status.text = "Waiting for Factorio through the relay at %s:%d (%s)\nOn that PC: the server with --enable-lua-udp and the factorio-3d-bridge mod, and python3 server/relay.py (see docs/RUNNING.md, \"Server on another PC\")" % [Bridge.factorio_host, Bridge.factorio_port, Bridge.relay_status()]
 	elif not Bridge.connected:
 		hud.status.text = "Waiting for Factorio on %s:%d\nStart it with --enable-lua-udp %d and the factorio-3d-bridge mod (see docs/RUNNING.md)" % [Bridge.factorio_host, Bridge.factorio_port, Bridge.factorio_port]
 	elif not Bridge.world_ready:
 		hud.status.text = "Connected. Loading prototypes..."
 	else:
-		hud.status.text = "tick %d · %d chunks · %d entities · %d moving · %d on belts · %d on the ground · %d arms · %d lamps lit · %d wires · %d ghosts · %d packets/s · %d gaps · %.1f UPS · %d FPS\nhealth %d · crafting %d · %s" % [
+		hud.status.text = "tick %d · %d chunks · %d entities · %d moving · %d on belts · %d on the ground · %d arms · %d lamps lit · %d wires · %d ghosts · %d packets/s · %d gaps · %d datagrams lost · %.1f UPS · %d FPS\nhealth %d · crafting %d · %s" % [
 			Bridge.server_tick, world.loaded_chunk_count(), world.entity_count(), movers.count(), belt_items.count(), ground_items.count(), arms.count(), lamps.lit_count(), wires.span_count(), ghosts.ghost_count(),
-			int(rate), int(Bridge.stats["gaps"]), _ups, int(Engine.get_frames_per_second()), avatar.health, avatar.craft_queue, fx.status()]
+			int(rate), int(Bridge.stats["gaps"]), int(Bridge.loss["lost"]), _ups, int(Engine.get_frames_per_second()), avatar.health, avatar.craft_queue, fx.status()]
 		var held := ups_governor.status()
 		if held != "":
 			hud.status.text += "\n" + held

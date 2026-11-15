@@ -202,6 +202,10 @@ for _prefix, _ss in (("small-", 0.99), ("medium-", 1.32), ("big-", 1.76)):
                                         "overhang": 1.0 * _ss, "centre": 0.6 * _ss, "sink": 0.3 * _ss}
 SPECS["big-wriggler-pentapod"] = {"size": (1.8, 1.8), "budget": LOGISTICS * 2, "fill": (0.5, 0.5), "overhang": 2.5,
                                   "centre": 0.3, "sink": 0.05}
+# Its strike and corpse (creature_pose.py): the walking model posed, off its position as the
+# sprites have them.
+SPECS["big-wriggler-pentapod-attack"] = dict(SPECS["big-wriggler-pentapod"], base="big-wriggler-pentapod", centre=1.0)
+SPECS["big-wriggler-pentapod-corpse"] = dict(SPECS["big-wriggler-pentapod"], base="big-wriggler-pentapod", centre=1.0)
 # Gleba spawners, measured from their pictures (creature_hull.py): the small one's heap is smaller
 # than its 3x3 box; the corpse is a splash lying round where the big one stood.
 SPECS["gleba-spawner"] = {"size": (5, 5), "budget": MACHINE, "overhang": 0.8, "centre": 0.6, "sink": 0.2}

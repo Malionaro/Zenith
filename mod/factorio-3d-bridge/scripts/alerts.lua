@@ -1,17 +1,38 @@
 -- Factorio's alerts for the bridge's force. LuaPlayer.get_alerts needs a player, which the
 -- bridge's character hasn't, so the same alerts are worked out here: from events (entity
 -- destroyed, under attack, turret firing) and from scans of the force's entities on every
--- surface (turret out of ammo, machines without power or fuel or with their output full, ghosts
--- missing material or robots, damaged buildings without repair packs, trains out of fuel or
--- without a path, platform, asteroid collector and rocket silo problems).
+-- surface (turret out of ammo, machines without power or fuel or with their output full, drills with
+-- nothing left to mine, ghosts missing material or robots, damaged buildings without repair packs,
+-- trains out of fuel or without a path, platform, asteroid collector and rocket silo problems).
 --
 -- Event alerts live in `storage` (written only from events and on_tick). Scan results only feed
 -- the `al` message, so they stay module-local. One kind of scan runs per SCAN_STEP ticks, so a
 -- busy base's cost is spread out.
+--
+-- Machines not connected to any pole (the unplugged icon) round the client's focus don't wait for
+-- the pass (J5: the owner saw the icon come and go late, 10-40 s with the pass's interval and its
+-- length on a big base): fluids_power.lua's read of every electric machine there, once a second,
+-- says which are unplugged, and building or removing a pole or an electric machine has the machines
+-- round it read again the next tick. Either sends `al` at once when the list changed. The pass still
+-- finds them everywhere else.
+--
+-- The same goes for the other warnings Factorio draws over a machine (J22, J27, J28: the owner saw the
+-- no-ammo and no-fuel icons come and go late too): turrets out of ammo, machines out of fuel and drills
+-- with nothing left to mine round the focus come from that once-a-second read (fluids_power.lua reads
+-- every electric type's status for `pw` anyway, and the turrets and burners it leaves out besides), a
+-- turret or burner built or removed has itself read again the next tick, and items put into or taken out
+-- of a building by the character (session.lua: take, put, move, xfer, fast, drop) have the buildings in
+-- its reach read again 2 and 20 ticks after (a burner takes its fuel on its next update). `status_near`
+-- (perf.lua) off: those kinds from the pass alone, as before.
 
 local transport = require("scripts.transport")
 local world = require("scripts.world")
 local puppet = require("scripts.puppet")
+local tracker = require("scripts.tracker")
+local perf = require("scripts.perf")
+local rate = require("scripts.rate")
+local registry = require("scripts.registry")
+local fluids_power = require("scripts.fluids_power")
 
 local M = {}
 
@@ -21,12 +42,16 @@ local PER_KIND = 40          -- entities listed per kind (the count is the full 
 local GHOSTS_MAX = 3000      -- ghosts looked at per pass
 local CHUNKS_PER_TICK = 32   -- the entity pass's budget per tick: chunks looked in,
 local ENTITIES_PER_TICK = 40 -- and entities checked (a ghost counts 4)
-local PASS_INTERVAL = 600    -- a pass starts at most this often (a large real save: ~0.35 ms a tick for ~7 s)
+-- A pass starts at most this often (the owner's save: ~0.35 ms a tick for ~7 s; at its belts, Zenith Test,
+-- the pass fills the interval, 0.6 ms a tick); under `rate` level 2 and 3 it waits 2 and 4 times as
+-- long between passes (rate.lua's `al`: machines without power, output full, turrets out of ammo show
+-- 20-40 s late instead of 10), one of the jobs that pay for the belt updates keeping their 6 ticks.
+local PASS_INTERVAL = 600
 -- How long an event alert stays after its last event (ticks); Factorio's own timings aren't in
 -- the API, these are close to what the game shows.
 local LIFETIME = { destroyed = 30 * 60, attack = 5 * 60, fire = 5 * 60 }
 
--- Machines whose status says no power, no fuel or output full.
+-- Machines whose status says no power, no fuel, output full or nothing to mine.
 local PASS_TYPES = { "ammo-turret", "entity-ghost", "assembling-machine", "furnace", "mining-drill", "lab", "inserter",
   "boiler", "beacon", "radar", "rocket-silo", "asteroid-collector", "agricultural-tower", "burner-generator", "reactor",
   "pump", "roboport" }
@@ -171,10 +196,12 @@ end
 -- Factorio's warnings over machines: unplugged (no pole reaches it), no fuel, output full. No power
 -- and low power aren't listed: Factorio has no alert for them, and the client draws the no-power
 -- icon from `pw` (fluids_power.lua); 2.1 says no_power for a machine no pole reaches, hence the read.
+-- A drill with nothing left to mine is Factorio's resources-depleted icon (J27): no alert in its bar, an icon
+-- over the drill.
 local STATUS_KINDS = { no_power = "no_power", not_plugged_in_electric_network = "unplugged", no_fuel = "no_fuel",
-  full_output = "output_full", full_burnt_result_output = "output_full" }
+  full_output = "output_full", full_burnt_result_output = "output_full", no_minable_resources = "depleted" }
 local PASS_KINDS = { "no_ammo", "unplugged", "no_fuel", "output_full", "launch", "collector",
-  "no_material", "no_robots" }
+  "no_material", "no_robots", "depleted" }
 
 local function networks_at(e)
   local ok, nets = pcall(function() return e.surface.find_logistic_networks_by_construction_area(e.position, e.force) end)
@@ -240,8 +267,282 @@ local pass
 
 local next_pass = 0
 
+-- alerts_quiet (perf.lua): most chunks of a surface hold none of the force's machines (0.36 ms on 97% of
+-- the owner's ticks went on them). A chunk the pass found none in is looked in again only every
+-- EMPTY_EVERY'th pass, or once something is built, mined or changed there (tracker.listeners); a pass
+-- passing over one counts it as EMPTY_COST of a chunk. And the pass steps once a tick, not once per
+-- client (its results only feed `al`, so module-local is fine). empty: "si,cx,cy" -> true.
+local EMPTY_EVERY = 10
+local EMPTY_COST = 0.25
+local empty = {}
+local passes = 0
+local stepped_at = -1
+
+local function chunk_of(si, x, y)
+  return si .. "," .. math.floor(x / 32) .. "," .. math.floor(y / 32)
+end
+
+---------------------------------------------------------------------------------------------
+-- Warnings over machines round the focus (J5, J22, J27, J28), kept in the client's state from on_tick
+-- reads: storage.f3d.al_near = {si, x0, y0, x1, y1 (the square fluids_power read, 1/256 tiles), and per
+-- kind its field (NEAR) = {unit -> entity}}; al_spots, [{x, y, t, r}]: where something was built or
+-- removed, or the character moved items, since (from events and commands), looked at again once the
+-- tick is past t, r tiles round (nil: the widest pole's reach).
+
+-- The kinds read round the focus, by their field in al_near (u: J5's, as saves have it).
+local NEAR = { unplugged = "u", no_fuel = "f", no_ammo = "a", depleted = "d" }
+-- What their entries say after the entity (as the pass's: its status, or nothing for a turret).
+local NEAR_EXTRA = { no_fuel = "no_fuel", depleted = "no_minable_resources" }
+
+-- Spots looked at again a tick, at most (a drag of poles or inserters makes one each).
+local SPOTS_PER_TICK = 8
+local SPOTS_MAX = 64
+-- Burners and turrets built or removed: themselves read again (tiles round them).
+local STATUS_SPOT = 2
+-- Items moved by the character: the buildings in its reach read again these ticks after, and this much
+-- further than its reach (the reach is measured to a building's edge, the read finds it by its box).
+local HAND_LOOKS = { 2, 20 }
+local HAND_SLACK = 3
+-- An `al` sent for a change waits at least this long after the last one.
+local CHANGE_GAP = 6
+local spot_reach
+local spot_types
+
+-- How far round a pole built or removed its supply can have reached a machine: the widest supply
+-- area of any pole (a substation's 9 tiles), with room for quality's wider ones and the machine's
+-- own half width. From prototypes alone, once.
+local function reach()
+  if not spot_reach then
+    local widest = 9
+    for _, proto in pairs(prototypes.entity) do
+      if proto.type == "electric-pole" then
+        local ok, d = pcall(function() return proto.get_supply_area_distance() end)
+        if not (ok and type(d) == "number") then
+          ok, d = pcall(function() return proto.supply_area_distance end)
+        end
+        if ok and type(d) == "number" and d > widest then
+          widest = d
+        end
+      end
+    end
+    spot_reach = widest + 10
+  end
+  return spot_reach
+end
+
+-- "power" for a pole or an electric machine (the machines round it read again), "status" for a turret
+-- or burner no electric type covers (itself read again), nil for anything else.
+local function is_spot_type(t)
+  if not spot_types then
+    spot_types = { ["electric-pole"] = "power" }
+    for _, et in pairs(registry.electric_types()) do
+      spot_types[et] = "power"
+    end
+    for _, et in ipairs(fluids_power.status_types()) do
+      spot_types[et] = spot_types[et] or "status"
+    end
+  end
+  return spot_types[t]
+end
+
+-- Every type a spot reads: the electric ones and the turrets and burners besides (from prototypes).
+local look_types
+local function spot_look_types()
+  if not look_types then
+    look_types = {}
+    for _, et in pairs(registry.electric_types()) do
+      look_types[#look_types + 1] = et
+    end
+    for _, et in ipairs(fluids_power.status_types()) do
+      look_types[#look_types + 1] = et
+    end
+  end
+  return look_types
+end
+
+local function inside_near(near, si, x, y)
+  return si == near.si and x >= near.x0 and x <= near.x1 and y >= near.y0 and y <= near.y1
+end
+
+local function near_on(kind)
+  return kind == "unplugged" or perf.on("status_near")
+end
+
+local function same_units(a, b)
+  for unit in pairs(a) do
+    if not b[unit] then
+      return false
+    end
+  end
+  for unit in pairs(b) do
+    if not a[unit] then
+      return false
+    end
+  end
+  return true
+end
+
+-- fluids_power's read: the force's warned machines in the focus square, replacing the last.
+fluids_power.listeners[#fluids_power.listeners + 1] = function(si, f, r, unplugged, warn)
+  local s = storage.f3d
+  local fname = force().name
+  local old = s.al_near
+  local new = { si = si, x0 = world.fixed(f.x - r), y0 = world.fixed(f.y - r), x1 = world.fixed(f.x + r),
+    y1 = world.fixed(f.y + r) }
+  local changed = not (old ~= nil and old.si == si)
+  for kind, field in pairs(NEAR) do
+    local set = {}
+    local list = kind == "unplugged" and unplugged or (near_on(kind) and warn and warn[kind]) or {}
+    for _, e in ipairs(list) do
+      if e.valid and e.unit_number and e.force and e.force.name == fname then
+        set[e.unit_number] = e
+      end
+    end
+    new[field] = set
+    if not changed and not same_units(old[field] or {}, set) then
+      changed = true
+    end
+  end
+  s.al_near = new
+  if changed then
+    s.al_dirty = true
+  end
+end
+
+local function add_spot(x, y, t, r)
+  local s = storage.f3d
+  s.al_spots = s.al_spots or {}
+  if #s.al_spots < SPOTS_MAX then
+    s.al_spots[#s.al_spots + 1] = { x = x, y = y, t = t, r = r }
+  end
+end
+
+tracker.listeners[#tracker.listeners + 1] = function(entity)
+  if not (entity and entity.valid) then
+    return
+  end
+  local p = entity.position
+  if next(empty) then
+    empty[chunk_of(entity.surface.index, p.x, p.y)] = nil
+  end
+  local near = storage.f3d.al_near
+  local kind = near and near.si == entity.surface.index and is_spot_type(entity.type)
+  if kind == "status" then
+    if perf.on("status_near") then
+      add_spot(p.x, p.y, game.tick, STATUS_SPOT)
+    end
+  elseif kind then
+    add_spot(p.x, p.y, game.tick)
+  end
+end
+
+-- The character put items into or took them out of a building (session.lua, after take, put, move, xfer,
+-- fast and drop): the turrets' ammo and the burners' fuel in its reach are looked at again soon.
+function M.items_moved()
+  local s = storage.f3d
+  local near = s and s.al_near
+  local c = puppet.get()
+  if not (near and c and c.valid and c.surface.index == near.si and perf.on("status_near")) then
+    return
+  end
+  local p = c.position
+  local r = (c.reach_distance or 10) + HAND_SLACK
+  for _, after in ipairs(HAND_LOOKS) do
+    add_spot(p.x, p.y, game.tick + after - 1, r)
+  end
+end
+
+-- Which near kind an entity is now (nil: none). A turret by its ammo inventory, as the pass reads it.
+local function near_kind(e)
+  if e.type == "ammo-turret" then
+    local inv = e.get_inventory(defines.inventory.turret_ammo)
+    return (inv and inv.is_empty()) and "no_ammo" or nil
+  end
+  local status = e.status
+  local name = status_name(status)
+  if name == "no_fuel" then
+    return "no_fuel"
+  elseif name == "no_minable_resources" then
+    return "depleted"
+  elseif fluids_power.power_state(e, status) == 2 then
+    return "unplugged"
+  end
+  return nil
+end
+
+-- Reads the machines round the spots again once their tick is past (a machine built out of every
+-- pole's reach says so then, one a new pole reaches has its network at once, a burner given fuel
+-- loses its icon). Spots not due yet wait; at most SPOTS_PER_TICK are read a tick.
+local function look_at_spots()
+  local s = storage.f3d
+  local spots, near = s.al_spots, s.al_near
+  if not spots then
+    return
+  end
+  if not near then
+    s.al_spots = nil
+    return
+  end
+  local surface = game.get_surface(near.si)
+  local types = spot_look_types()
+  if #types == 0 then
+    s.al_spots = nil
+    return
+  end
+  for _, field in pairs(NEAR) do
+    near[field] = near[field] or {}  -- (a save from J5 has only u)
+  end
+  local f = force()
+  local done, changed = 0, false
+  local rest = {}
+  for _, spot in ipairs(spots) do
+    if done < SPOTS_PER_TICK and spot.t < game.tick then
+      done = done + 1
+      if surface and surface.valid then
+        local d = spot.r or reach()
+        local found = surface.find_entities_filtered({ area = { { spot.x - d, spot.y - d }, { spot.x + d, spot.y + d } },
+          type = types, force = f })
+        for _, e in pairs(found) do
+          local p = e.position
+          local unit = e.unit_number
+          if unit and inside_near(near, near.si, world.fixed(p.x), world.fixed(p.y)) then
+            local now = near_kind(e)
+            for kind, field in pairs(NEAR) do
+              if near_on(kind) then
+                local want = now == kind and e or nil
+                if (near[field][unit] ~= nil) ~= (want ~= nil) then
+                  near[field][unit] = want
+                  changed = true
+                end
+              end
+            end
+          end
+        end
+      end
+    else
+      rest[#rest + 1] = spot
+    end
+  end
+  if done == 0 then
+    return
+  end
+  for _, field in pairs(NEAR) do
+    for unit, e in pairs(near[field]) do
+      if not e.valid then -- mined or destroyed: its icon goes now
+        near[field][unit] = nil
+        changed = true
+      end
+    end
+  end
+  s.al_spots = #rest > 0 and rest or nil
+  if changed then
+    s.al_dirty = true
+  end
+end
+
 local function start_pass()
-  next_pass = game.tick + PASS_INTERVAL
+  passes = passes + 1
+  next_pass = game.tick + PASS_INTERVAL * rate.factor("al")
   local list = {}
   for _, surface in pairs(game.surfaces) do
     list[#list + 1] = surface.index
@@ -262,6 +563,8 @@ local function step_pass(now)
   end
   local f = force()
   local chunks, cost = 0, 0
+  local quiet = perf.on("alerts_quiet")
+  local recheck = passes % EMPTY_EVERY == 0
   while chunks < CHUNKS_PER_TICK and cost < ENTITIES_PER_TICK do
     local si = pass.surfaces[pass.i]
     if not si then
@@ -277,11 +580,18 @@ local function step_pass(now)
       pass.iter = pass.iter or surface.get_chunks()
       chunk = pass.iter()
     end
+    local ckey = quiet and chunk and (si .. "," .. chunk.x .. "," .. chunk.y)
     if not chunk then
       pass.i, pass.iter = pass.i + 1, nil
+    elseif ckey and empty[ckey] and not recheck then
+      chunks = chunks + EMPTY_COST
     else
       chunks = chunks + 1
-      for _, e in pairs(surface.find_entities_filtered({ area = chunk.area, force = f, type = pass.types })) do
+      local found = surface.find_entities_filtered({ area = chunk.area, force = f, type = pass.types })
+      if ckey then
+        empty[ckey] = #found == 0 or nil
+      end
+      for _, e in pairs(found) do
         local key = e.unit_number or key_of(e)
         if not pass.seen[key] then
           pass.seen[key] = true
@@ -397,7 +707,7 @@ local SCANS = { scan_repair, scan_trains, scan_platforms }
 
 -- The order of Factorio's alert bar, then the machine warnings.
 local ORDER = { "destroyed", "attack", "fire", "no_ammo", "no_material", "no_robots", "no_repair", "train_fuel", "train_path",
-  "platform_path", "platform_storage", "collector", "launch", "unplugged", "no_fuel", "output_full" }
+  "platform_path", "platform_storage", "collector", "launch", "unplugged", "no_fuel", "output_full", "depleted" }
 
 local function from_events(al, kind)
   local list = {}
@@ -411,13 +721,45 @@ local function from_events(al, kind)
   return list
 end
 
+-- A near kind's machines: the pass's outside the focus square, the last read's inside it.
+local function near_list(kind)
+  local list = scans[kind] and still_there(scans[kind]) or {}
+  local near = storage.f3d.al_near
+  if not (near and near_on(kind)) then
+    return list
+  end
+  local out = {}
+  for _, rec in ipairs(list) do
+    if not inside_near(near, rec[3], rec[1], rec[2]) then
+      out[#out + 1] = rec
+    end
+  end
+  for _, e in pairs(near[NEAR[kind]] or {}) do
+    if e.valid then
+      if kind == "unplugged" then
+        out[#out + 1] = entry(e, status_name(e.status))
+      else
+        out[#out + 1] = entry(e, NEAR_EXTRA[kind])
+      end
+    end
+  end
+  return out
+end
+
 local function message()
   local al = state()
   local here = puppet.get()
   local si = here and here.surface.index or 0
   local l = {}
   for _, kind in ipairs(ORDER) do
-    local list = LIFETIME[kind] and from_events(al, kind) or (scans[kind] and still_there(scans[kind]))
+    local list
+    if LIFETIME[kind] then
+      list = from_events(al, kind)
+    elseif NEAR[kind] then
+      list = near_list(kind)
+    else
+      list = scans[kind] and still_there(scans[kind])
+    end
     if list and #list > 0 then
       -- The character's surface first, nearest the camera first (only PER_KIND are listed, and
       -- the client draws icons over those).
@@ -448,11 +790,16 @@ end
 
 function M.tick()
   local t = game.tick
-  local ok, err = pcall(step_pass)
-  if not ok then
-    pass = nil
-    log("[factorio-3d-bridge] alert pass: " .. tostring(err))
+  -- (alerts_quiet: one step a tick for every client: its results are the same for all.)
+  if not (perf.on("alerts_quiet") and stepped_at == t) then
+    stepped_at = t
+    local ok, err = pcall(step_pass)
+    if not ok then
+      pass = nil
+      log("[factorio-3d-bridge] alert pass: " .. tostring(err))
+    end
   end
+  local ok, err
   if t % SCAN_STEP == 0 then
     local i = (t / SCAN_STEP) % #SCANS + 1
     ok, err = pcall(SCANS[i])
@@ -460,8 +807,17 @@ function M.tick()
       log("[factorio-3d-bridge] alert scan " .. i .. ": " .. tostring(err))
     end
   end
-  -- Its own phase: the bridge's periodic jobs all fell on the same tick once a second (budget.lua).
-  if (t + 29) % SEND_INTERVAL == 0 then
+  ok, err = pcall(look_at_spots)
+  if not ok then
+    storage.f3d.al_spots = nil
+    log("[factorio-3d-bridge] alert spots: " .. tostring(err))
+  end
+  -- Its own phase: the bridge's periodic jobs all fell on the same tick once a second (budget.lua);
+  -- sooner when the warned machines round the focus changed.
+  local s = storage.f3d
+  if (t + 29) % SEND_INTERVAL == 0 or (s.al_dirty and t - (s.al_sent_at or -CHANGE_GAP) >= CHANGE_GAP) then
+    s.al_dirty = nil
+    s.al_sent_at = t
     transport.send_now(message())
   end
 end
@@ -482,6 +838,25 @@ function M.reset()
   scans = {}
   pass = nil
   next_pass = 0
+  empty = {}
+  local s = storage.f3d
+  if s then
+    s.al_near, s.al_spots, s.al_dirty, s.al_sent_at = nil, nil, nil, nil
+  end
+end
+
+-- Passes started since loading (tests: every EMPTY_EVERY'th looks in the empty chunks too).
+function M.pass_count()
+  return passes
+end
+
+-- How many chunks the pass takes as empty (tests).
+function M.empty_chunks()
+  local n = 0
+  for _ in pairs(empty) do
+    n = n + 1
+  end
+  return n
 end
 
 -- For measuring a pass's cost (/c): one step, and whether the pass just finished.

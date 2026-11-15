@@ -19,10 +19,12 @@ extends RefCounted
 const SYSTEMS := {
 	&"messages": [0, 4000, 1000],  # bridge.gd: messages handled (they feed everything else)
 	&"terrain": [1, 3000, 500],  # world.gd: finished terrain meshes put in (holes in the ground)
+	&"blueprint": [1, 3000, 1000],  # blueprint_preview.gd: a held blueprint laid out and checked at the cursor
 	&"build": [2, 6000, 1500],  # world.gd: chunks' buildings built, nearest first
 	&"models": [3, 4000, 500],  # model_library.gd: models made on workers finished here
 	&"unload": [4, 1500, 300],  # world.gd: unloaded chunks taken apart
 	&"shadows": [5, 1000, 300],  # world.gd: chunks' shadow tiers set
+	&"lods": [5, 1500, 300],  # world.gd: chunks' levels of detail looked at, band by band
 	&"pick": [5, 1500, 0],  # world.gd: the index of what is under the mouse
 	&"decoratives": [6, 3000, 0],  # decoratives.gd: clutter built on workers put in
 	&"lanes": [6, 2000, 0],  # belt_lanes.gd: far belt icons put in
@@ -54,6 +56,22 @@ const MIN_SLICE := 500
 const OVERRUN_SLACK := 1000
 
 static var shared := true
+## --frame-budget-belts=first|off (first; the owner: belt logic is the last thing culled for performance): the
+## belts' sliced work (belt_lanes.gd's far icons, `lanes`) ranks with the messages (priority 0) and has a floor, so
+## under a tight frame the near chunks' builds, terrain, models, shadows, levels of detail, decoratives, wires and
+## far merging wait before it; off: its place in SYSTEMS (6, no floor), as before. (The pool's size still counts
+## it by its place in SYSTEMS: far icons waiting don't make a standing frame "busy".) The `bs` messages and the
+## belt job's results don't wait in the pool at all (bridge.gd --belt-messages-first; belt_items.gd).
+static var belts_first := true
+const BELTS_FIRST := {&"lanes": [0, 2000, 500]}
+
+
+## A system's [priority, slice, floor]: SYSTEMS', or with belts_first the belts' own.
+static func _sys(system: StringName) -> Array:
+	if belts_first and BELTS_FIRST.has(system):
+		return BELTS_FIRST[system]
+	return SYSTEMS[system]
+
 ## A screenshot settling (addon_host.gd): the interface is hidden and nobody plays meanwhile, so the
 ## sliced work may make frames of up to BOOST_TARGET_USEC, each system BOOST times its slice, and the
 ## backlog of full detail's wider view (1,681 chunks at view distance 20) drains that much faster.
@@ -82,11 +100,33 @@ static var _starved := {}  # system -> frames in a row it was granted nothing wi
 static var used_total := 0
 ## Overruns so far by system (for --stutter-probe and the UI test).
 static var overruns := {}
+## Grants raised to the system's own slice because its work had waited too long (`behind`), so far by
+## system (for --stutter-probe).
+static var catchups := {}
 ## The other scripts' time a frame (Godot's process time minus the sliced work), smoothed.
 static var _other_ema := 6000.0
 static var _last_frame_used := 0
 ## For the UI test: a frame's other work fixed, instead of Godot's measured process time.
 static var test_other_usec := -1
+## The frame's other scripts are measured from the first system's ask to the frame's last script
+## (frame_end(), from a node world.gd adds at the last process priority), less the sliced work.
+## Godot's Performance.TIME_PROCESS, used before, is the slowest whole process step of the last
+## second, the renderer's sync and draw included (Godot 4.7.2 main.cpp, Main::iteration: the most
+## process_ticks since the last report, set once a second): any frame over about 8.7 ms in the last
+## second held the pool at POOL_MIN, and the renderer counted twice beside RESERVE_USEC. On the
+## owner's base the pool was 3.000 ms in every one of 7,162 frames (client-cpu.md 5).
+## `--frame-budget-measure=godot` measures it from TIME_PROCESS again.
+static var measure_frame := not OS.get_cmdline_user_args().has("--frame-budget-measure=godot")
+static var _end_usec := 0
+static var _end_frame := -1
+## The last frame's other scripts as measured, µs (for probes; -1 before any).
+static var other_usec := -1
+
+
+## The frame's scripts are done (world.gd's FrameEnd node, last of all to process).
+static func frame_end() -> void:
+	_end_frame = Engine.get_process_frames()
+	_end_usec = Time.get_ticks_usec()
 
 
 static func _check_arg() -> void:
@@ -94,6 +134,8 @@ static func _check_arg() -> void:
 	for arg in OS.get_cmdline_user_args():
 		if arg.begins_with("--frame-budget="):
 			shared = arg.get_slice("=", 1) != "separate"
+		elif arg.begins_with("--frame-budget-belts="):
+			belts_first = arg.get_slice("=", 1) != "off"
 
 
 ## Starts a new frame's books when the frame changed (the first system to ask in a frame).
@@ -103,11 +145,22 @@ static func _roll() -> void:
 		return
 	if not _arg_checked:
 		_check_arg()
+	var other := 0.0
+	var sampled := true
+	if test_other_usec >= 0:
+		other = float(test_other_usec)
+	elif not measure_frame:
+		other = Performance.get_monitor(Performance.TIME_PROCESS) * 1.0e6 - _last_frame_used
+	elif _frame >= 0 and _end_frame == _frame and _end_usec > _frame_start:
+		# The frame that ended: its scripts from the first ask to the last, less its sliced work.
+		other = float(_end_usec - _frame_start - used_total)
+		other_usec = int(other)
+	else:
+		sampled = false  # no world drawing (the menu): the last measure stands
 	_frame = f
 	_frame_start = Time.get_ticks_usec()
-	var other := float(test_other_usec) if test_other_usec >= 0 \
-		else Performance.get_monitor(Performance.TIME_PROCESS) * 1.0e6 - _last_frame_used
-	_other_ema = lerpf(_other_ema, maxf(other, 0.0), 0.1)
+	if sampled:
+		_other_ema = lerpf(_other_ema, maxf(other, 0.0), 0.1)
 	var target := _target()
 	var busy := false
 	for s in queued:
@@ -121,21 +174,27 @@ static func _roll() -> void:
 
 
 ## How long `system` may run now, in µs. 0: nothing this frame (it does nothing, not even one item).
-## `scale` multiplies its own slice (messages with a backlog take twice theirs).
-static func grant(system: StringName, scale := 1) -> int:
+## `scale` multiplies its own slice (messages with a backlog take twice theirs, as the pool allows).
+## `behind`: its work has waited too long (bridge.gd's messages, --message-catchup): it gets at least
+## its own slice (not times `scale`), whatever the pool has left and past the frame's deadline. With
+## the pool at POOL_MIN (the frame's other scripts at 9 ms or more: loading or walking a big base) the
+## messages otherwise get POOL_MIN less LOW_RESERVE, 2 ms, backlog or not, and at a lower frame rate
+## that was fewer than the bridge sends (bridge.gd).
+static func grant(system: StringName, scale := 1, behind := false) -> int:
 	_roll()
-	var own := int(SYSTEMS[system][1]) * scale * (BOOST if boost else 1)
+	var own := int(_sys(system)[1]) * scale * (BOOST if boost else 1)
 	if not shared:
 		granted[system] = own
 		return own
-	var prio := int(SYSTEMS[system][0])
+	var prio := int(_sys(system)[0])
 	# Kept for the higher systems that haven't run yet this frame and have work waiting.
 	var reserve := 0
 	var low_waits := false
 	for s in SYSTEMS:
-		var p := int(SYSTEMS[s][0])
+		var sy := _sys(s)
+		var p := int(sy[0])
 		if p < prio and not used.has(s) and int(queued.get(s, 0)) > 0:
-			reserve += mini(int(_last_use.get(s, SYSTEMS[s][1])), int(SYSTEMS[s][1]))
+			reserve += mini(int(_last_use.get(s, sy[1])), int(sy[1]))
 		elif p > NEAR_PRIORITY and int(queued.get(s, 0)) > 0:
 			low_waits = true
 	if prio <= NEAR_PRIORITY and low_waits:
@@ -151,7 +210,12 @@ static func grant(system: StringName, scale := 1) -> int:
 			_starved[system] = n
 			if n >= STARVE_FRAMES:
 				g = MIN_SLICE
-	g = maxi(g, int(SYSTEMS[system][2]) * scale)
+	g = maxi(g, int(_sys(system)[2]) * scale)
+	if behind:
+		var slice := int(_sys(system)[1]) * (BOOST if boost else 1)
+		if g < slice:
+			g = slice
+			catchups[system] = int(catchups.get(system, 0)) + 1
 	if g > 0:
 		_starved.erase(system)
 	granted[system] = maxi(int(granted.get(system, 0)), g)
@@ -175,7 +239,7 @@ static func spent(system: StringName, usec: int, waiting: int) -> void:
 	queued[system] = waiting
 	if waiting > 0 or usec > 0:
 		_last_use[system] = usec
-	var g := int(granted.get(system, int(SYSTEMS[system][1])))
+	var g := int(granted.get(system, int(_sys(system)[1])))
 	if usec > g + OVERRUN_SLACK:
 		overruns[system] = int(overruns.get(system, 0)) + 1
 
@@ -205,7 +269,10 @@ static func reset() -> void:
 	_last_use.clear()
 	_starved.clear()
 	overruns.clear()
+	catchups.clear()
 	used_total = 0
 	_last_frame_used = 0
 	_other_ema = 6000.0
+	_end_frame = -1
+	other_usec = -1
 	pool = POOL_MAX

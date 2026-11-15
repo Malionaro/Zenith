@@ -39,10 +39,16 @@ void vertex() {
 global uniform float f3d_look_ground_specular;  // looks.gd "ground_specular"
 
 void fragment() {
+	vec4 c = texture(atlas, UV);
+	// A picture's quad is its bounding box, mostly empty round a tuft: an empty pixel stops here, before
+	// the mask's read and the lighting (8 or more of these layers lie over a meadow's every pixel).
+	// Under 1/255 never showed.
+	if (c.a < 0.004) {
+		discard;
+	}
 	if (decor_blocked(ground_at)) {
 		discard;
 	}
-	vec4 c = texture(atlas, UV);
 	ALBEDO = c.rgb * (1.0 - raised_shade * grown);
 	SPECULAR = 0.5 * f3d_look_ground_specular;
 	ALPHA = c.a * smoothstep(0.75, 0.9, level);

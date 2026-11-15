@@ -20,5 +20,5 @@ jobs:
           NOTE: >-
             Thanks for taking the time. Zenith is a one-person project and doesn't take pull
             requests, so this one is closed automatically. You're welcome to keep the change in
-            your own fork: the code is MIT-licensed (see CONTRIBUTING.md). Bug reports are welcome
-            as issues.
+            your own fork: the code is under the GPL-3.0 (see LICENSING.md). Bug reports are
+            welcome as issues.

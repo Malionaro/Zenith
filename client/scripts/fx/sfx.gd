@@ -35,7 +35,10 @@ const ONE_SHOT_VOICES := 24
 const UI_VOICES := 4
 ## One-shots playing at once per category (bus). Machine and vehicle loops have their own voices
 ## (Settings: max_voices).
-const CATEGORY_LIMITS := {"Effects": 10, "Walking": 2, "Weapons": 6, "Explosions": 6, "Enemies": 6, "Environment": 6}
+const CATEGORY_LIMITS := {"Effects": 10, "Walking": 3, "Weapons": 6, "Explosions": 6, "Enemies": 6, "Environment": 6}
+## Categories where a new sound takes the oldest one's voice when they're all busy (I21: a step
+## that came out quieter than the two still ringing was dropped, so running went quiet in patches).
+const NEWEST_WINS := ["Walking"]
 ## Working loops of one prototype heard at once when its prototype doesn't say.
 const DEFAULT_PER_PROTOTYPE := 4
 ## Tiles over which a sound with audible_distance_modifier 1 fades to nothing.
@@ -177,12 +180,13 @@ func set_listener(focus: Vector2, camera: Camera3D, camera_distance := DEFAULT_C
 
 
 func listener_position() -> Vector3:
-	return listener.global_position
+	# Out of the tree (a test's effects, or while the scene closes) a global position is an error.
+	return listener.global_position if listener.is_inside_tree() else listener.position
 
 
 ## How loud a sound at `pos` is heard, 0 to 1: Factorio's fade over the audible distance.
 func distance_gain(pos: Vector3, reach := 1.0, curve := "") -> float:
-	var here := listener.global_position
+	var here := listener_position()
 	var flat := Vector2(pos.x - here.x, pos.z - here.z).length()
 	var d := sqrt(flat * flat + _zoom_height * _zoom_height)
 	var x := d / (AUDIBLE_DISTANCE * maxf(reach, 0.05))
@@ -295,6 +299,7 @@ func _aggregate(def: SoundBank.SoundDef, now: int) -> float:
 func _shot_voice(bus: String, priority: int, loudness: float) -> Shot:
 	var limit: int = CATEGORY_LIMITS.get(bus, ONE_SHOT_VOICES)
 	var in_bus := 0
+	var oldest_bus: Shot = null
 	var weakest_bus: Shot = null
 	var weakest: Shot = null
 	var free: Shot = null
@@ -305,12 +310,16 @@ func _shot_voice(bus: String, priority: int, loudness: float) -> Shot:
 			continue
 		if s.bus == bus:
 			in_bus += 1
+			if oldest_bus == null or s.started < oldest_bus.started:
+				oldest_bus = s
 			if weakest_bus == null or _outranks(weakest_bus, s):
 				weakest_bus = s
 		if weakest == null or _outranks(weakest, s):
 			weakest = s
 	var victim: Shot = null
 	if in_bus >= limit:
+		if bus in NEWEST_WINS:
+			return oldest_bus
 		victim = weakest_bus
 	elif free != null:
 		return free

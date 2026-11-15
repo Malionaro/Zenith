@@ -31,6 +31,7 @@ const ProductionPanels := preload("res://scripts/ui/factorio/production_panels.g
 const MenuKit := preload("res://scripts/menu/menu_kit.gd")
 const LogicWindows := preload("res://scripts/ui/factorio/logic_windows.gd")
 const CircuitWindow := preload("res://scripts/ui/factorio/circuit_window.gd")
+const SmoothBar := preload("res://scripts/ui/factorio/smooth_bar.gd")
 
 ## Shown or hidden (the window lays itself out around it).
 signal opened_changed(open: bool)
@@ -102,6 +103,9 @@ var _preview: Control = null
 var _preview_proto := ""
 ## What the progress bar shows: "pr" (crafting) or "mp" (mining).
 var _progress_key := "pr"
+## The progress and fuel bars drawn on between the twice-a-second states (I26).
+var _progress_smooth := SmoothBar.new(true, 1000)
+var _fuel_smooth := SmoothBar.new(false, 1000)
 var _sig := ""
 var _scroll_key := ""  # unit|kind of the last build, whose scroll places a rebuild keeps
 var _last_msec := 0
@@ -172,6 +176,8 @@ func _fit_to_window() -> void:
 func request(target_unit: int, cmd: Dictionary) -> void:
 	unit = target_unit
 	target = cmd.duplicate()
+	_progress_smooth = SmoothBar.new(true, 1000)
+	_fuel_smooth = SmoothBar.new(false, 1000)
 	_last_msec = Time.get_ticks_msec()
 	_sig = ""
 	_recipes = []
@@ -359,8 +365,7 @@ func handle(msg: Dictionary) -> void:
 	if sig != _sig and not _editing():
 		_sig = sig
 		_build(kind, str(msg.get("recipe", "")), inv)
-	if _progress != null:
-		ProductionPanels.set_percent(_progress, int(msg.get(_progress_key, 0)) / 1000.0)
+	_report_bars(msg)
 	SpacePanels.refresh(self, msg)
 	LogicWindows.refresh(self, msg)
 	_follow_train(msg)
@@ -381,9 +386,49 @@ func _follow_train(msg: Dictionary) -> void:
 		EntityPanels.aim_train_camera(cam, Vector2(int(tr["pos"][0]), int(tr["pos"][1])) / 256.0)
 
 
-func _process(_delta: float) -> void:
+func _process(delta: float) -> void:
 	if unit != 0 and Time.get_ticks_msec() - _last_msec > STALE_MSEC:
 		close_local()
+		return
+	_draw_bars(delta)
+
+
+## A state's progress and fuel for the bars that run on between states (I26): a crafter's says
+## how fast it goes (`ps`, unless short of power: then it is learnt), a drill's and the fuel's are
+## learnt from the states; standing machines hold what the bridge says.
+func _report_bars(msg: Dictionary) -> void:
+	var status := str(msg.get("status", "working"))
+	var running := status == "working" or status == "low_power" or status == ""
+	if msg.has(_progress_key):
+		var per_second := -1.0
+		if _progress_key == "pr" and msg.has("ps") and status != "low_power":
+			per_second = int(msg["ps"]) / 1000.0
+		_progress_smooth.report(int(msg[_progress_key]) / 1000.0, per_second, running)
+	if msg.has("bn"):
+		_fuel_smooth.report(int(msg["bn"]) / 1000.0, -1.0, running)
+	_draw_bars(0.0)
+
+
+func _draw_bars(delta: float) -> void:
+	if not visible:
+		return
+	if _progress != null and is_instance_valid(_progress):
+		var v := _progress_smooth.advance(delta)
+		if v >= 0.0:
+			ProductionPanels.set_percent(_progress, v)
+	var fuel := _fuel_bar()
+	if fuel != null:
+		var f := _fuel_smooth.advance(delta)
+		if f >= 0.0:
+			fuel.value = f * 1000.0
+
+
+## production_panels.gd's burner bar in the screen, if it has one.
+func _fuel_bar() -> ProgressBar:
+	if not has_meta("fuel_bar"):
+		return null
+	var bar = get_meta("fuel_bar")
+	return bar if is_instance_valid(bar) and bar is ProgressBar and is_ancestor_of(bar) else null
 
 
 ## What entity_panels.gd draws from, for the rebuild check: the settings, without what changes all
@@ -407,7 +452,7 @@ func _panel_sig(msg: Dictionary) -> String:
 ## machine_info.lua's fields that change the layout (the progress bar updates in place).
 func _production_sig(msg: Dictionary) -> String:
 	return JSON.stringify([msg.get("rd"), msg.get("rp"), msg.get("fixed"), msg.get("mt"), msg.get("lc"), msg.get("li"), msg.get("ld"),
-		int(msg.get("pb", 0)) > 0, roundi(int(msg.get("bn", 0)) / 50.0), roundi(int(msg.get("bp", 0)) / 50.0),
+		int(msg.get("pb", 0)) > 0, msg.has("bn"), roundi(int(msg.get("bp", 0)) / 50.0),
 		roundi(int(msg.get("tc", 0)) / 100.0), _pick_group, _pick_quality, _recipe_groups.size()])
 
 

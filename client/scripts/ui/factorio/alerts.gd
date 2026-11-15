@@ -26,7 +26,7 @@ const REFRESH := 0.5
 const HIDDEN_BY_DEFAULT := ["output_full"]
 ## Entity statuses Factorio draws only as an icon over the entity, never in its alert list (H5: the bar
 ## listed them, so the client showed alerts the game didn't): icons yes, bar no.
-const STATUS_ONLY := ["no_power", "unplugged", "low_power", "no_fuel"]
+const STATUS_ONLY := ["no_power", "unplugged", "low_power", "no_fuel", "depleted"]
 ## Types whose damage isn't the player's alert: enemies and nature.
 const NOT_OURS := ["unit-spawner", "turret", "tree", "simple-entity", "resource", "cliff", "fish", "plant"]
 ## kind -> [picture, title, what Factorio's tooltip says (%d: how many; one or several)].
@@ -55,6 +55,8 @@ const KINDS := {
 	"low_power": ["electricity-icon-red.png", "Low power", ["%d entity has low power.", "%d entities have low power."]],
 	"no_fuel": ["fuel-icon-red.png", "No fuel", ["%d entity is out of fuel.", "%d entities are out of fuel."]],
 	"output_full": ["destination-full-icon.png", "Output full", ["%d entity has its output full.", "%d entities have their output full."]],
+	"depleted": ["resources-depleted-icon.png", "No minable resources", ["%d mining drill has nothing left to mine.",
+		"%d mining drills have nothing left to mine."]],
 	# The client's own, for an older mod:
 	"damaged": ["danger-icon.png", "Damaged", ["%d entity is damaged.", "%d entities are damaged."]],
 }

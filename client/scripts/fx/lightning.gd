@@ -7,9 +7,12 @@ extends Node3D
 ##
 ## Factorio draws its bolt with a shader from the prototype's graphics_set (bolt_detail_level 5,
 ## colours {0, 0.6, 1}); here it is midpoint displacement to as many levels, as two camera-facing
-## ribbons (a white core and a blue glow), rebuilt each frame while a bolt is out.
+## ribbons (a white core and a blue glow), rebuilt each frame while a bolt is out. On an add-on's
+## hills (ground_height.gd) the bolt and its light are placed over the height where it strikes, read
+## once as it does: at the flat height they ended inside raised ground.
 
 const BoltShader := preload("res://shaders/lightning_bolt.gdshader")
+const GroundHeight := preload("res://scripts/world/ground_height.gd")
 
 ## Seconds a bolt is drawn (the prototype's effect_duration, 36 ticks).
 const LIFE := 0.6
@@ -75,7 +78,7 @@ func strike(at: Vector2, caught := false) -> void:
 	var b := Bolt.new()
 	b.phase = _rng.randf() * 100.0
 	# A rod or collector that caught it is struck at its tip, as Factorio draws it.
-	var ground := Vector3(at.x, 3.0 if caught else 0.0, at.y)
+	var ground := Vector3(at.x, (3.0 if caught else 0.0) + GroundHeight.at(at.x, at.y), at.y)
 	var top := ground + Vector3(_rng.randf_range(-4.0, 4.0), HEIGHT * _rng.randf_range(0.9, 1.1), _rng.randf_range(-3.0, 3.0))
 	var main := _jagged(top, ground, DETAIL)
 	b.paths.append(main)

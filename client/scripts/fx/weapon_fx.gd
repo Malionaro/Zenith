@@ -12,6 +12,11 @@ extends Node3D
 ##
 ## Factorio draws in 2D, so heights are ours: a sprite's upward shift becomes height, projectiles
 ## fly about a tile up, streams and thrown capsules arc, artillery shells climb high.
+##
+## Heights are over the flat world: on an add-on's hills (ground_height.gd) sprite_fx.gd's cards are
+## lifted in their shader, as the models are. The lights are placed here, so they are lifted by the
+## height under them: an explosion's once as it goes off, a fire's again only when the hills change,
+## a projectile's each frame it is among the lights drawn.
 
 const SpriteFx := preload("res://scripts/fx/sprite_fx.gd")
 const SoundBank := preload("res://scripts/fx/sound_bank.gd")
@@ -19,6 +24,7 @@ const Avatar := preload("res://scripts/player/avatar.gd")
 const MoverLayer := preload("res://scripts/world/movers.gd")
 const WorldMirror := preload("res://scripts/world/world.gd")
 const CapsuleAim := preload("res://scripts/player/capsule_aim.gd")
+const GroundHeight := preload("res://scripts/world/ground_height.gd")
 
 const DATA_PATH := "res://data/weapon_fx.json"
 const TICKS := 60.0
@@ -101,6 +107,8 @@ class Ground:
 	var fade_out := 1.0
 	var gone := -1.0  # seconds fading since it left the list
 	var seen := 0
+	var hills := 0.0  # the hills' height under it, read at GroundHeight.version() hills_v
+	var hills_v := -1
 
 
 var sprites: SpriteFx
@@ -321,7 +329,7 @@ func explode(name: String, at: Vector3, dir := Vector3.ZERO) -> void:
 	var light = rec.get("l")
 	if light is Array and light.size() >= 3:
 		var col: Array = light[2]
-		_flashes.append([at + Vector3(0, 0.5, 0), Color(float(col[0]), float(col[1]), float(col[2])), float(light[0]) * 3.0,
+		_flashes.append([GroundHeight.lift(at + Vector3(0, 0.5, 0)), Color(float(col[0]), float(col[1]), float(col[2])), float(light[0]) * 3.0,
 			clampf(float(light[1]) * 0.5, 2.0, 16.0), 0.0, life])
 	var smoke = rec.get("sm")
 	if smoke is Array and smoke.size() >= 2:
@@ -361,7 +369,7 @@ func _line_explosion(name: String, from: Vector3, to: Vector3) -> void:
 	var light = rec.get("l")
 	if light is Array and light.size() >= 3:
 		var col: Array = light[2]
-		_flashes.append([from.lerp(to, 0.2), Color(float(col[0]), float(col[1]), float(col[2])), float(light[0]) * 2.0, 10.0, 0.0, life])
+		_flashes.append([GroundHeight.lift(from.lerp(to, 0.2)), Color(float(col[0]), float(col[1]), float(col[2])), float(light[0]) * 2.0, 10.0, 0.0, life])
 
 
 ## A puff of a trivial smoke prototype (smoke-fast behind rockets, soft-fire-smoke over fires).
@@ -890,7 +898,7 @@ func _update_ground(delta: float) -> void:
 ## The nearest few of everything that lights its surroundings: explosions as they burn out,
 ## rockets and grenades in flight, fires.
 func _update_lights(delta: float) -> void:
-	var wants: Array = []  # [position, colour, energy, range]
+	var wants: Array = []  # [position, colour, energy, range, whether the hills are still to be added]
 	for i in range(_flashes.size() - 1, -1, -1):
 		var fl: Array = _flashes[i]
 		fl[4] = float(fl[4]) + delta
@@ -898,16 +906,19 @@ func _update_lights(delta: float) -> void:
 			_flashes.remove_at(i)
 			continue
 		var t := float(fl[4]) / float(fl[5])
-		wants.append([fl[0], fl[1], float(fl[2]) * (1.0 - t), maxf(float(fl[3]), FLASH_MIN_RANGE)])
+		wants.append([fl[0], fl[1], float(fl[2]) * (1.0 - t), maxf(float(fl[3]), FLASH_MIN_RANGE), false])
 	for f: Flyer in _flying.values():
 		var l = f.rec.get("l")
 		if l is Array and l.size() >= 3 and not f.cards.is_empty():
 			var col: Array = l[2]
-			wants.append([(f.cards[0][0] as SpriteFx.Card).pos, Color(float(col[0]), float(col[1]), float(col[2])), float(l[0]) * 1.5, clampf(float(l[1]) * 0.5, 1.5, 8.0)])
+			wants.append([(f.cards[0][0] as SpriteFx.Card).pos, Color(float(col[0]), float(col[1]), float(col[2])), float(l[0]) * 1.5, clampf(float(l[1]) * 0.5, 1.5, 8.0), true])
 	for g: Ground in _ground.values():
 		if g.fire and not g.cards.is_empty():
 			var c: SpriteFx.Card = g.cards[0][0]
-			wants.append([g.pos + Vector3(0, 0.8, 0), Color(1.0, 0.55, 0.2), 2.0 * c.color.a, 7.0])
+			if g.hills_v != GroundHeight.version():
+				g.hills_v = GroundHeight.version()
+				g.hills = GroundHeight.at(g.pos.x, g.pos.z)
+			wants.append([g.pos + Vector3(0, 0.8 + g.hills, 0), Color(1.0, 0.55, 0.2), 2.0 * c.color.a, 7.0, false])
 	var centre := avatar.position if avatar != null else Vector3.ZERO
 	if wants.size() > MAX_LIGHTS:
 		wants.sort_custom(func(a, b): return (a[0] as Vector3).distance_squared_to(centre) < (b[0] as Vector3).distance_squared_to(centre))
@@ -915,7 +926,7 @@ func _update_lights(delta: float) -> void:
 		var light: OmniLight3D = _lights[i]
 		if i < wants.size():
 			var w: Array = wants[i]
-			light.position = w[0]
+			light.position = GroundHeight.lift(w[0]) if w[4] else w[0]
 			light.light_color = w[1]
 			light.light_energy = w[2]
 			light.omni_range = w[3]

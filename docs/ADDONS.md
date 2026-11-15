@@ -340,7 +340,7 @@ icons, effects), and the mouse's ground point and the camera follow. The
 
 | | |
 |---|---|
-| `set_heights(image, origin, tiles_per_texel)` | The heights: an `Image` (`FORMAT_RF`, heights in tiles), its first texel's corner at world `origin` (`Vector2`: x, z), each texel that many tiles square. Bilinear between texel centres, 0 outside: fade the edges yourself. One field for the whole client; the last add-on to set it wins |
+| `set_heights(image, origin, tiles_per_texel)` | The heights: an `Image` (`FORMAT_RF`, heights in tiles), its first texel's corner at world `origin` (`Vector2`: x, z), each texel that many tiles square. Bilinear between texel centres, 0 outside: fade the edges yourself. One field for the whole client; the last add-on to set it wins. Zenith measures each field's lowest and highest height (for culling); an image that carries them as the meta `lift_range` (`image.set_meta("lift_range", Vector2(lowest, highest))`, tiles) is taken at its word instead, which spares a worker thread a pass over every texel (about 15 ms for 768 x 768) each time the field changes. Older Zenith ignores it |
 | `clear()` | Flat again (only your own field). Done for you when the add-on is switched off or the game ends |
 | `is_on()`, `area()` | A field is drawn; the square it covers (`Rect2`, tiles) |
 | `height_at(x, z)` | The height drawn under a point |

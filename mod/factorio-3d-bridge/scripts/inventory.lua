@@ -233,6 +233,20 @@ local function send_quickbar()
   transport.send_reliable({ t = "qb", p = page, sel = qb.sel, held = list[qb.sel] or "", l = list })
 end
 
+-- The slots now, if they changed (ui_actions.lua's Ctrl+clicks: the client's hand and its sound
+-- follow them, I1, I3).
+function M.send_slots_now()
+  local c = puppet.get()
+  if c then
+    send_slots(c, storage.f3d)
+  end
+end
+
+-- And after the character mined something (J20: the hand's count and the quickbar follow at once).
+puppet.mined_listeners[#puppet.mined_listeners + 1] = function(c)
+  send_slots(c, storage.f3d)
+end
+
 -- Right after a command: the client sees the result on the next tick instead of within half a
 -- second.
 local function changed()

@@ -20,6 +20,13 @@ const REACH := 48.0
 ## The lift's range is rounded out to this (tiles), so a field moved with the character, its hills
 ## a little taller or lower, doesn't set every node's bounds again.
 const RANGE_STEP := 0.5
+## Giving every node room walks all of them on the main thread: 6-13 ms for the mock's 3,200 at a
+## small base. Room that grows is given at once (nothing lifted may be culled meanwhile); a range
+## that shrinks by up to SHRINK_SLACK tiles keeps the room it has (hills a little lower where the
+## field moved to, then a little taller again, walk nothing), and room that shrinks by more is
+## taken back WALK_USEC of the main thread a frame. Flat again (clear) is at once.
+const SHRINK_SLACK := 1.0
+const WALK_USEC := 1000
 ## Fields up to this many texels are measured at once; bigger ones on a worker thread (768 x 768
 ## texels of two channels take about 17 ms).
 const MEASURE_NOW := 256 * 256
@@ -47,16 +54,23 @@ static var _on_added := Callable()
 static var _tasks: Array = []
 static var _field := 0  # numbers the fields set, so an older field's measuring is only tidied up
 static var _polling := false
+## Nodes still to be given the range's room, from _walk_at on (a shrink, a slice a frame).
+static var _walk: Array = []
+static var _walk_at := 0
+## The main thread's time a frame for that walk (µs); tests set 0 (64 nodes a frame).
+static var walk_usec := WALK_USEC
 
 
 ## Sets the field: `heights` an Image of FORMAT_RF (heights in tiles) or FORMAT_RGF (red the
 ## ground, green the ground without its cliffs' terraces: what cliff models sit on), its first
 ## texel's corner at `origin` (world x, z), `tiles_per_texel` tiles a texel. Replaces any field
-## before it.
+## before it. An image may carry its own lowest and highest height as the meta `lift_range` (a
+## Vector2, tiles): then it isn't measured (_measure), as the add-on that made it knows them.
 static func set_field(heights: Image, origin: Vector2, tiles_per_texel: float) -> void:
 	if heights == null or heights.is_empty():
 		clear()
 		return
+	var given: Variant = heights.get_meta(&"lift_range") if heights.has_meta(&"lift_range") else null
 	var format := heights.get_format()
 	if format != Image.FORMAT_RF and format != Image.FORMAT_RGF:
 		heights = heights.duplicate()
@@ -75,7 +89,7 @@ static func set_field(heights: Image, origin: Vector2, tiles_per_texel: float) -
 	RenderingServer.global_shader_parameter_set(GLOBAL_TEX, _texture)
 	RenderingServer.global_shader_parameter_set(GLOBAL_RECT, Vector4(_origin.x, _origin.y, _step, 1.0 if low_ground else 0.0))
 	RenderingServer.global_shader_parameter_set(GLOBAL_ON, 1.0)
-	_measure(heights)
+	_measure(heights, given)
 
 
 ## Back to flat ground.
@@ -149,10 +163,18 @@ static func hold_mesh(node: MeshInstance3D) -> void:
 
 
 ## Rounds the range out and, when that changed, gives every drawn node room for it: those made
-## already and, while there are hills, those to come.
+## already and, while there are hills, those to come. Room that grows at once, room that shrinks
+## (past SHRINK_SLACK) a slice a frame.
 static func _set_range(lo: float, hi: float) -> void:
 	lo = floorf(minf(lo, 0.0) / RANGE_STEP) * RANGE_STEP
 	hi = ceilf(maxf(hi, 0.0) / RANGE_STEP) * RANGE_STEP
+	var grows := lo < _lo or hi > _hi
+	var flat := lo == 0.0 and hi == 0.0
+	if not grows and not flat:
+		if lo - _lo <= SHRINK_SLACK:
+			lo = _lo
+		if _hi - hi <= SHRINK_SLACK:
+			hi = _hi
 	if lo == _lo and hi == _hi:
 		return
 	_lo = lo
@@ -168,8 +190,38 @@ static func _set_range(lo: float, hi: float) -> void:
 			tree.node_added.connect(_on_added)
 		else:
 			tree.node_added.disconnect(_on_added)
-	for node in tree.root.find_children("*", "GeometryInstance3D", true, false):
-		_hold(node)
+	_walk = tree.root.find_children("*", "GeometryInstance3D", true, false)
+	_walk_at = 0
+	_walk_step(grows or flat)
+	if _walk_at < _walk.size() and not tree.process_frame.is_connected(_walk_on):
+		tree.process_frame.connect(_walk_on)
+
+
+## Gives the walk's nodes room for the range, all of them (`all`) or WALK_USEC's worth.
+static func _walk_step(all: bool) -> void:
+	var t0 := Time.get_ticks_usec()
+	var n := _walk.size()
+	while _walk_at < n:
+		var node: Variant = _walk[_walk_at]
+		_walk_at += 1
+		if is_instance_valid(node):
+			_hold(node)
+		if not all and (_walk_at & 63) == 0 and Time.get_ticks_usec() - t0 > walk_usec:
+			return
+	_walk = []
+	_walk_at = 0
+	var tree := Engine.get_main_loop() as SceneTree
+	if tree != null and tree.process_frame.is_connected(_walk_on):
+		tree.process_frame.disconnect(_walk_on)
+
+
+static func _walk_on() -> void:
+	_walk_step(false)
+
+
+## Whether nodes are still being given room a slice a frame (tests).
+static func walking() -> bool:
+	return _walk_at < _walk.size()
 
 
 static func _hold(node: Node) -> void:
@@ -199,10 +251,16 @@ static func _set_margin(g: GeometryInstance3D, want: float) -> void:
 		g.extra_cull_margin = own
 
 
-## The field's lowest and highest lift. The first field gives everything room for REACH until its
-## heights are measured; a later one keeps the last field's range meanwhile.
-static func _measure(heights: Image) -> void:
+## The field's lowest and highest lift: `given` (the image's `lift_range`) when it is a finite
+## Vector2, else measured. Terrain Elevation gives it: its fields come every few seconds while the
+## player builds, and each measuring was a 15 ms high-priority job beside the belts' own. The first
+## field measured gives everything room for REACH until its heights are measured; a later one keeps
+## the last field's range meanwhile.
+static func _measure(heights: Image, given: Variant = null) -> void:
 	_field += 1
+	if given is Vector2 and is_finite(given.x) and is_finite(given.y):
+		_set_range(given.x, given.y)
+		return
 	var data := heights.get_data()
 	if heights.get_width() * heights.get_height() <= MEASURE_NOW:
 		var r := _range_of(data)
@@ -260,6 +318,12 @@ static func _range_of(data: PackedByteArray) -> Vector2:
 
 static func is_on() -> bool:
 	return _on
+
+
+## Counts the fields set and cleared: a height read under something that stays put (a lamp, a
+## furnace's fire, a turret) is still right while this hasn't changed, so it needn't be read again.
+static func version() -> int:
+	return _field
 
 
 ## The square the field covers: Rect2(origin, size in tiles), or an empty Rect2 when off.
@@ -340,4 +404,15 @@ static func overlay_material(priority: int, picture: Texture2D = null) -> Shader
 	if picture != null:
 		m.set_shader_parameter(&"picture", picture)
 		m.set_shader_parameter(&"use_picture", true)
+	return m
+
+
+## A material for see-through marks on the ground that what stands in front hides, riding on the
+## hills: `color`, times the vertex colour when `vertex_color`. In place of an unshaded, see-through
+## StandardMaterial3D, which the hills' lift doesn't reach (the mark ends up inside raised ground).
+static func mark_material(color: Color, vertex_color := true) -> ShaderMaterial:
+	var m := ShaderMaterial.new()
+	m.shader = preload("res://shaders/ground_mark.gdshader")
+	m.set_shader_parameter(&"tint", color)
+	m.set_shader_parameter(&"vertex_color", vertex_color)
 	return m

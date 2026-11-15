@@ -9,6 +9,7 @@ local puppet = require("scripts.puppet")
 local tracker = require("scripts.tracker")
 local rate = require("scripts.rate")
 local requests = require("scripts.requests")
+local movers = require("scripts.movers")
 
 local M = {}
 
@@ -566,11 +567,16 @@ function M.tick()
     rate.read("tr", 0)
     return
   end
-  local found = world.surface().find_entities_filtered({
-    area = { { f.x - f.r, f.y - f.r }, { f.x + f.r, f.y + f.r } },
-    type = types,
-  })
-  rate.read("tr", #found)
+  -- (one_search: the rolling stock the movers' search found; its count from storage.)
+  local surface = world.surface()
+  local found, n = movers.found("tr", surface)
+  if not found then
+    found = surface.find_entities_filtered({
+      area = { { f.x - f.r, f.y - f.r }, { f.x + f.r, f.y + f.r } },
+      type = types,
+    })
+  end
+  rate.read("tr", n or #found)
   local seen, list = {}, {}
   for _, e in pairs(found) do
     local train = e.train

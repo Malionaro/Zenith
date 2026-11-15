@@ -144,20 +144,25 @@ local function ghost_at(surface, proto, position)
   return nil
 end
 
--- What a fast-replace would remove: an entity there of the same fast-replaceable group.
-local function replaced_entity(surface, proto, position)
+-- What a fast-replace would remove: the entities under the new one's footprint (w x h tiles) of the
+-- same fast-replaceable group. Under the whole footprint, not its middle (J9): a splitter stands on a
+-- tile edge between the two belts it replaces, and a search round that point found neither (or one,
+-- whose neighbour then went without its removal sent or its items given back).
+local function replaced_entities(surface, proto, position, w, h)
   local group = proto.fast_replaceable_group
+  local out = {}
   if not group or group == "" then
-    return nil
+    return out
   end
+  local hx, hy = math.max(w / 2 - 0.1, 0.1), math.max(h / 2 - 0.1, 0.1)
   for _, e in pairs(surface.find_entities_filtered({
-    area = { { position.x - 0.1, position.y - 0.1 }, { position.x + 0.1, position.y + 0.1 } },
+    area = { { position.x - hx, position.y - hy }, { position.x + hx, position.y + hy } },
   })) do
     if e.prototype.fast_replaceable_group == group then
-      return e
+      out[#out + 1] = e
     end
   end
-  return nil
+  return out
 end
 
 -- Items go to the character; what doesn't fit is spilled at its feet, as the game does.
@@ -347,28 +352,34 @@ function M.build(cmd)
   end
   -- Fast-replace first: can_place_entity also answers true where the entity would replace what
   -- stands there (2.1), but create_entity without fast_replace then builds nothing.
-  local old = replaced_entity(surface, proto, position)
+  local olds = replaced_entities(surface, proto, position, w, h)
   local entity
-  if old and surface.can_fast_replace({ name = proto.name, position = position, direction = direction, force = c.force }) then
-    -- Fast-replace without a player: the old entity's items are ours to hand back, and its
-    -- removal ours to report (the game raises no destroy event for it).
-    local removal = tracker.removal_message(old)
-    local products = old.prototype.mineable_properties.products or {}
-    local old_quality = quality_name(old)
+  if #olds > 0 and surface.can_fast_replace({ name = proto.name, position = position, direction = direction, force = c.force }) then
+    -- Fast-replace without a player: the old entities' items are ours to hand back, and their
+    -- removal ours to report (the game raises no destroy event for them).
+    local gone = {}
+    for i, old in ipairs(olds) do
+      gone[i] = { old = old, removal = tracker.removal_message(old), quality = quality_name(old),
+        products = old.prototype.mineable_properties.products or {} }
+    end
     spec.fast_replace = true
     spec.spill = false
     entity = surface.create_entity(spec)
     if entity then
-      if removal and not old.valid then
-        transport.send_reliable(removal)
-      end
-      for _, product in pairs(products) do
-        if product.type == "item" then
-          local stack = { name = product.name, count = product.amount or product.amount_min or 1 }
-          if old_quality ~= "normal" then
-            stack.quality = old_quality
+      for _, g in ipairs(gone) do
+        if not g.old.valid then
+          if g.removal then
+            transport.send_reliable(g.removal)
           end
-          give(c, stack)
+          for _, product in pairs(g.products) do
+            if product.type == "item" then
+              local stack = { name = product.name, count = product.amount or product.amount_min or 1 }
+              if g.quality ~= "normal" then
+                stack.quality = g.quality
+              end
+              give(c, stack)
+            end
+          end
         end
       end
     end

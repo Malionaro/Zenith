@@ -1128,6 +1128,18 @@ static func tech_name(name: String) -> String:
 	return LocaleNames.technology(name)
 
 
+## A levelled technology's name at a level past the first ("Mining productivity 7" for
+## mining-productivity-3 at 7: a "-N" series' base name and the level); others as tech_name.
+static func tech_level_name(name: String, level: int) -> String:
+	if level <= 1:
+		return tech_name(name)
+	var base := name
+	var dash := name.rfind("-")
+	if dash > 0 and name.substr(dash + 1).is_valid_int():
+		base = name.substr(0, dash)
+	return "%s %d" % [tech_name(base), level]
+
+
 static func group_name(name: String) -> String:
 	return LocaleNames._first(name, ["item-group-name"])
 

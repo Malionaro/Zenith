@@ -32,7 +32,40 @@ WORLD_PARTS = {"w_build": "chunk entity rebuild (world.gd build)", "w_pending": 
                "w_ic_look": "item kinds' look (model or icon lookup)", "w_ic_icons_prepare": "icon index and mods scanned (first icon)",
                "w_ic_dress": "item kinds' materials", "c_us_build_recs": "chunk build: records to models",
                "c_us_build_wants": "chunk build: MultiMesh wants", "c_us_build_apply": "chunk build: MultiMeshes made (apply)",
-               "c_us_build_finish": "chunk build: lists, shadows, far chunks"}
+               "c_us_build_finish": "chunk build: lists, shadows, far chunks",
+               # probing.gd prof: the once-a-join work of other nodes, spread over frames
+               "w_mv_ready": "movers: waiting models checked (new model)", "w_mv_refresh": "movers: robot batches made again (new model)",
+               "w_mv_dress": "movers: dressed (model ready)", "w_mv_move": "movers: moved", "w_mv_robots": "movers: robots drawn",
+               "w_dc_free": "decoratives: left world freed", "w_dc_build": "decoratives: builds queued", "w_dc_finish": "decoratives: clutter put in (finish_jobs)",
+               "w_dc_kinds": "decoratives: new kinds' textures and materials", "w_dc_cull": "decoratives: culled", "w_dc_mask": "decoratives: mask uploaded",
+               "w_dc_grass": "decoratives: grass made", "w_ic_poll_look": "item kinds: looks polled (model or icon come)",
+               "w_ic_poll_dress": "item kinds: dressed (model or icon come)", "w_gi_model_get": "item kinds: a model read on a thread taken",
+               "w_cb_ready": "chunk build: models asked for (entity_ready)", "w_cb_card": "chunk build: sprite stand-ins asked for",
+               "w_gs_env": "settings applied: look lifted, environment", "w_gs_shadows_ssao": "settings applied: shadows, SSAO",
+               "w_gs_contact": "settings applied: contact shading over every chunk", "w_gs_look": "settings applied: the look settled",
+               "w_gs_clouds": "settings applied: clouds", "w_gs_models": "settings applied: models' quality, far chunks, cards",
+               "w_gs_belts": "settings applied: belt lanes' mode", "w_gs_decoratives": "settings applied: decoratives",
+               "w_gs_held_belts": "governor's knobs: view radius, belt distances and cap", "w_gs_held_rest": "governor's knobs: entity radius, map, rate, fps",
+               "w_gs_rest": "settings applied: priority, help, overlay, camera",
+               "w_ic_d_look": "item kind dressed: model or icon looked up", "w_ic_d_mesh": "item kind dressed: MultiMesh given its mesh",
+               "w_ic_d_material": "item kind dressed: material made", "w_ic_d_aabb": "item kind dressed: model bounds read",
+               "w_ic_d_override": "item kind dressed: material set on the instance",
+               "w_rb_mesh": "robot batch: part meshes copied for the robot shader", "w_rb_arrays": "robot batch: a part's arrays read",
+               "w_rb_surface": "robot batch: a part's surface made", "w_rb_materials": "robot batch: materials copied",
+               "w_rb_instances": "robot batch: MultiMeshInstances made", "w_mv_d_robot": "mover dressed: robot (batch, record)",
+               "w_mv_d_node": "mover dressed: its node made", "w_mv_d_shadow": "mover dressed: its drop shadow made",
+               "w_mv_d_attach": "mover dressed: attached to vehicle_anim",
+               "w_dc_k_material": "decorative kind: material made", "w_dc_k_texture": "decorative kind: atlas texture made",
+               "w_dc_k_param": "decorative kind: atlas set on the material", "w_dc_k_grass": "decorative kind: grass meshes and materials",
+               "w_dc_k_priority": "decorative kind: drawing order", "w_dc_k_mesh": "decorative kind: quad or plane made",
+               "w_dc_multimeshes": "decoratives: a chunk's MultiMeshes made",
+               "w_terrain_apply": "terrain mesh applied (apply_terrain)", "w_ta_surfaces": "terrain apply: surfaces made from arrays",
+               "w_ta_mesh_set": "terrain apply: mesh set on the instance", "w_ta_hold": "terrain apply: hills' room (GroundHeight)"}
+
+# Which of a frame's parts belong to the subtree a hitch is attributed to.
+PART_PREFIXES = {"World itself": ("w_",), "World": ("w_",), "before": ("w_",), "BeltItems": ("w_bi_",),
+                 "GroundItems": ("w_gi_", "w_ic_"), "Movers": ("w_mv_",), "Decoratives": ("w_dc_",), "UpsGovernor": ("w_gs_",)}
+OTHER_NODES = ("w_mv_", "w_dc_", "w_gi_", "w_gs_")  # not world.gd's, whatever the prefix says
 
 
 def load(path, keep_shots=False):
@@ -64,9 +97,10 @@ def attribute(f):
     if not cands:
         return "unknown", 0.0
     name, ms = max(cands, key=lambda c: c[1])
-    if name in ("World itself", "World", "BeltItems", "GroundItems", "before"):
-        parts = [(k, float(v)) for k, v in phases.items() if k.startswith("w_") and (name != "BeltItems" or k.startswith("w_bi_"))
-                 and (name != "GroundItems" or k.startswith("w_ic_"))]
+    if name in PART_PREFIXES:
+        prefixes = PART_PREFIXES[name]
+        parts = [(k, float(v)) for k, v in phases.items() if k.startswith(prefixes)
+                 and (prefixes != ("w_",) or not k.startswith(OTHER_NODES))]
         # chunk_view.gd's build phases, counted in microseconds (c_us_*)
         parts += [(k, float(v) / 1000.0) for k, v in phases.items() if k.startswith("c_us_")]
         if name == "World itself" or name == "World":
@@ -82,8 +116,10 @@ def attribute(f):
         return name, ms
     if name == "draw":
         pipes = int(f[PIPES]) if len(f) > PIPES else 0
+        if int(phases.get("pipes_draw", 0)) > 0:
+            return "renderer draw with pipeline compiles at draw time", ms
         if pipes > 0:
-            return "renderer draw with pipeline compiles", ms
+            return "renderer draw with pipeline compiles (ahead of the draw)", ms
         return "renderer draw (main thread)", ms
     if name == "present":
         return "present / GPU wait", ms
@@ -99,7 +135,8 @@ def summarize(frames, over):
            "over": sum(1 for m in ms if m > over),
            "over25": sum(1 for m in ms if m > 25.0), "over50": sum(1 for m in ms if m > 50.0),
            "over100": sum(1 for m in ms if m > 100.0), "over_ms": sum(max(0.0, m - 16.7) for m in ms if m > over),
-           "pipelines": sum(int(f[PIPES]) for f in frames if len(f) > PIPES)}
+           "pipelines": sum(int(f[PIPES]) for f in frames if len(f) > PIPES),
+           "pipes_draw": sum(int(f[PHASES].get("pipes_draw", 0)) for f in frames if len(f) > PHASES and isinstance(f[PHASES], dict))}
     return out
 
 
@@ -159,10 +196,10 @@ def main():
         s = summarize(frames, a.over)
         join = d.get("join", {})
         print("%s: %d frames over %.1f s | p50 %.1f p95 %.1f p99 %.1f max %.1f ms | over 25 ms %d, over %g ms %d, over 50 ms %d, "
-              "over 100 ms %d | pipelines compiled %d | settled %.1f s, belt load done %.1f s, fully drawn %.1f s | "
+              "over 100 ms %d | pipelines compiled %d (%d at draw time) | settled %.1f s, belt load done %.1f s, fully drawn %.1f s | "
               "screenshot frames left out %d" % (
                   r, s["frames"], s["seconds"], s["p50"], s["p95"], s["p99"], s["max"], s["over25"], a.over, s["over"], s["over50"],
-                  s["over100"], s["pipelines"], join.get("settled_s", -1), join.get("belt_load_done_s", -1), join.get("drawn_s", -1),
+                  s["over100"], s["pipelines"], s["pipes_draw"], join.get("settled_s", -1), join.get("belt_load_done_s", -1), join.get("drawn_s", -1),
                   d.get("shots_dropped", 0)))
         if a.windows:
             for w in windows(frames):
@@ -181,13 +218,14 @@ def main():
             print("%-62s %6d %10.0f %5.0f%% %8.0f" % (src, e[0], e[1], 100.0 * e[1] / total, e[2]))
     worst = sorted(pooled, key=lambda f: -float(f[MS]))[:a.frames]
     print()
-    print("worst frames: ms | source | segments | pipelines | models made | w_ parts over 1 ms")
+    print("worst frames: ms | source | segments | pipelines (at draw time) | models made | w_ parts over 1 ms, c_us_ parts over 1000 us, GPU memory steps (MB)")
     for f in worst:
         src, _ = attribute(f)
         phases = f[PHASES] if len(f) > PHASES and isinstance(f[PHASES], dict) else {}
-        parts = {k: v for k, v in phases.items() if (k.startswith("w_") and float(v) >= 1.0) or k in ("flush", "draw", "present")}
-        print("  %7.1f | %s | %s | pipes %d | made %d | %s" % (float(f[MS]), src, json.dumps(f[SEGS]) if len(f) > SEGS else "", int(f[PIPES]) if len(f) > PIPES else 0,
-                                                              int(f[MADE]), json.dumps(parts)))
+        parts = {k: v for k, v in phases.items() if (k.startswith("w_") and float(v) >= 1.0) or (k.startswith("c_us_") and float(v) >= 1000)
+                 or k in ("flush", "draw", "present", "tex_mem", "buf_mem")}
+        print("  %7.1f | %s | %s | pipes %d (%d) | made %d | %s" % (float(f[MS]), src, json.dumps(f[SEGS]) if len(f) > SEGS else "", int(f[PIPES]) if len(f) > PIPES else 0,
+                                                                   int(phases.get("pipes_draw", 0)), int(f[MADE]), json.dumps(parts)))
 
 
 if __name__ == "__main__":

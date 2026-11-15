@@ -24,6 +24,7 @@ extends RefCounted
 const Settings := preload("res://scripts/menu/settings.gd")
 const ModelLods := preload("res://scripts/world/model_lods.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
+const PipelineWarm := preload("res://scripts/world/pipeline_warm.gd")
 const BeltLods := preload("res://scripts/world/belt_lods.gd")
 const UpsGovernor := preload("res://scripts/world/ups_governor.gd")
 
@@ -180,7 +181,7 @@ static func pending(main: Node) -> Dictionary:
 			out["chunks"] = left
 	elif world != null and world.has_method("settled") and not world.settled():
 		out["chunks"] = world.chunks.size()
-	if ModelLibrary.busy():
+	if ModelLibrary.busy() or PipelineWarm.pending_count() > 0:  # (models left out while their pipelines compile)
 		out["models"] = true
 	if ModelLods.busy():
 		out["lods"] = true

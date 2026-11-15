@@ -91,6 +91,26 @@ func _run() -> void:
 	sim.step_to(260)
 	s = _at(sim)
 	check(s[201] == [9, 0] and s[202] == [9, 64], "no longer leading out: up to its end: %s" % s)
+	# (dead_walls) A lane leading nowhere that the bridge didn't say leads out (it sent the belt but not the one
+	# it feeds, lm next 0), its front standing short of its end in the game: two reads finding the front
+	# where it was wall it there, so the line behind stands too; off (as before), or after a read finding
+	# it elsewhere, its front runs up to its end.
+	for dw in [true, false]:
+		var de: Object = _world(false)
+		de.set("dead_walls", dw)
+		de.set_wall(9, 100, 100, 40)
+		de.set_wall(9, 104, 100, 40)
+		de.step_to(160)
+		var dd := _at(de)
+		if dw:
+			check(dd.get(100) == [9, 40] and dd.get(103) == [9, 232] and dd.get(203) == [17, 232],
+				"a dead end two reads walled: the line stands there: %s" % dd)
+			de.set_wall(9, 170, 101, 0)
+			de.step_to(200)
+			dd = _at(de)
+			check(dd.get(100) == [9, 0] and dd.get(200) == [17, 0], "... a read finding it moved: up to its end again: %s" % dd)
+		else:
+			check(dd.get(100) == [9, 0] and dd.get(103) == [9, 192], "dead walls off: a dead end's front runs to its end: %s" % dd)
 	# A drift check (pc) of a packed lane: the same count, front and back, but other items (a whole gap
 	# off) is a mismatch only by their ids (pu).
 	var ok: Object = _world(true)
@@ -121,3 +141,16 @@ func _run() -> void:
 		"a creeping packed line read in the middle: the lane in front moved with it: %s gone %s" % [c, gone])
 	check(c.get(301) == [25, 40] and c.get(303) == [25, 168] and c.get(300) == [17, 232],
 		"... and the lane behind too: %s" % c)
+	# The lattice's speed for a lane (lane_fronts, belt_lattice.gd lane_speed): its front waits at the wall
+	# while the items behind it close up. speed_of 0: its front item's (standing); 1: most of its items'.
+	var sg: Object = _world(true)
+	var g9 := PackedInt64Array()
+	for it in [[100, 40], [101, 160], [102, 224]]:
+		g9.append_array([it[0], 1, it[1], 1])
+	sg.load_lane(9, 101, g9)
+	sg.set_wall(9, 101, 100, 40)
+	sg.step_to(102)
+	var f0: PackedInt32Array = sg.lane_fronts(PackedInt64Array([9, 17]), 0)
+	var f1: PackedInt32Array = sg.lane_fronts(PackedInt64Array([9, 17]), 1)
+	check(f0[0] == 40 and f0[1] == 0 and f1[0] == 40 and f1[1] == 8 and f1[2] == 3 and f0[4] == 8 and f1[4] == 8,
+		"a lane whose front waits while the items behind close up moves at the lane's speed: front %s, lane %s" % [f0, f1])

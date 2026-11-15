@@ -4,7 +4,7 @@ extends Node3D
 ## area at the cursor (red when out of range); a left click throws (`throw`), holding it keeps
 ## throwing at the capsule's pace. Fish and other use-on-self capsules are eaten on a click.
 
-const Visuals := preload("res://scripts/world/visuals.gd")
+const GroundHeight := preload("res://scripts/world/ground_height.gd")
 
 ## Seconds between throws while the button is held (a grenade's cooldown is 30 ticks).
 const REPEAT := 0.5
@@ -19,8 +19,9 @@ var pi: Node
 
 var _mesh := ImmediateMesh.new()
 var _mi := MeshInstance3D.new()
-var _ok_mat := Visuals.ghost_material(Color(1.0, 1.0, 1.0, 0.55))
-var _bad_mat := Visuals.ghost_material(Color(1.0, 0.3, 0.25, 0.6))
+## The rings ride on an add-on's hills (ground_height.gd), as the ground does.
+var _ok_mat := GroundHeight.mark_material(Color(1.0, 1.0, 1.0, 0.55), false)
+var _bad_mat := GroundHeight.mark_material(Color(1.0, 0.3, 0.25, 0.6), false)
 var _timer := 0.0
 
 

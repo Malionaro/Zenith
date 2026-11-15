@@ -132,14 +132,29 @@ void BeltDrawNative::set_lane(i64 key, const PackedInt32Array &meta) {
 	for (int i = 0; i < 9; i++) {
 		mt.m[i] = meta[i];
 	}
+	auto was = lanes.find(key);
+	if (was == lanes.end() || memcmp(was->second.m, mt.m, sizeof(mt.m)) != 0) {
+		lanes_moved = true;
+	}
 	lanes[key] = mt;
 	if (mt.m[0] == CURVE) {
 		arcs[key] = _arc(mt.m);
 	}
+	dropped_meta.erase(key);
+	dropped_arcs.erase(key);
 }
 
 void BeltDrawNative::drop_lane(i64 key) {
 	dropped.insert(key);
+	auto f = lanes.find(key);
+	if (f != lanes.end()) {
+		lanes_moved = true;
+		dropped_meta[key] = f->second;
+		auto a = arcs.find(key);
+		if (a != arcs.end()) {
+			dropped_arcs[key] = a->second;
+		}
+	}
 	lanes.erase(key);
 	arcs.erase(key);
 }
@@ -149,15 +164,21 @@ Vector4 BeltDrawNative::_point(i64 key, double pos) const {
 	if (f == lanes.end()) {
 		return Vector4(0.0f, (float)height, 0.0f, 0.0f);
 	}
-	const int32_t *m = f->second.m;
+	const Arc *arc = nullptr;
+	if (f->second.m[0] == CURVE) {
+		auto ar = arcs.find(key);
+		if (ar != arcs.end()) {
+			arc = &ar->second;
+		}
+	}
+	return _point_m(f->second.m, arc, pos, height);
+}
+
+Vector4 BeltDrawNative::_point_m(const int32_t *m, const Arc *arc, double pos, double height) {
 	double fr = clampd(pos / (double)std::max(m[1], 1), 0.0, 1.0);
 	double x, y;
-	auto ar = arcs.end();
-	if (m[0] == CURVE) {
-		ar = arcs.find(key);
-	}
-	if (m[0] == CURVE && ar != arcs.end() && ar->second.ok) {
-		const double *a = ar->second.a;
+	if (m[0] == CURVE && arc != nullptr && arc->ok) {
+		const double *a = arc->a;
 		double ang = a[3] + a[4] * fr;
 		x = a[0] + std::cos(ang) * a[2];
 		y = a[1] + std::sin(ang) * a[2];
@@ -246,8 +267,51 @@ bool BeltDrawNative::_in_view(i64 key, i64 pos, i64 reach) const {
 	return r.has_point(Vector2(p.x, p.z));
 }
 
+// (lattice) Whether a motion from line position `pos` of lane `key` over `reach` stays on lanes the lattice
+// draws (belt_items.gd _on_lat).
+bool BeltDrawNative::_on_lat(i64 key, i64 pos, i64 reach) const {
+	auto f = lat_ahead.find(key);
+	return f != lat_ahead.end() && std::max<i64>(reach, 0) <= pos + f->second;
+}
+
+// Why an item's motion isn't drawn: 0 it is, 1 out of the planned view, 2 (park_lat) on the lattice's lanes
+// all along, so its mask hides it there anyway.
+int BeltDrawNative::_hide_why(i64 key, i64 pos, i64 reach, i64 v) const {
+	if (!_in_view(key, pos, reach)) {
+		return 1;
+	}
+	if (park_lat && !lat_ahead.empty() && _on_lat(key, pos, v > 0 ? reach : 0)) {
+		return 2;
+	}
+	return 0;
+}
+
+void BeltDrawNative::_set_lat(Item *it, bool on) {
+	if (it->lat == on) {
+		return;
+	}
+	it->lat = on;
+	if (on) {
+		lat_items.set(it, true);
+	} else {
+		lat_items.erase(it);
+	}
+}
+
+// (later_tick) Something _apply_early reads of the item may have changed: its waiting changes are tried again.
+void BeltDrawNative::_touch(Item *it) {
+	it->ver = ++ver_seq;
+	if (it->waits) {
+		retry.push_back(it->uid);
+	}
+}
+
 void BeltDrawNative::_park(Item *it) {
 	if (it->slot >= 0) {
+		// (dump_parks, belt_items.gd's) Its record hidden: the draw dump says so, as gone.
+		if (dumping && dump_parks) {
+			dump_gone.push_back(it->uid);
+		}
 		_unplace(it);
 	}
 	it->parked = true;
@@ -255,14 +319,17 @@ void BeltDrawNative::_park(Item *it) {
 	renewing.erase(it);
 	it->path.clear();
 	_mark(it);
+	_touch(it);
 }
 
 void BeltDrawNative::_unpark(Item *it) {
 	it->parked = false;
+	_set_lat(it, false);
 	_place(it);
 	i64 n = it->count;
 	it->count = 1;
 	_set_count(it, n);
+	_touch(it);
 }
 
 void BeltDrawNative::_replan_parked() {
@@ -273,7 +340,9 @@ void BeltDrawNative::_replan_parked() {
 		}
 		i64 d = (it->v > 0 && now > it->t0) ? std::min<i64>(it->v * (now - it->t0), it->reach) : 0;
 		Vector2i at = d > 0 ? _advance(it->lane, it->pos, d) : Vector2i((int32_t)it->lane, (int32_t)it->pos);
-		if (!_in_view(at.x, at.y, it->reach - d)) {
+		int why = _hide_why(at.x, at.y, it->reach - d, it->v);
+		if (why != 0) {
+			_set_lat(it, why == 2);
 			continue;
 		}
 		if (d > 0) {
@@ -290,10 +359,227 @@ void BeltDrawNative::_replan_parked() {
 	}
 }
 
+// ---------------------------------------------------------------- the lattice's lanes
+
+// The lattice's update (run before this job) added and removed lanes: how far lattice lanes go on past each
+// worked out again; (ask view) lanes leaving it whose checks failed in places alone asked for now; (park_lat)
+// items no longer on its lanes all along planned again from their motion as _replan_parked does (an item on
+// a lane dropped from the square stands where it is, for the far icons' hand-over), and placed items now on
+// them all along let go of their slots. `graph`: the lanes' links may have moved (every lane looked at).
+void BeltDrawNative::_relattice(const PackedInt64Array &add, const PackedInt64Array &del, bool graph) {
+	for (int64_t q = 0; q < del.size(); q++) {
+		lat.erase(del[q]);
+	}
+	for (int64_t q = 0; q < add.size(); q++) {
+		lat.insert(add[q]);
+	}
+	bool changed = add.size() > 0 || del.size() > 0;
+	if (!changed && !(graph && !lat.empty())) {
+		return;
+	}
+	lat_ahead_dirty = true;  // (worked out when parking or the counters need it)
+	for (int64_t q = 0; q < del.size(); q++) {
+		i64 k = del[q];
+		if (lat_pend.erase(k) > 0 && !lat.count(k) && lanes.count(k) && !dropped.count(k)) {
+			asked[k] = now_msec;
+			resend.push_back(k);
+			ask_lat++;
+		}
+	}
+	if (!park_lat) {
+		return;
+	}
+	_lat_ahead();
+	i64 now = (i64)std::floor(fold_tick);
+	if (del.size() > 0 || graph) {
+		std::vector<Item *> list = lat_items.key_list();
+		for (Item *it : list) {
+			if (dropped.count(it->lane) || dropped_meta.count(it->lane)) {
+				_stand_dropped(it, now);
+				continue;
+			}
+			i64 d = (it->v > 0 && now > it->t0) ? std::min<i64>(it->v * (now - it->t0), it->reach) : 0;
+			Vector2i at = d > 0 ? _advance(it->lane, it->pos, d) : Vector2i((int32_t)it->lane, (int32_t)it->pos);
+			int why = _hide_why(at.x, at.y, it->reach - d, it->v);
+			if (why == 2) {
+				continue;
+			}
+			_set_lat(it, false);
+			if (why == 1) {
+				continue;  // (out of view: parked as anything out of it is)
+			}
+			if (d > 0) {
+				it->lane = at.x;
+				it->pos = at.y;
+				it->reach -= d;
+				auto f = lanes.find(it->lane);
+				it->run = (f != lanes.end() && f->second.m[0] == STRAIGHT) ? it->pos + sim->run_of(it->lane) : 0;
+				it->t0 = now;
+			}
+			_unpark(it);
+			_plan(it);
+			lat_unparks++;
+		}
+	}
+	if (add.size() > 0 || graph) {
+		std::vector<Item *> cand;
+		for (Kind *kind : kinds.val_list()) {
+			for (const SlotRef &e : kind->slots) {
+				if (e.it != nullptr && e.k == 0 && !e.it->parked && lat.count(e.it->lane)) {
+					cand.push_back(e.it);
+				}
+			}
+		}
+		for (Item *it : cand) {
+			i64 d = (it->v > 0 && now > it->t0) ? std::min<i64>(it->v * (now - it->t0), it->reach) : 0;
+			Vector2i at = d > 0 ? _advance(it->lane, it->pos, d) : Vector2i((int32_t)it->lane, (int32_t)it->pos);
+			if (!_on_lat(at.x, at.y, it->v > 0 ? it->reach - d : 0)) {
+				continue;
+			}
+			_park(it);
+			_set_lat(it, true);
+			lat_parks++;
+		}
+	}
+}
+
+// For each lane the lattice draws, how far (1/256) lattice lanes go on past its exit: its next's length and
+// that one's own, to the first lane that isn't the lattice's (a ring of them: LAT_FAR).
+void BeltDrawNative::_lat_ahead() {
+	lat_ahead_dirty = false;
+	lat_ahead.clear();
+	std::vector<i64> path;
+	std::unordered_map<i64, size_t> on_path;
+	for (i64 start : lat) {
+		if (lat_ahead.count(start)) {
+			continue;
+		}
+		path.clear();
+		on_path.clear();
+		i64 k = start;
+		i64 tail = 0;
+		size_t last = 0;
+		bool none = false;
+		while (true) {
+			on_path[k] = path.size();
+			path.push_back(k);
+			i64 nx = sim->next_of(k);
+			auto nf = nx == 0 ? lanes.end() : lanes.find(nx);
+			if (nx == 0 || nf == lanes.end() || !lat.count(nx)) {
+				last = path.size() - 1;
+				tail = 0;
+				break;
+			}
+			auto af = lat_ahead.find(nx);
+			if (af != lat_ahead.end()) {
+				last = path.size() - 1;
+				tail = std::min<i64>(LAT_FAR, (i64)nf->second.m[1] + af->second);
+				break;
+			}
+			auto pf = on_path.find(nx);
+			if (pf != on_path.end()) {
+				for (size_t j = pf->second; j < path.size(); j++) {
+					lat_ahead[path[j]] = LAT_FAR;
+				}
+				none = pf->second == 0;
+				last = none ? 0 : pf->second - 1;
+				tail = LAT_FAR;
+				break;
+			}
+			k = nx;
+		}
+		if (none) {
+			continue;
+		}
+		lat_ahead[path[last]] = tail;
+		for (size_t j = last; j-- > 0;) {
+			i64 nxt = path[j + 1];
+			auto nf = lanes.find(nxt);
+			i64 len = nf == lanes.end() ? 0 : (i64)nf->second.m[1];
+			lat_ahead[path[j]] = std::min<i64>(LAT_FAR, len + lat_ahead[nxt]);
+		}
+	}
+}
+
+// (park_lat) An item parked on the lattice's lanes whose lane was dropped from the square in this job's
+// messages: placed standing where its motion has it now (the dropped lanes' meta as they were), so its going
+// keeps it for the far icons (_go) and the belt is never bare; out of view it stays parked (it just goes).
+bool BeltDrawNative::_stand_dropped(Item *it, i64 now) {
+	_set_lat(it, false);
+	i64 d = (it->v > 0 && now > it->t0) ? std::min<i64>(it->v * (now - it->t0), it->reach) : 0;
+	auto meta_of = [this](i64 key) -> const Meta * {
+		auto f = lanes.find(key);
+		if (f != lanes.end()) {
+			return &f->second;
+		}
+		auto g = dropped_meta.find(key);
+		return g == dropped_meta.end() ? nullptr : &g->second;
+	};
+	i64 k = it->lane;
+	i64 p = it->pos;
+	i64 left = d;
+	bool stuck = false;
+	int guard = 0;
+	while (left > p && guard < 4096) {
+		left -= p;
+		i64 nx = sim->next_of(k);
+		const Meta *nm = nx == 0 ? nullptr : meta_of(nx);
+		if (nm == nullptr) {
+			stuck = true;
+			break;
+		}
+		k = nx;
+		p = nm->m[1];
+		guard++;
+	}
+	const Meta *m = meta_of(k);
+	if (m == nullptr) {
+		return false;
+	}
+	const Arc *arc = nullptr;
+	auto a = arcs.find(k);
+	if (a != arcs.end()) {
+		arc = &a->second;
+	} else {
+		auto b = dropped_arcs.find(k);
+		if (b != dropped_arcs.end()) {
+			arc = &b->second;
+		}
+	}
+	Vector4 q = _point_m(m->m, arc, (double)(stuck ? 0 : p - left), height);
+	if (view_cull && !view_all && !planned_view.grow((float)VIEW_MARGIN).has_point(Vector2(q.x, q.z))) {
+		return false;
+	}
+	_unpark(it);
+	it->v = 0;
+	it->from = Vector3(q.x, q.y, q.z);
+	it->step = Vector3();
+	it->path.clear();
+	it->t_from = fold_tick;
+	it->t_to = fold_tick;
+	it->hidden = q.w < 0.5f;
+	it->renew = -1.0;
+	renewing.erase(it);
+	_mark(it);
+	lat_unparks++;
+	return true;
+}
+
 // ---------------------------------------------------------------- changes
 
 void BeltDrawNative::_apply_changes(const Dictionary &ch) {
 	PackedInt64Array uids = ch["uid"];
+	puts.clear();
+	if (ch.has("hand_why")) {
+		PackedInt32Array hw = ch["hand_why"];
+		PackedInt64Array hu = ch["hand_uid"];
+		PackedInt64Array ht = ch["hand_tick"];
+		for (int64_t j = 0; j < hw.size(); j++) {
+			if (hw[j] == 3) {
+				puts[hu[j]] = ht[j];
+			}
+		}
+	}
 	changes = uids.size();
 	PackedInt32Array itemsa = ch["item"];
 	PackedInt32Array stacks = ch["stack"];
@@ -328,7 +614,7 @@ void BeltDrawNative::_apply_changes(const Dictionary &ch) {
 	std::unordered_set<i64> held;
 	std::vector<i64> idx;
 	if (coalesce) {
-		std::unordered_map<i64, i64> last_i;
+		last_i.clear();
 		last_i.reserve((size_t)n_ch);
 		for (i64 i = 0; i < n_ch; i++) {
 			if (T[i] > now) {
@@ -343,13 +629,18 @@ void BeltDrawNative::_apply_changes(const Dictionary &ch) {
 		}
 		std::sort(idx.begin(), idx.end());
 	}
-	if (!later.empty()) {
+	if (later_tick) {
+		_drain_due(now);
+	} else if (!later.empty()) {
 		std::vector<Later> lt;
 		lt.swap(later);
 		for (const Later &e : lt) {
 			if (e.tick > now || held.count(e.uid)) {
-				if (early && e.what == 0 && !held.count(e.uid) && _apply_early(e.uid, e.item, e.stack, e.key, e.pos, e.tick, e.speed, e.reach, e.run, now)) {
-					continue;
+				if (early && e.what == 0 && !held.count(e.uid)) {
+					early_tries++;
+					if (_apply_early(e.uid, e.item, e.stack, e.key, e.pos, e.tick, e.speed, e.reach, e.run, now)) {
+						continue;
+					}
 				}
 				held.insert(e.uid);
 				later.push_back(e);
@@ -374,12 +665,18 @@ void BeltDrawNative::_apply_changes(const Dictionary &ch) {
 			gi++;
 		}
 		i64 uid = U[i];
-		if (T[i] > now || (!held.empty() && held.count(uid))) {
-			if (early && !held.count(uid) && _apply_early(uid, I[i], S[i], K[i], P[i], T[i], V[i], R[i], RN[i], now)) {
-				continue;
+		bool h = _held(uid, held);
+		if (T[i] > now || h) {
+			bool tried = false;
+			i64 rt = INT64_MAX;
+			if (early && !h) {
+				early_tries++;
+				tried = true;
+				if (_apply_early(uid, I[i], S[i], K[i], P[i], T[i], V[i], R[i], RN[i], now, &rt)) {
+					continue;
+				}
 			}
-			held.insert(uid);
-			later.push_back(Later{ 0, uid, T[i], I[i], S[i], K[i], P[i], V[i], R[i], RN[i] });
+			_hold(Later{ 0, uid, T[i], I[i], S[i], K[i], P[i], V[i], R[i], RN[i] }, held, tried, rt);
 			continue;
 		}
 		_apply_one(uid, I[i], S[i], K[i], P[i], T[i], V[i], R[i], RN[i]);
@@ -388,15 +685,244 @@ void BeltDrawNative::_apply_changes(const Dictionary &ch) {
 		_go_or_hold(G[gi], timed ? GT[gi] : now, now, held);
 		gi++;
 	}
+	if (!later_tick) {
+		later_n = (i64)later.size();
+	}
+	_ask_mismatches(ch);
+}
+
+// Whether changes of the item wait (taken after them, in order).
+bool BeltDrawNative::_held(i64 uid, const std::unordered_set<i64> &held) const {
+	if (later_tick) {
+		return !waiting.empty() && waiting.count(uid) != 0;
+	}
+	return !held.empty() && held.count(uid) != 0;
+}
+
+// A change (or a going) to wait for the next jobs: in the list, or (later_tick) behind the item's others,
+// its first filed by tick (`tried`: it was just tried early and wasn't taken; retry_at: a start, tried again
+// once the drawn tick reaches the item's t0).
+void BeltDrawNative::_hold(const Later &e, std::unordered_set<i64> &held, bool tried, i64 retry_at) {
+	if (!later_tick) {
+		held.insert(e.uid);
+		later.push_back(e);
+		return;
+	}
+	later_n++;
+	Waiting &w = waiting[e.uid];
+	bool first = w.head >= w.q.size();
+	w.q.push_back(e);
+	if (!first) {
+		return;
+	}
+	Item **pit = items.get(e.uid);
+	Item *it = pit == nullptr ? nullptr : *pit;
+	if (it != nullptr) {
+		it->waits = true;
+	}
+	w.tried = tried ? (it != nullptr ? it->ver : -1) : -2;
+	w.retry_at = tried ? retry_at : INT64_MAX;
+	_file(e.uid, w);
+}
+
+// (later_tick) Files the item under the tick its first waiting change takes effect at (or is tried again).
+void BeltDrawNative::_file(i64 uid, Waiting &w) {
+	if (w.head >= w.q.size()) {
+		return;
+	}
+	i64 t = std::min(w.q[w.head].tick, w.retry_at);
+	if (t != w.filed) {
+		due[t].push_back(uid);
+		w.filed = t;
+	}
+}
+
+// (later_tick) The waiting changes this job can take: those of the items filed up to the drawn tick and of
+// the items that changed since their first was tried; of every waiting item when the lanes' links may have
+// moved (a lane set or dropped, a relink since the last job or one pending: an early take walks the lanes
+// ahead). Anything else would be tried as it was last time and stay. Same takes as the list's, item by item.
+void BeltDrawNative::_drain_due(i64 now) {
+	std::vector<i64> work;
+	while (!due.empty() && due.begin()->first <= now) {
+		i64 tb = due.begin()->first;
+		std::vector<i64> &v = due.begin()->second;
+		for (i64 uid : v) {
+			auto wf = waiting.find(uid);
+			if (wf != waiting.end() && wf->second.filed == tb) {
+				wf->second.filed = INT64_MIN;
+			}
+		}
+		work.insert(work.end(), v.begin(), v.end());
+		due.erase(due.begin());
+	}
+	bool all = graph_now && early;
+	if (all) {
+		work.clear();
+		work.reserve(waiting.size());
+		for (auto &kv : waiting) {
+			work.push_back(kv.first);
+		}
+	} else {
+		work.insert(work.end(), retry.begin(), retry.end());
+	}
+	// (By uid, as belt_items.gd: the order hands out slots, so both twins compact a kind in the same job.)
+	std::sort(work.begin(), work.end());
+	work.erase(std::unique(work.begin(), work.end()), work.end());
+	retry.clear();
+	i64 lv = sim->get_links_ver();
+	for (i64 uid : work) {
+		_drain(uid, now, all);
+	}
+	drained += (i64)work.size();
+	if (early && !all && sim->get_links_ver() != lv) {
+		// (Links worked out again on the way: every first change tried again, with them.)
+		work.clear();
+		for (auto &kv : waiting) {
+			work.push_back(kv.first);
+		}
+		std::sort(work.begin(), work.end());
+		for (i64 uid : work) {
+			_drain(uid, now, true);
+		}
+		drained += (i64)work.size();
+	}
+}
+
+// (later_tick) One item's waiting changes, in order: those due taken, then the first tried early (when
+// anything it reads may have changed since its last try), until one stays.
+void BeltDrawNative::_drain(i64 uid, i64 now, bool all) {
+	auto wf = waiting.find(uid);
+	if (wf == waiting.end()) {
+		return;
+	}
+	Waiting &w = wf->second;
+	while (w.head < w.q.size()) {
+		const Later e = w.q[w.head];
+		if (e.tick <= now) {
+			w.head++;
+			later_n--;
+			w.tried = -2;
+			w.retry_at = INT64_MAX;
+			if (e.what == 0) {
+				_apply_one(e.uid, e.item, e.stack, e.key, e.pos, e.tick, e.speed, e.reach, e.run);
+			} else {
+				_go(e.uid);
+			}
+			continue;
+		}
+		if (early && e.what == 0) {
+			Item **pit = items.get(uid);
+			Item *it = pit == nullptr ? nullptr : *pit;
+			if (it == nullptr) {
+				w.tried = -1;
+			} else if (all || it->ver != w.tried || now >= w.retry_at) {
+				early_tries++;
+				i64 rt = INT64_MAX;
+				if (_apply_early(e.uid, e.item, e.stack, e.key, e.pos, e.tick, e.speed, e.reach, e.run, now, &rt)) {
+					w.head++;
+					later_n--;
+					w.tried = -2;
+					w.retry_at = INT64_MAX;
+					continue;
+				}
+				w.tried = it->ver;
+				w.retry_at = rt;
+			}
+		}
+		break;
+	}
+	if (w.head >= w.q.size()) {
+		Item **pit = items.get(uid);
+		if (pit != nullptr) {
+			(*pit)->waits = false;
+		}
+		waiting.erase(wf);
+		return;
+	}
+	if (w.head >= 32 && w.head * 2 >= w.q.size()) {
+		w.q.erase(w.q.begin(), w.q.begin() + (std::ptrdiff_t)w.head);
+		w.head = 0;
+	}
+	if (w.retry_at <= now) {
+		w.retry_at = INT64_MAX;  // (not tried, no item: nothing to try again for)
+	}
+	_file(uid, w);
+}
+
+// The lanes whose drift check failed, asked for again (`bre`), each at most every ASK_AGAIN_MSEC, as before;
+// (--belt-sim-ask=view) a lane the lattice draws only when its count is wrong (every 30 s at most: places
+// and ids drifting on a full lane are what the lattice ignores; asked the moment it leaves the lattice), one
+// out of the planned view every 12 s, doubling to 60 s while it keeps failing. (ask_near) Nearest the view's
+// middle first: the bridge reads them in the order asked, bre_cap an update.
+void BeltDrawNative::_ask_mismatches(const Dictionary &ch) {
 	PackedInt64Array mism = ch["mismatch"];
+	PackedInt32Array mn = ch.has("mismatch_n") ? (PackedInt32Array)ch["mismatch_n"] : PackedInt32Array();
+	if (mism.size() == 0) {
+		return;
+	}
+	Vector2 c = view_all ? Vector2(square.x, square.y) : view.get_center();
+	std::vector<std::pair<double, i64>> out;
 	for (i64 i = 0; i < mism.size(); i++) {
 		i64 key = mism[i];
-		auto f = asked.find(key);
-		i64 last = f == asked.end() ? -ASK_AGAIN_MSEC : f->second;
-		if (now_msec - last >= ASK_AGAIN_MSEC) {
-			asked[key] = now_msec;
-			resend.push_back(key);
+		bool count = i < mn.size() ? mn[i] != 0 : true;
+		auto lf = lanes.find(key);
+		int cls = 0;  // 0 in view, 1 the lattice's, 2 out of view
+		if (lat.count(key)) {
+			cls = 1;
+		} else if (lf != lanes.end() && !_in_view(key, lf->second.m[1] / 2, 0)) {
+			cls = 2;
 		}
+		i64 every = ASK_AGAIN_MSEC;
+		if (ask_mode == 1) {
+			if (cls == 1) {
+				if (!count) {
+					lat_pend.insert(key);
+					ask_held++;
+					continue;
+				}
+				every = ASK_LATTICE_MSEC;
+			} else if (cls == 2) {
+				auto of = out_every.find(key);
+				every = of == out_every.end() ? ASK_OUT_MSEC : of->second;
+			} else {
+				out_every.erase(key);
+			}
+		}
+		auto f = asked.find(key);
+		i64 last = f == asked.end() ? -LAT_FAR : f->second;
+		if (now_msec - last < every) {
+			ask_held++;
+			continue;
+		}
+		asked[key] = now_msec;
+		if (ask_mode == 1 && cls == 2) {
+			// (Failing again after a quiet spell: from 12 s again.)
+			auto of = out_every.find(key);
+			bool fresh = of == out_every.end() || now_msec - last > 2 * every;
+			out_every[key] = fresh ? ASK_OUT_MSEC : std::min<i64>(every * 2, ASK_OUT_MAX_MSEC);
+		}
+		if (cls == 1) {
+			lat_pend.erase(key);
+			ask_lat++;
+		} else if (cls == 2) {
+			ask_out++;
+		} else {
+			ask_view++;
+		}
+		double d2 = 0.0;
+		if (lf != lanes.end()) {
+			Vector4 p = _point(key, (double)lf->second.m[1] * 0.5);
+			double dx = (double)p.x - (double)c.x;
+			double dz = (double)p.z - (double)c.y;
+			d2 = dx * dx + dz * dz;
+		}
+		out.push_back(std::make_pair(d2, key));
+	}
+	if (ask_near) {
+		std::sort(out.begin(), out.end());
+	}
+	for (const auto &e : out) {
+		resend.push_back(e.second);
 	}
 }
 
@@ -407,9 +933,8 @@ void BeltDrawNative::_go_or_hold(i64 uid, i64 t, i64 now, std::unordered_set<i64
 			t = now;
 		}
 	}
-	if (t > now || (!held.empty() && held.count(uid))) {
-		held.insert(uid);
-		later.push_back(Later{ 1, uid, t, 0, 0, 0, 0, 0, 0, 0 });
+	if (t > now || _held(uid, held)) {
+		_hold(Later{ 1, uid, t, 0, 0, 0, 0, 0, 0, 0 }, held, false, INT64_MAX);
 		return;
 	}
 	_go(uid);
@@ -442,6 +967,7 @@ void BeltDrawNative::_go(i64 uid) {
 			renewing.erase(it);
 			kept.set(it, Vector2i(cx, cz));
 			_mark(it);
+			_touch(it);
 			return;
 		}
 	}
@@ -449,11 +975,25 @@ void BeltDrawNative::_go(i64 uid) {
 }
 
 // belt_items.gd's _apply_early: a change after the drawn tick taken now when nothing shows early (a start
-// of a standing item, or a continuation of a moving item's record across a line's end).
-bool BeltDrawNative::_apply_early(i64 uid, i64 item, i64 stack, i64 key, i64 pos, i64 t0, i64 v, i64 reach, i64 run, i64 now) {
+// of a standing item, or a continuation of a moving item's record across a line's end). Not taken only for
+// want of time (a start whose item stands there from a later tick): `retry_at` says that tick.
+bool BeltDrawNative::_apply_early(i64 uid, i64 item, i64 stack, i64 key, i64 pos, i64 t0, i64 v, i64 reach, i64 run, i64 now,
+		i64 *retry_at) {
 	Item **pit = items.get(uid);
 	if (pit == nullptr) {
-		return false;
+		// (--inserter-handoff) An item a hand puts on its belt: made now, hidden till the put's tick.
+		auto pf = puts.find(uid);
+		if (pf == puts.end() || pf->second != t0) {
+			return false;
+		}
+		_apply_one(uid, item, stack, key, pos, t0, v, reach, run);
+		Item **nit = items.get(uid);
+		if (nit != nullptr) {
+			(*nit)->show_at = (double)t0;
+			_mark(*nit);
+		}
+		early_n++;
+		return true;
 	}
 	Item *it = *pit;
 	i64 n = std::max<i64>(1, std::min<i64>(stack, MAX_STACK));
@@ -461,10 +1001,15 @@ bool BeltDrawNative::_apply_early(i64 uid, i64 item, i64 stack, i64 key, i64 pos
 		return false;
 	}
 	if (it->v <= 0) {
-		if (v > 0 && it->lane == key && it->pos == pos && it->t0 <= now) {
-			_apply_one(uid, item, stack, key, pos, t0, v, reach, run);
-			early_n++;
-			return true;
+		if (v > 0 && it->lane == key && it->pos == pos) {
+			if (it->t0 <= now) {
+				_apply_one(uid, item, stack, key, pos, t0, v, reach, run);
+				early_n++;
+				return true;
+			}
+			if (retry_at != nullptr) {
+				*retry_at = it->t0;
+			}
 		}
 		return false;
 	}
@@ -487,8 +1032,10 @@ bool BeltDrawNative::_apply_early(i64 uid, i64 item, i64 stack, i64 key, i64 pos
 	it->reach = (d - d0) + reach;
 	auto f = lanes.find(it->lane);
 	it->run = (f != lanes.end() && f->second.m[0] == STRAIGHT) ? it->pos + sim->run_of(it->lane) : 0;
-	if (!_in_view(it->lane, it->pos, it->reach)) {
+	int why = _hide_why(it->lane, it->pos, it->reach, it->v);
+	if (why != 0) {
 		_park(it);
+		_set_lat(it, why == 2);
 		parked++;
 		return true;
 	}
@@ -509,6 +1056,7 @@ void BeltDrawNative::_apply_one(i64 uid, i64 item, i64 stack, i64 key, i64 pos, 
 		it->c = std::cos(a);
 		it->s = std::sin(a);
 		it->parked = true;
+		it->waits = later_tick && !waiting.empty() && waiting.count(uid) != 0;
 		items.set(uid, it);
 	} else {
 		it = *pit;
@@ -525,10 +1073,13 @@ void BeltDrawNative::_apply_one(i64 uid, i64 item, i64 stack, i64 key, i64 pos, 
 	it->v = v;
 	it->reach = reach;
 	it->run = run;
-	if (!_in_view(key, pos, reach)) {
+	_touch(it);
+	int why = _hide_why(key, pos, reach, v);
+	if (why != 0) {
 		if (!it->parked) {
 			_park(it);
 		}
+		_set_lat(it, why == 2);
 		parked++;
 		return;
 	}
@@ -549,6 +1100,7 @@ void BeltDrawNative::_plan(Item *it) {
 	it->path.clear();
 	it->hidden = p0.w < 0.5f;
 	_mark(it);
+	_touch(it);
 	auto lf = lanes.find(it->lane);
 	if (lf != lanes.end() && it->pos > lf->second.m[1]) {
 		it->hidden = true;
@@ -750,6 +1302,7 @@ void BeltDrawNative::_remove(i64 uid) {
 	_free_path(it);
 	renewing.erase(it);
 	kept.erase(it);
+	lat_items.erase(it);
 	// (GDScript's Item lives on while anything refers to it; here only `dirty` can, and _write lets it go.)
 	if (it->dirty) {
 		it->uid = -1;
@@ -1120,7 +1673,7 @@ void BeltDrawNative::_records(const std::vector<SlotRef> &batch, int writing) {
 			d[o + 12] = (float)(it->slot - slot);
 			d[o + 13] = (float)e.k;
 			d[o + 14] = (float)kind->pile;
-			records.mark(r / PER_PAGE);
+			records.mark(r / records.per_page);
 			continue;
 		}
 		// Every item turns, models, icon cards and blocks alike (item_cards.gd turn_for).
@@ -1155,8 +1708,8 @@ void BeltDrawNative::_records(const std::vector<SlotRef> &batch, int writing) {
 		d[o + 12] = 0.0f;
 		d[o + 13] = 0.0f;
 		d[o + 14] = 0.0f;
-		d[o + 15] = 0.0f;
-		records.mark(r / PER_PAGE);
+		d[o + 15] = it->hide_at >= 0.0 ? (float)(it->hide_at - base) : (it->show_at >= 0.0 ? (float)(base - it->show_at) : 0.0f);
+		records.mark(r / records.per_page);
 		if (dumping && e.k == 0) {
 			i64 ids[8] = { it->uid, it->item_id, it->count, it->lane, it->pos, it->t0, it->v, it->reach };
 			dump_ids.insert(dump_ids.end(), ids, ids + 8);
@@ -1223,6 +1776,7 @@ Dictionary BeltDrawNative::run_job(const Dictionary &ch, const Dictionary &param
 	lead_on = (bool)params.get("lead_on", true);
 	gone_order = (bool)params.get("gone_order", true);
 	pile_one = (bool)params.get("pile_one", true);
+	dump_parks = (bool)params.get("dump_parks", true);
 	view_all = (bool)params.get("view_all", true);
 	view = (Rect2)params.get("view", Rect2());
 	cam_led = (bool)params.get("cam_led", false);
@@ -1233,33 +1787,44 @@ Dictionary BeltDrawNative::run_job(const Dictionary &ch, const Dictionary &param
 	for (int i = 0; i < cpl.size(); i++) {
 		cam_planes.push_back((Plane)cpl[i]);
 	}
-	known.clear();
-	Dictionary kn = params.get("known", Dictionary());
-	Array kk = kn.keys();
-	for (int i = 0; i < kk.size(); i++) {
-		Array look = kn[kk[i]];
-		Look l;
-		if (look.size() >= 2) {
-			l.lift = (Vector3)look[0];
-			l.turns = (bool)look[1];
-			l.pile = look.size() > 2 ? (double)look[2] : 0.07;
-			known[(i64)kk[i]] = l;
+	later_tick = (bool)params.get("later_tick", true);
+	park_lat = (bool)params.get("park_lat", false);
+	ask_mode = (int)params.get("ask", 0);
+	ask_near = (bool)params.get("ask_near", true);
+	// The kinds' looks and the far icons' chunks are given only when they changed (belt_items.gd, A4):
+	// otherwise those of the last job stand.
+	if (params.has("known")) {
+		known.clear();
+		Dictionary kn = params["known"];
+		Array kk = kn.keys();
+		for (int i = 0; i < kk.size(); i++) {
+			Array look = kn[kk[i]];
+			Look l;
+			if (look.size() >= 2) {
+				l.lift = (Vector3)look[0];
+				l.turns = (bool)look[1];
+				l.pile = look.size() > 2 ? (double)look[2] : 0.07;
+				known[(i64)kk[i]] = l;
+			}
 		}
 	}
-	far_built.clear();
-	Variant fb = params.get("far_built", Variant());
-	far_given = fb.get_type() == Variant::DICTIONARY;
-	if (far_given) {
-		Dictionary fbd = fb;
-		Array fk = fbd.keys();
-		for (int i = 0; i < fk.size(); i++) {
-			Vector2i c = fk[i];
-			far_built.insert(_chunk_key(c.x, c.y));
+	if (params.has("far_built")) {
+		far_built.clear();
+		Variant fb = params["far_built"];
+		far_given = fb.get_type() == Variant::DICTIONARY;
+		if (far_given) {
+			Dictionary fbd = fb;
+			Array fk = fbd.keys();
+			for (int i = 0; i < fk.size(); i++) {
+				Vector2i c = fk[i];
+				far_built.insert(_chunk_key(c.x, c.y));
+			}
 		}
 	}
 	written = Array();
 	unknown = Array();
 	records_written = changes = coalesced = early_n = renewed = gone_n = parked = unparked = 0;
+	early_tries = ask_view = ask_lat = ask_out = ask_held = lat_parks = lat_unparks = drained = 0;
 	resend.clear();
 	paths = Ref<Image>();
 	dump_ids.clear();
@@ -1267,8 +1832,88 @@ Dictionary BeltDrawNative::run_job(const Dictionary &ch, const Dictionary &param
 	dump_gone.clear();
 
 	i64 ta = now_us();
+	// (A lane set or dropped, links worked out since the last job or about to be: next_of may answer
+	// otherwise, which the lattice's lanes ahead and the waiting changes' early takes read.)
+	graph_now = lanes_moved || sim->get_links_ver() != links_seen || sim->links_pending();
+	lanes_moved = false;
 	bool view_moved = _set_view();
+	PackedInt64Array lat_add = params.get("lat_add", PackedInt64Array());
+	PackedInt64Array lat_del = params.get("lat_del", PackedInt64Array());
+	_relattice(lat_add, lat_del, graph_now);
 	_apply_changes(ch);
+	// (--inserter-handoff) belt_items.gd Job._hands: an item a take still to come was guessed to take (peek)
+	// and a taken item's record hide on the take's tick; a guess the take didn't make is shown again.
+	// (Only a take after the drawn tick hides a record: belt_items.gd Job._hands.)
+	i64 h_now = (i64)std::floor(fold_tick);
+	if (ch.has("peek_uid")) {
+		PackedInt64Array pu = ch["peek_uid"];
+		PackedInt64Array pt = ch["peek_tick"];
+		PackedInt64Array pi = ch["peek_ins"];
+		for (int64_t j = 0; j < pu.size(); j++) {
+			Item **pit = items.get(pu[j]);
+			if (pit != nullptr && (*pit)->hide_at < 0.0 && pt[j] > h_now) {
+				(*pit)->hide_at = (double)pt[j];
+				_mark(*pit);
+			}
+			peeks[std::make_pair(pi[j], pt[j])].push_back(pu[j]);
+		}
+	}
+	if (ch.has("hand_uid")) {
+		PackedInt64Array hu = ch["hand_uid"];
+		PackedInt64Array ht = ch["hand_tick"];
+		PackedInt64Array hi = ch["hand_ins"];
+		PackedInt32Array hw = ch["hand_why"];
+		for (int64_t j = 0; j < hu.size(); j++) {
+			if (hw[j] != 0 || ht[j] <= h_now) {
+				continue;
+			}
+			Item **pit = items.get(hu[j]);
+			if (pit != nullptr && (*pit)->hide_at < 0.0) {
+				(*pit)->hide_at = (double)ht[j];
+				_mark(*pit);
+			}
+		}
+		if (!peeks.empty()) {
+			// (In the order the hand records came, as belt_items.gd's Dictionary.)
+			std::vector<std::pair<i64, i64>> order;
+			std::map<std::pair<i64, i64>, std::vector<i64>> taken;
+			for (int64_t j = 0; j < hu.size(); j++) {
+				auto pk = std::make_pair(hi[j], ht[j]);
+				if (peeks.count(pk)) {
+					if (!taken.count(pk)) {
+						order.push_back(pk);
+					}
+					std::vector<i64> &t = taken[pk];
+					if (hw[j] == 0) {
+						t.push_back(hu[j]);
+					}
+				}
+			}
+			for (const auto &pk : order) {
+				const std::vector<i64> &got = taken[pk];
+				for (i64 p : peeks[pk]) {
+					if (std::find(got.begin(), got.end(), p) == got.end()) {
+						Item **wit = items.get(p);
+						if (wit != nullptr && (*wit)->hide_at == (double)pk.second) {
+							(*wit)->hide_at = -1.0;
+							_mark(*wit);
+						}
+					}
+				}
+				peeks.erase(pk);
+			}
+			if (peeks.size() > 512) {
+				i64 old = h_now - 600;
+				for (auto it = peeks.begin(); it != peeks.end();) {
+					if (it->first.second < old) {
+						it = peeks.erase(it);
+					} else {
+						++it;
+					}
+				}
+			}
+		}
+	}
 	if (view_moved) {
 		_replan_parked();
 	}
@@ -1293,6 +1938,12 @@ Dictionary BeltDrawNative::run_job(const Dictionary &ch, const Dictionary &param
 	_write();
 	i64 te = now_us();
 	dropped.clear();
+	dropped_meta.clear();
+	dropped_arcs.clear();
+	links_seen = sim->get_links_ver();
+	if (jobs_n++ % GAUGE_EVERY == 0) {
+		_gauges();
+	}
 
 	// Positions of the watched items (position_of).
 	Dictionary positions;
@@ -1306,6 +1957,7 @@ Dictionary BeltDrawNative::run_job(const Dictionary &ch, const Dictionary &param
 			wl.push_back((i64)watch[i]);
 		}
 	}
+	i64 now_t = (i64)std::floor(fold_tick);
 	for (i64 uid : wl) {
 		Item **pit = items.get(uid);
 		if (pit == nullptr) {
@@ -1313,12 +1965,34 @@ Dictionary BeltDrawNative::run_job(const Dictionary &ch, const Dictionary &param
 		}
 		Item *it = *pit;
 		Array p;
-		p.push_back(it->from);
-		p.push_back(it->step);
-		p.push_back(to_packed<PackedFloat32Array>(it->path));
-		p.push_back(it->t_from);
-		p.push_back(it->t_to);
-		p.push_back(it->hidden);
+		if (it->lat) {
+			// (Parked on the lattice's lanes: no record; where its motion has it, in a straight line.)
+			i64 d = (it->v > 0 && now_t > it->t0) ? std::min<i64>(it->v * (now_t - it->t0), it->reach) : 0;
+			Vector2i a = d > 0 ? _advance(it->lane, it->pos, d) : Vector2i((int32_t)it->lane, (int32_t)it->pos);
+			Vector4 q = _point(a.x, a.y);
+			Vector3 from(q.x, q.y, q.z);
+			Vector3 step;
+			double t_to = (double)now_t;
+			if (it->v > 0 && it->reach > d) {
+				Vector2i b = _advance(it->lane, it->pos, it->reach);
+				Vector4 r = _point(b.x, b.y);
+				step = Vector3(r.x, r.y, r.z) - from;
+				t_to = (double)it->t0 + (double)it->reach / (double)it->v;
+			}
+			p.push_back(from);
+			p.push_back(step);
+			p.push_back(PackedFloat32Array());
+			p.push_back((double)now_t);
+			p.push_back(t_to);
+			p.push_back(false);
+		} else {
+			p.push_back(it->from);
+			p.push_back(it->step);
+			p.push_back(to_packed<PackedFloat32Array>(it->path));
+			p.push_back(it->t_from);
+			p.push_back(it->t_to);
+			p.push_back(it->hidden);
+		}
 		positions[uid] = p;
 	}
 	Dictionary hc;
@@ -1344,8 +2018,23 @@ Dictionary BeltDrawNative::run_job(const Dictionary &ch, const Dictionary &param
 	res["held_chunks"] = hc;
 	res["count"] = (i64)items.size();
 	res["kept"] = (i64)kept.size();
-	res["later"] = (i64)later.size();
+	res["later"] = later_n;
 	res["lanes"] = (i64)lanes.size();
+	// (Counters, belt_items.gd stats: join.belt_stats.)
+	res["early_tries"] = early_tries;
+	res["drained"] = drained;
+	res["waiting"] = later_tick ? (i64)waiting.size() : (i64)-1;
+	res["ask_view"] = ask_view;
+	res["ask_lat"] = ask_lat;
+	res["ask_out"] = ask_out;
+	res["ask_held"] = ask_held;
+	res["lat_parks"] = lat_parks;
+	res["lat_unparks"] = lat_unparks;
+	res["lat_lanes"] = (i64)lat.size();
+	res["slots"] = g_slots;
+	res["slots_hidden"] = g_hidden;
+	res["parked_view"] = g_parked_view;
+	res["parked_lat"] = g_parked_lat;
 	if (paths.is_valid()) {
 		res["paths"] = paths;
 		if (dumping) {
@@ -1426,13 +2115,48 @@ Dictionary BeltDrawNative::stats() const {
 	d["pages"] = records.pages;
 	d["path_top"] = path_top;
 	d["renewing"] = (i64)renewing.size();
-	d["later"] = (i64)later.size();
+	d["later"] = later_n;
 	d["kept"] = (i64)kept.size();
+	d["lat_items"] = (i64)lat_items.size();
 	return d;
+}
+
+// The counters that walk every slot and item (slots in use and those on lattice lanes all along, which the
+// mask hides; parked items by why), every GAUGE_EVERY jobs.
+void BeltDrawNative::_gauges() {
+	if (lat_ahead_dirty) {
+		_lat_ahead();
+	}
+	g_slots = 0;
+	g_hidden = 0;
+	for (Kind *kind : kinds.val_list()) {
+		for (const SlotRef &e : kind->slots) {
+			if (e.it == nullptr || e.k != 0) {
+				continue;
+			}
+			i64 n = 1 + (i64)e.it->layers.size();
+			g_slots += n;
+			if (!lat_ahead.empty() && _on_lat(e.it->lane, e.it->pos, e.it->v > 0 ? e.it->reach : 0)) {
+				g_hidden += n;
+			}
+		}
+	}
+	g_parked_view = 0;
+	g_parked_lat = 0;
+	for (size_t i = 0; i < items.vals.size(); i++) {
+		if (items.live[i] && items.vals[i]->parked) {
+			if (items.vals[i]->lat) {
+				g_parked_lat++;
+			} else {
+				g_parked_view++;
+			}
+		}
+	}
 }
 
 void BeltDrawNative::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_sim", "sim"), &BeltDrawNative::set_sim);
+	ClassDB::bind_method(D_METHOD("set_small_pages", "on"), &BeltDrawNative::set_small_pages);
 	ClassDB::bind_method(D_METHOD("set_lane", "key", "meta"), &BeltDrawNative::set_lane);
 	ClassDB::bind_method(D_METHOD("drop_lane", "key"), &BeltDrawNative::drop_lane);
 	ClassDB::bind_method(D_METHOD("run_job", "changes", "params"), &BeltDrawNative::run_job);

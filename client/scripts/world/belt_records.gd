@@ -18,7 +18,9 @@ extends RefCounted
 ## Each item kind (a MultiMesh, item_cards.gd) has a run of records of its own, one per slot: the
 ## shader reads record `belt_base` + INSTANCE_ID, so the MultiMesh's own buffer is never written
 ## after its size changes. Records live in pages (layers of the texture array); only the pages
-## written since the last upload go to the GPU.
+## written since the last upload go to the GPU. A page is 4 rows (64 KB, 1,024 records) and the array
+## starts with START_PAGES of them (--belt-draw-small-pages=off: 16 rows, 256 KB, and one page, as
+## before); the shader takes a page's size from the texture's.
 ##
 ## Ticks are stored from `base` (the first update's tick), so a float32 keeps them to a few
 ## hundredths of a tick for several hours of game.
@@ -27,15 +29,26 @@ extends RefCounted
 
 const TEXELS := 4  # texels a record
 const ROW := 1024  # texels a row
-const PAGE_ROWS := 16
+const PAGE_ROWS := 16  # (--belt-draw-small-pages=off) 4,096 records a page
+const SMALL_ROWS := 4  # 1,024 records a page
 const FLOATS := TEXELS * 4
-const PER_PAGE := ROW * PAGE_ROWS / TEXELS  # 4096 records a page
-const PAGE_FLOATS := PER_PAGE * FLOATS
+## (small) The pages the array starts with: the first load's growing made the array again (every page
+## uploaded) at 1, 2, 4 and 8 pages, a 1.5-3 ms frame each.
+const START_PAGES := 8
 ## Runs are handed out in sizes of a power of two, from this up.
 const MIN_RUN := 64
 ## Path codes in texel 2, w.
 const HIDDEN := -1.0
 
+## --belt-draw-small-pages=off: pages of 16 rows (256 KB), one at the start, as before. On (the default):
+## 4 rows (64 KB), START_PAGES at the start. One record written sends its whole page up: a job wrote a few
+## thousand records over every page, and a quarter of a page each is a quarter of the copy and the upload.
+static var small := true
+
+var rows := PAGE_ROWS  # this one's page: rows, records and floats (set when made, from `small`)
+var per_page := ROW * PAGE_ROWS / TEXELS
+var page_floats := ROW * PAGE_ROWS / TEXELS * FLOATS
+var start_pages := 1
 var data := PackedFloat32Array()
 var pages := 0
 ## Pages written since take_pages().
@@ -45,6 +58,14 @@ var all_dirty := false
 var base := -1.0
 var _top := 0  # records handed out so far, the next run starts here
 var _free := {}  # run size -> Array of free run starts
+
+
+func _init() -> void:
+	if small:
+		rows = SMALL_ROWS
+		start_pages = START_PAGES
+	per_page = ROW * rows / TEXELS
+	page_floats = per_page * FLOATS
 
 
 ## A run of records for `n` slots (rounded up to a power of two): its first record.
@@ -79,19 +100,19 @@ func copy(from: int, to: int, n: int) -> void:
 
 
 func _grow(records: int) -> void:
-	var need := (records + PER_PAGE - 1) / PER_PAGE
+	var need := (records + per_page - 1) / per_page
 	if need <= pages:
 		return
-	var p := maxi(1, pages)
+	var p := maxi(start_pages, pages)
 	while p < need:
 		p *= 2
 	pages = p
-	data.resize(pages * PAGE_FLOATS)
+	data.resize(pages * page_floats)
 	all_dirty = true
 
 
 func _mark_range(start: int, n: int) -> void:
-	for p in range(start / PER_PAGE, (start + maxi(n, 1) - 1) / PER_PAGE + 1):
+	for p in range(start / per_page, (start + maxi(n, 1) - 1) / per_page + 1):
 		dirty[p] = true
 
 
@@ -101,7 +122,7 @@ func hide(r: int) -> void:
 	for k in FLOATS:
 		data[o + k] = 0.0
 	data[o + 11] = HIDDEN
-	dirty[r / PER_PAGE] = true
+	dirty[r / per_page] = true
 
 
 ## Ticks as stored: from `base`.
@@ -116,8 +137,8 @@ func take_pages() -> Dictionary:
 	var all := all_dirty
 	var which: Array = range(pages) if all else dirty.keys()
 	for p in which:
-		var bytes := data.slice(p * PAGE_FLOATS, (p + 1) * PAGE_FLOATS).to_byte_array()
-		list.append([p, Image.create_from_data(ROW, PAGE_ROWS, false, Image.FORMAT_RGBAF, bytes)])
+		var bytes := data.slice(p * page_floats, (p + 1) * page_floats).to_byte_array()
+		list.append([p, Image.create_from_data(ROW, rows, false, Image.FORMAT_RGBAF, bytes)])
 	dirty = {}
 	all_dirty = false
 	return {"all": all, "pages": list}

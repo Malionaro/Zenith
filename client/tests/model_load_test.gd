@@ -275,7 +275,8 @@ func _edits_check() -> void:
 	MaterialRows._value(ShaderMaterial.new(), "grain")
 	var kinds := {"albedo": TYPE_COLOR, "emission": TYPE_COLOR, "grime_color": TYPE_COLOR, "edge_color": TYPE_COLOR,
 		"rust_color": TYPE_COLOR, "dust_color": TYPE_COLOR, "part_weathering": TYPE_VECTOR4,
-		"part_light": TYPE_VECTOR2, "activity_glow": TYPE_BOOL, "part_colors": TYPE_BOOL, "glow_fades": TYPE_BOOL}
+		"part_light": TYPE_VECTOR2, "activity_glow": TYPE_BOOL, "part_colors": TYPE_BOOL, "glow_fades": TYPE_BOOL,
+		"skin_mode": TYPE_INT, "skin_tint2": TYPE_COLOR}
 	for u: String in MaterialRows.ROW_PARAMS:
 		var d: Variant = MaterialRows._defaults.get(u)
 		if typeof(d) != int(kinds.get(u, TYPE_FLOAT)):

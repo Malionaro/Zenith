@@ -24,6 +24,8 @@ const VehicleAnim := preload("res://scripts/world/vehicle_anim.gd")
 const RobotSwarm := preload("res://scripts/world/robot_swarm.gd")
 const MoverRecords := preload("res://scripts/world/mover_records.gd")
 const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
+const Probing := preload("res://scripts/debug/probing.gd")
+const GroundHeight := preload("res://scripts/world/ground_height.gd")
 
 const MISSING_FRAMES := 3
 const FOLLOW_RATE := 15.0
@@ -148,7 +150,7 @@ var _seen := {}
 var _waiting := {}
 var _model_generation := -1
 var _materials := {}  # proto id -> Material
-var _shadow_material: StandardMaterial3D
+var _shadow_material: ShaderMaterial
 ## Biters and spitters are drawn and animated together (creatures.gd); their nodes stay empty.
 var creatures := Creatures.new()
 ## Vehicles' and robots' moving parts and glow (spidertron legs, robots, cargo pods, treads).
@@ -161,6 +163,15 @@ var _grid_frame := -1
 var _frame := 0
 ## The last frame's _process time, microseconds (--robot-probe).
 var process_usec := 0
+## Movers whose model has arrived (ModelLibrary.generation) are dressed (their meshes, moving parts,
+## shadows and cards made, robot batches made again on the new mesh) for at most this long a frame,
+## at least one a frame: a join's robots and rolling stock all wait for the same few models, and
+## dressing every one in the frame the model came was a 150-180 ms frame at -62,-26.
+## --movers-dress-usec=N (1500; 0: all at once, as before).
+static var dress_usec := 1500
+static var _dress_arg_read := false
+var _to_dress := {}  # unit -> true: waiting movers whose model is ready, dressed within dress_usec a frame
+var _refresh_due := false  # robots' batches still to be made again on a new mesh (robots.refresh)
 
 
 func _ready() -> void:
@@ -186,6 +197,8 @@ func reset() -> void:
 	_fog_list.clear()
 	_seen.clear()
 	_waiting.clear()
+	_to_dress.clear()
+	_refresh_due = false
 	_frame_tick = -1
 	clock = GameClock.new()
 	creatures.clear()
@@ -482,6 +495,11 @@ func set_night(n: float) -> void:
 			h.visible = _beam > 0.01
 
 
+## Where a locomotive's headlights sit in its model: either side of its nose (models face north, -Z).
+const HEADLIGHT_HEIGHT := 1.4
+const HEADLIGHT_AHEAD := -3.2
+
+
 func _add_headlights(m: Mover) -> void:
 	for side in [-0.6, 0.6]:
 		var h := SpotLight3D.new()
@@ -489,12 +507,22 @@ func _add_headlights(m: Mover) -> void:
 		h.spot_range = 30.0
 		h.spot_angle = 18.0
 		h.spot_attenuation = 0.5
-		h.position = Vector3(side, 1.4, -3.2)  # the locomotive's nose (models face north, -Z)
+		h.position = Vector3(side, HEADLIGHT_HEIGHT, HEADLIGHT_AHEAD)
 		h.rotation.x = deg_to_rad(-6.0)
 		h.light_energy = 7.0 * _beam
 		h.visible = _beam > 0.01
 		m.node.add_child(h)
 		m.headlights.append(h)
+
+
+## A locomotive's headlights over the add-on's hills under its nose (ground_height.gd): the model is
+## lifted onto them in its shader, the lights are placed here, and at the flat height they sat inside
+## raised ground. One height read a frame per locomotive, only while they shine.
+func _lift_headlights(m: Mover) -> void:
+	var nose := m.node.transform * Vector3(0.0, 0.0, HEADLIGHT_AHEAD)
+	var y := HEADLIGHT_HEIGHT + GroundHeight.at(nose.x, nose.z)
+	for h: SpotLight3D in m.headlights:
+		h.position.y = y
 
 
 ## Drops a mover at once (it died) instead of waiting for it to stop showing up.
@@ -637,7 +665,8 @@ func pick(point: Vector2, radius: float, types: Array) -> Array:
 
 
 ## The mover of one of these types that the mouse ray (`from`, `dir`, world space) hits first:
-## [unit, proto id, fixed position, centre (Vector2 tiles), half size (Vector2), yaw], or [].
+## [unit, proto id, fixed position, centre (Vector2 tiles), half size (Vector2), yaw, distance along
+## the ray], or [].
 ## Each mover is hit within its selection box turned by its orientation, as tall as its model
 ## (and anywhere on the model, where that sticks out of the box), so a click anywhere on a train,
 ## car, tank or spidertron opens it, not the rail or ground behind it.
@@ -664,7 +693,7 @@ func pick_ray(from: Vector3, dir: Vector3, types: Array) -> Array:
 			best_distance = d
 			var c := proto.center()
 			var at := m.node.global_transform * Vector3(c.x, 0.0, c.y)
-			best = [unit, m.proto_id, m.fixed, Vector2(at.x, at.z), proto.size() * 0.5, m.node.rotation.y]
+			best = [unit, m.proto_id, m.fixed, Vector2(at.x, at.z), proto.size() * 0.5, m.node.rotation.y, d]
 	return best
 
 
@@ -712,17 +741,31 @@ func _process(delta: float) -> void:
 
 func _process_movers(delta: float) -> void:
 	_frame += 1
+	if not _dress_arg_read:
+		_dress_arg_read = true
+		for a in OS.get_cmdline_user_args():
+			if a.begins_with("--movers-dress-usec="):
+				dress_usec = maxi(0, int(a.substr(20)))
 	if _model_generation != ModelLibrary.generation:
 		_model_generation = ModelLibrary.generation
-		robots.refresh()
+		_refresh_due = true
+		var t0 := Time.get_ticks_usec()
 		for unit in _waiting.keys():
 			var m: Mover = _movers.get(unit)
 			var proto: ProtoDB.EntityProto = protos.entity(m.proto_id) if m != null else null
 			if proto == null:
 				_waiting.erase(unit)
+				_to_dress.erase(unit)
 			elif _model_ready(proto):
-				_waiting.erase(unit)
-				_dress(unit, m, proto)
+				_to_dress[unit] = true
+		Probing.add("mv_ready", t0)
+	if _refresh_due:
+		var t0 := Time.get_ticks_usec()
+		_refresh_due = not robots.refresh(dress_usec)
+		Probing.add("mv_refresh", t0)
+	if not _to_dress.is_empty():
+		_dress_some()
+	var t0_move := Time.get_ticks_usec()
 	var t := 1.0 - exp(-delta * FOLLOW_RATE)
 	var drawn := clock.advance(delta)
 	records.frame(clock.tick, clock.rate, 0.0 if MomentHold.on else delta)
@@ -765,6 +808,8 @@ func _process_movers(delta: float) -> void:
 			m.rail_h = move_toward(m.rail_h, goal, delta * 6.0)
 			m.node.position.y = m.rail_h
 		m.node.rotation.y = lerp_angle(m.node.rotation.y, m.yaw_goal, t)
+		if _beam > 0.01 and not m.headlights.is_empty():
+			_lift_headlights(m)
 		if m.card != null:
 			_update_card(m, null, m.node.position.distance_squared_to(was) > CARD_STILL * CARD_STILL)
 		if not m.wheels.is_empty():
@@ -772,7 +817,36 @@ func _process_movers(delta: float) -> void:
 		if m.shadow != null:
 			m.shadow.position = Vector3(m.node.position.x, 0.03, m.node.position.z) + SHADOW_OFFSET
 			m.shadow.rotation.y = m.node.rotation.y
+	Probing.add("mv_move", t0_move)
+	var t0_draw := Time.get_ticks_usec()
 	robots.draw(delta)
+	Probing.add("mv_robots", t0_draw)
+
+
+## Dresses the waiting movers whose model is ready (_to_dress), within dress_usec (at least one).
+func _dress_some() -> void:
+	var t0 := Time.get_ticks_usec()
+	var done := 0
+	for unit in _to_dress.keys():
+		if dress_usec > 0 and done > 0 and Time.get_ticks_usec() - t0 > dress_usec:
+			break
+		_to_dress.erase(unit)
+		if not _waiting.has(unit):
+			continue  # gone meanwhile (_end_frame), or dressed by a later update
+		var m: Mover = _movers.get(unit)
+		var proto: ProtoDB.EntityProto = protos.entity(m.proto_id) if m != null else null
+		if proto == null:
+			_waiting.erase(unit)
+			continue
+		if not _model_ready(proto):
+			continue  # its model changed under it: listed again when the next one is ready
+		_waiting.erase(unit)
+		var td := Time.get_ticks_usec()
+		_dress(unit, m, proto)
+		if Probing.on and Time.get_ticks_usec() - td > 5000:
+			print("MOVERS slow dress %s (%s): %d ms" % [proto.name, proto.type, (Time.get_ticks_usec() - td) / 1000])
+		done += 1
+	Probing.add("mv_dress", t0)
 
 
 ## Moves a mover onto its record: the GPU draws it from now on (robots, walking creatures).
@@ -801,14 +875,18 @@ func _paint(unit: int, m: Mover) -> void:
 ## rest get the model's mesh and moving parts under their node, or a mod's picture on a card.
 func _dress(unit: int, m: Mover, proto: ProtoDB.EntityProto) -> void:
 	if m.robot and RobotSwarm.handles(proto.name, proto.type):
+		var tr := Time.get_ticks_usec()
 		m.bot = robots.add(unit, proto.name)
 		remove_child(m.node)  # nothing under it to draw or move
 		_to_record(m, Vector4(m.bot.phase, 0.0, 0.0, 0.0), robots.flags_for(m.bot))
 		robots.place(m.bot, m.slot)
+		Probing.add("mv_d_robot", tr)
 		return
 	var creature := CreatureModels.walks(proto.name) and ModelLibrary.mesh_for(proto.name) != null
 	if not creature:
+		var tn := Time.get_ticks_usec()
 		var made := _make_node(proto)
+		Probing.add("mv_d_node", tn)
 		for child in made.get_children():
 			made.remove_child(child)
 			m.node.add_child(child)
@@ -818,9 +896,11 @@ func _dress(unit: int, m: Mover, proto: ProtoDB.EntityProto) -> void:
 		made.free()
 		m.wheels = _wheels_of(m.node)
 	if m.robot and m.card == null:  # a card casts its own shadow, as a building's does
+		var ts := Time.get_ticks_usec()
 		m.shadow = _make_shadow(m.node)
 		if m.shadow != null:
 			add_child(m.shadow)
+		Probing.add("mv_d_shadow", ts)
 	if creature:
 		m.creature = true
 		m.stagger = unit % 6
@@ -837,7 +917,9 @@ func _dress(unit: int, m: Mover, proto: ProtoDB.EntityProto) -> void:
 		else:
 			creatures.add(unit, proto.name, m.node)
 	else:
+		var ta := Time.get_ticks_usec()
 		vehicles.attach(unit, m.node, proto.name)
+		Probing.add("mv_d_attach", ta)
 	_paint(unit, m)
 
 
@@ -969,15 +1051,12 @@ func _free(m: Mover) -> void:
 
 
 ## A robot's drop shadow: its meshes flattened onto the ground in a see-through black. The robot
-## itself then casts no lit shadow, so there's one shadow, where Factorio draws it.
+## itself then casts no lit shadow, so there's one shadow, where Factorio draws it. (Robots the swarm
+## draws have robot_shadow.gdshader's.) Lifted onto an add-on's hills in its shader, as the robot is.
 func _make_shadow(node: Node3D) -> Node3D:
 	var root: Node3D = null
 	if _shadow_material == null:
-		_shadow_material = StandardMaterial3D.new()
-		_shadow_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-		_shadow_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-		_shadow_material.albedo_color = SHADOW_COLOR
-		_shadow_material.cull_mode = BaseMaterial3D.CULL_DISABLED
+		_shadow_material = GroundHeight.mark_material(SHADOW_COLOR, false)
 	for child in node.get_children():
 		var mi := child as MeshInstance3D
 		if mi == null or mi.mesh == null:

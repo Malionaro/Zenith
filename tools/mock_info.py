@@ -195,7 +195,21 @@ class InfoMixin:
         furnaces = [e for e in self.entities.values() if e.name == "stone-furnace" and not self.machine(e).get("inv", {}).get("fuel")]
         if furnaces:
             l.append(["no_fuel", len(furnaces), [rec(e, "no_fuel") for e in furnaces[:40]]])
+        # J27: a drill with no ore under its mining area (the mod's no_minable_resources): Factorio's
+        # resources-depleted icon over it.
+        depleted = [e for e in self.entities.values() if e.type == "mining-drill" and not self.ore_under(e)]
+        if depleted:
+            l.append(["depleted", len(depleted), [rec(e, "no_minable_resources") for e in depleted[:40]]])
         return {"t": "al", "l": l}
+
+    def ore_under(self, drill):
+        """Whether any resource lies in the drill's mining area (eprops mr: 0.99 burner, 2.49 electric)."""
+        r = 2.49 if drill.name == "electric-mining-drill" else 0.99
+        for dy in (-r, 0.0, r):
+            for dx in (-r, 0.0, r):
+                if any(e.type == "resource" for e in self.entities_at(drill.x + dx, drill.y + dy)):
+                    return True
+        return False
 
     # --- statistics ----------------------------------------------------------------------------
 

@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <map>
 
 using namespace godot;
@@ -82,6 +83,8 @@ void BeltSimNative::set_lane(i64 key, i64 kind, i64 length, i64 step, Vector2i p
 	_marking = "set_lane";
 	int i = _lane_index(key);
 	if (i >= 0) {
+		l_xm[i] = pm.x;
+		l_ym[i] = pm.y;
 		if (l_kind[i] == kind && l_len[i] == length && l_step[i] == step && l_x0[i] == p0.x && l_y0[i] == p0.y &&
 				l_x1[i] == p1.x && l_y1[i] == p1.y && l_extra[i] == extra && l_xnext[i] == next_key) {
 			return;
@@ -101,6 +104,7 @@ void BeltSimNative::set_lane(i64 key, i64 kind, i64 length, i64 step, Vector2i p
 		l_side[i] = -1;
 		l_sp0[i] = -1;
 		l_sp1[i] = -1;
+		l_read[i] = -1;
 		l_feeders[i].clear();
 		l_sideins[i].clear();
 		auto w = _xnext_wait.find(key);
@@ -119,6 +123,8 @@ void BeltSimNative::set_lane(i64 key, i64 kind, i64 length, i64 step, Vector2i p
 	l_y0[i] = p0.y;
 	l_x1[i] = p1.x;
 	l_y1[i] = p1.y;
+	l_xm[i] = pm.x;
+	l_ym[i] = pm.y;
 	if (l_xnext[i] != next_key) {
 		_wait_remove(i);
 		l_xnext[i] = next_key;
@@ -170,7 +176,10 @@ void BeltSimNative::drop_lane(i64 key) {
 	_unlink(i);
 	_out_keys.erase(key);
 	_walls.erase(key);
+	_dead_last.erase(key);
 	_in_holds.erase(i);
+	_rescued.erase(i);
+	_qload.erase(key);
 	l_alive[i] = 0;
 	_key_idx.erase(key);
 	_free_lanes.push_back(i);
@@ -185,6 +194,9 @@ void BeltSimNative::load_lane(i64 key, i64 at_tick, const PackedInt64Array &item
 	const int64_t *p = items.ptr();
 	for (int64_t k = 0; k < items.size(); k++) {
 		v[k] = p[k];
+	}
+	if (take_line) {
+		_qload[key].push_back({ at_tick, v });
 	}
 	_enqueue(at_tick, 0, key, 0, 0, 0, &v);
 }
@@ -211,15 +223,48 @@ void BeltSimNative::check_lane(i64 key, i64 at_tick, i64 count, i64 front, i64 b
 void BeltSimNative::set_out_edge(i64 key, bool on) {
 	if (on) {
 		_out_keys.insert(key);
-	} else {
-		_out_keys.erase(key);
+	} else if (_out_keys.erase(key) > 0) {
 		_walls.erase(key);
 	}
 }
 
+// belt_sim.gd _dead_end.
+bool BeltSimNative::_dead_end(i64 key) const {
+	if (!dead_walls) {
+		return false;
+	}
+	int i = _lane_index(key);
+	return i >= 0 && l_next[i] < 0 && l_side[i] < 0 && l_xnext[i] == 0 && l_kind[i] != SPLIT_IN && l_kind[i] != UG_HIDDEN &&
+			!_ug_back_half(i);
+}
+
+// belt_sim.gd _walled.
+bool BeltSimNative::_walled(i64 key) const {
+	return (!_out_keys.empty() && _out_keys.count(key)) || (dead_walls && !_walls.empty() && _walls.count(key) && _dead_end(key));
+}
+
 void BeltSimNative::set_wall(i64 key, i64 at_tick, i64 uid, i64 pos) {
-	if (!_out_keys.count(key)) {
-		return;
+	bool out = _out_keys.count(key) > 0;
+	if (!out) {
+		if (!dead_walls) {
+			return;
+		}
+		// (dead_walls) A read finding the front where the read before did walls it; any other, none.
+		auto lt = _dead_last.find(key);
+		bool same = lt != _dead_last.end() && lt->second.uid == uid && lt->second.pos == pos;
+		_dead_last[key] = Wall{ at_tick, uid, pos };
+		if (uid == 0 || !same) {
+			if (_walls.erase(key) > 0 && _dead_end(key)) {
+				int i0 = _lane_index(key);
+				if (l_line[i0] >= 0) {
+					Line *L0 = _lneg(l_line[i0]);
+					if (L0 != nullptr) {
+						_wake(L0);
+					}
+				}
+			}
+			return;
+		}
 	}
 	std::vector<Wall> &w = _walls[key];
 	size_t j = w.size();
@@ -230,6 +275,12 @@ void BeltSimNative::set_wall(i64 key, i64 at_tick, i64 uid, i64 pos) {
 		w[j - 1] = Wall{ at_tick, uid, pos };
 	} else {
 		w.insert(w.begin() + j, Wall{ at_tick, uid, pos });
+	}
+	if (!out && w.size() > (size_t)DEAD_KEEP) {
+		w.erase(w.begin());
+	}
+	if (!out && !_dead_end(key)) {
+		return;
 	}
 	int i = _lane_index(key);
 	if (i >= 0 && l_line[i] >= 0) {
@@ -406,7 +457,446 @@ Dictionary BeltSimNative::take_changes() {
 	d["gone_tick"] = to_packed<PackedInt64Array>(out_gone_tick);
 	d["gone_at"] = to_packed<PackedInt32Array>(out_gone_at);
 	d["mismatch"] = to_packed<PackedInt64Array>(out_mismatch);
+	d["mismatch_n"] = to_packed<PackedInt32Array>(out_mismatch_n);
+	d["hand_uid"] = to_packed<PackedInt64Array>(out_hand_uid);
+	d["hand_tick"] = to_packed<PackedInt64Array>(out_hand_tick);
+	d["hand_ins"] = to_packed<PackedInt64Array>(out_hand_ins);
+	d["hand_key"] = to_packed<PackedInt64Array>(out_hand_key);
+	d["hand_pos"] = to_packed<PackedInt32Array>(out_hand_pos);
+	d["hand_why"] = to_packed<PackedInt32Array>(out_hand_why);
 	return d;
+}
+
+PackedInt64Array BeltSimNative::get_n_hand() const {
+	PackedInt64Array a;
+	for (int k = 0; k < 6; k++) {
+		a.append(n_hand[k]);
+	}
+	return a;
+}
+
+void BeltSimNative::set_n_hand(const PackedInt64Array &a) {
+	for (int k = 0; k < 6 && k < a.size(); k++) {
+		n_hand[k] = a[k];
+	}
+}
+
+// (--inserter-handoff) belt_sim.gd's take_at / put_at: queue kinds 5 and 6 (the rest in the items list).
+void BeltSimNative::take_at(i64 at_tick, i64 unit, i64 item, i64 n, i64 hx, i64 hy, i64 inserter) {
+	if (take_first) {
+		_takes[unit].push_back(PendingTake{ _qseq, at_tick, item, n, hx, hy, inserter });
+	}
+	std::vector<i64> v = { hx, hy, inserter };
+	_enqueue(at_tick, 5, unit, item, n, 0, &v);
+}
+
+void BeltSimNative::put_at(i64 at_tick, i64 key, i64 uid, i64 item, i64 stack, i64 pos, i64 inserter) {
+	std::vector<i64> v = { pos, inserter };
+	_enqueue(at_tick, 6, key, uid, item, stack, &v);
+}
+
+void BeltSimNative::_apply_take(i64 at, i64 unit, i64 item, i64 n, i64 hx, i64 hy, i64 ins) {
+	i64 got = take_first ? _take_rescued(at, unit, item, n, hx, hy, ins) : 0;
+	if (got >= std::max<i64>(n, 1)) {
+		return;
+	}
+	if (take_line && !_qload.empty()) {
+		got += _take_known(at, unit, item, std::max<i64>(n, 1) - got, hx, hy, ins);
+		if (got >= std::max<i64>(n, 1)) {
+			return;
+		}
+	}
+	i64 nc = _take_cands(at, unit, item, hx, hy);
+	if (nc < 0) {
+		if (got == 0) {
+			_hand_out(0, at, ins, l_key[_tc_lane], 0, HAND_READ);
+		}
+		return;
+	}
+	if (nc == 0) {
+		if (got == 0) {
+			_hand_out(0, at, ins, _tc_lane >= 0 ? l_key[_tc_lane] : 0, 0, HAND_NONE);
+		}
+		return;
+	}
+	for (i64 k = 0; k < nc; k++) {
+		if (got >= std::max<i64>(n, 1)) {
+			break;
+		}
+		_take_one(_tc[k].uid, at);
+		_hand_out(_tc[k].uid, at, ins, l_key[_tc[k].lane], _tc[k].pos, HAND_TAKEN);
+		got += std::max<i64>(_tc[k].stk, 1);
+	}
+}
+
+// (take_line) belt_sim.gd's _take_known: the take by what the game says: of the belt's lanes' items that the
+// first read queued for the take's tick or up to TAKE_EVIDENCE ticks on hasn't, the nearest the hand.
+i64 BeltSimNative::_take_known(i64 at, i64 unit, i64 item, i64 n, i64 hx, i64 hy, i64 ins) {
+	std::unordered_map<int, std::unordered_set<i64>> known;  // lane index -> the read's items
+	for (i64 ln = 1; ln < 9; ln++) {
+		auto ql = _qload.find(unit * 8 + ln);
+		if (ql == _qload.end()) {
+			continue;
+		}
+		for (auto &e : ql->second) {
+			if (e.first < at || e.first > at + TAKE_EVIDENCE) {
+				continue;
+			}
+			int i = _lane_index(unit * 8 + ln);
+			if (i >= 0) {
+				std::unordered_set<i64> has;
+				for (size_t k = 0; k + 3 < e.second.size(); k += 4) {
+					has.insert(e.second[k]);
+				}
+				known[i] = std::move(has);
+			}
+			break;
+		}
+	}
+	if (known.empty()) {
+		return 0;
+	}
+	i64 nc = _take_cands(at, unit, item, hx, hy, true);
+	std::vector<TakeCand> take;
+	for (i64 k = 0; k < nc; k++) {
+		auto kn = known.find(_tc[k].lane);
+		if (kn != known.end() && !kn->second.count(_tc[k].uid)) {
+			take.push_back(_tc[k]);
+		}
+	}
+	i64 got = 0;
+	for (const TakeCand &c : take) {
+		if (got >= n) {
+			break;
+		}
+		_take_one(c.uid, at);
+		_hand_out(c.uid, at, ins, l_key[c.lane], c.pos, HAND_TAKEN);
+		n_take_known += 1;
+		got += std::max<i64>(c.stk, 1);
+	}
+	return got;
+}
+
+PackedInt64Array BeltSimNative::peek_take(i64 at_tick, i64 unit, i64 item, i64 n, i64 hx, i64 hy) {
+	PackedInt64Array out;
+	i64 nc = _take_cands(at_tick, unit, item, hx, hy);
+	i64 got = 0;
+	for (i64 k = 0; k < std::max<i64>(nc, 0); k++) {
+		if (got >= std::max<i64>(n, 1)) {
+			break;
+		}
+		out.append(_tc[k].uid);
+		got += std::max<i64>(_tc[k].stk, 1);
+	}
+	return out;
+}
+
+i64 BeltSimNative::_take_cands(i64 at, i64 unit, i64 item, i64 hx, i64 hy, bool ignore_read) {
+	_relink();
+	_tc.clear();
+	_tc_lane = -1;
+	std::vector<int> lanes;
+	for (int ln = 1; ln <= 8; ln++) {
+		int i = _lane_index(unit * 8 + ln);
+		if (i < 0 || l_alive[i] == 0 || l_kind[i] == UG_HIDDEN || l_line[i] < 0 || _line(l_line[i]) == nullptr) {
+			continue;
+		}
+		if (l_read[i] >= at && !ignore_read) {
+			_tc_lane = i;
+			return -1;
+		}
+		lanes.push_back(i);
+	}
+	if (!lanes.empty()) {
+		_tc_lane = lanes[0];
+	}
+	i64 dt = tick - at;
+	double reach2 = (double)TAKE_REACH * (double)TAKE_REACH;
+	for (int i : lanes) {
+		_project(i, (double)hx, (double)hy);
+		double ph = _pj_pos;
+		double dl2 = _pj_d2;
+		if (dl2 > reach2) {
+			continue;
+		}
+		double moved = (double)(dt * (i64)l_step[i]);
+		Line *L = _line(l_line[i]);
+		_materialize(L, tick);
+		i64 lo = l_base[i];
+		i64 hi = lo + l_len[i];
+		// (take_edge) And the items the line ran on over the belt's front edge since the take's tick (with
+		// TAKE_LEAD ticks' slack): on it then.
+		i64 back = take_edge ? (i64)l_step[i] * (std::max<i64>(dt, 0) + TAKE_LEAD) : 0;
+		i64 pos = L->f;
+		for (size_t j = 0; j < L->uid.size(); j++) {
+			if (j > 0) {
+				pos += L->gap[j];
+			}
+			if (pos < lo - back) {
+				continue;
+			}
+			if (pos >= hi) {
+				break;
+			}
+			if (item > 0 && L->itm[j] != item) {
+				continue;
+			}
+			double p = (double)(pos - lo);
+			double da = std::abs(p - ph);
+			if (dt != 0) {
+				da = std::min(da, std::abs(p - (ph - moved)));
+			}
+			double d2 = dl2 + da * da;
+			if (d2 > reach2) {
+				continue;
+			}
+			size_t k = _tc.size();
+			while (k > 0 && (_tc[k - 1].d2 > d2 || (_tc[k - 1].d2 == d2 && _tc[k - 1].uid > L->uid[j]))) {
+				k--;
+			}
+			_tc.insert(_tc.begin() + k, TakeCand{ d2, L->uid[j], L->stk[j], i, std::max<i64>(pos - lo, 0) });
+		}
+	}
+	return (i64)_tc.size();
+}
+
+void BeltSimNative::_apply_put(i64 at, i64 key, i64 uid, i64 item, i64 stack, i64 pos, i64 ins) {
+	if (_uid_line.count(uid)) {
+		_hand_out(uid, at, ins, key, pos, HAND_HAD);
+		return;
+	}
+	_relink();
+	int i = _lane_index(key);
+	if (i < 0 || l_alive[i] == 0 || l_line[i] < 0 || _line(l_line[i]) == nullptr) {
+		_hand_out(uid, at, ins, key, pos, HAND_NO_LANE);
+		return;
+	}
+	i64 p = pos - std::max<i64>(0, tick - at) * (i64)l_step[i];
+	p = std::min<i64>(std::max<i64>(p, 0), std::max<i64>((i64)l_len[i] - 1, 0));
+	put_item(key, uid, item, stack, p);
+	_hand_out(uid, at, ins, key, p, HAND_PUT);
+}
+
+void BeltSimNative::_project(int i, double hx, double hy) {
+	double half = (double)l_len[i] * 0.5;
+	_pj_pos = 0.0;
+	_pj_d2 = std::numeric_limits<double>::infinity();
+	for (int s = 0; s < 2; s++) {
+		double ax = (double)(s == 0 ? l_x0[i] : l_xm[i]);
+		double ay = (double)(s == 0 ? l_y0[i] : l_ym[i]);
+		double bx = (double)(s == 0 ? l_xm[i] : l_x1[i]);
+		double by = (double)(s == 0 ? l_ym[i] : l_y1[i]);
+		double dx = bx - ax;
+		double dy = by - ay;
+		double ll = dx * dx + dy * dy;
+		double t = 0.0;
+		if (ll > 0.0) {
+			t = std::min(std::max(((hx - ax) * dx + (hy - ay) * dy) / ll, 0.0), 1.0);
+		}
+		double qx = ax + dx * t - hx;
+		double qy = ay + dy * t - hy;
+		double d2 = qx * qx + qy * qy;
+		if (d2 < _pj_d2) {
+			_pj_pos = half * ((double)s + t);
+			_pj_d2 = d2;
+		}
+	}
+}
+
+void BeltSimNative::_take_one(i64 uid, i64 at) {
+	auto it = _uid_line.find(uid);
+	if (it == _uid_line.end() || it->second < 0) {
+		return;
+	}
+	Line *L = _line(it->second);
+	if (L == nullptr) {
+		return;
+	}
+	_materialize(L, tick);
+	i64 j = L->find_uid(uid);
+	if (j >= 0) {
+		_remove_at(L, (int)j);
+	}
+	_uid_line.erase(uid);
+	L->holds_erase(uid);
+	if (emit_changes) {
+		out_gone.push_back(uid);
+		out_gone_tick.push_back(at);
+		out_gone_at.push_back((int32_t)out_uid.size());
+	}
+	_touched(L);
+}
+
+// (take_first) belt_sim.gd's _take_left: a queued take being applied, how many it has left (0: a read that
+// came first made it); it leaves the list. `n` when it isn't listed.
+i64 BeltSimNative::_take_left(i64 unit, i64 seq, i64 n) {
+	auto it = _takes.find(unit);
+	if (it == _takes.end()) {
+		return n;
+	}
+	std::vector<PendingTake> &list = it->second;
+	for (size_t k = 0; k < list.size(); k++) {
+		if (list[k].seq == seq) {
+			i64 left = list[k].left;
+			list.erase(list.begin() + k);
+			if (list.empty()) {
+				_takes.erase(it);
+			}
+			return left;
+		}
+	}
+	return n;
+}
+
+// (take_first) belt_sim.gd's _takes_first: before a read of lane i, the takes queued for its belt up to
+// TAKE_LEAD ticks on take, as each would choose, those of the lane's items the read hasn't.
+void BeltSimNative::_takes_first(int i, const std::vector<i64> &items) {
+	i64 unit = _unit(l_key[i]);
+	auto it = _takes.find(unit);
+	if (it == _takes.end()) {
+		return;
+	}
+	std::unordered_set<i64> loaded;
+	for (size_t k = 0; k + 3 < items.size(); k += 4) {
+		loaded.insert(items[k]);
+	}
+	std::vector<PendingTake> &list = it->second;
+	for (size_t e = 0; e < list.size(); e++) {
+		i64 left = list[e].left;
+		i64 at = list[e].at;
+		if (left <= 0 || at > tick + TAKE_LEAD) {
+			continue;
+		}
+		i64 nc = _take_cands(at, unit, list[e].item, list[e].hx, list[e].hy, true);
+		i64 got = 0;
+		for (i64 k = 0; k < nc; k++) {
+			if (got >= std::max<i64>(left, 1)) {
+				break;
+			}
+			if (_tc[k].lane != i || loaded.count(_tc[k].uid)) {
+				continue;
+			}
+			_take_one(_tc[k].uid, at);
+			_hand_out(_tc[k].uid, at, list[e].ins, l_key[i], _tc[k].pos, HAND_TAKEN);
+			n_take_read += 1;
+			got += std::max<i64>(_tc[k].stk, 1);
+		}
+		if (got > 0) {
+			list[e].left = std::max<i64>(left, 1) - got;
+		}
+	}
+}
+
+// (take_first) belt_sim.gd's _note_rescued: what lane i's read just moved out of it (_rescue).
+void BeltSimNative::_note_rescued(int i, Line *L, const std::vector<i64> &P, const std::vector<i64> &before, i64 lo) {
+	Rescued r;
+	r.tick = tick;
+	for (size_t j = 0; j < P.size(); j++) {
+		if (P[j] != before[j]) {
+			r.uid.push_back(L->uid[j]);
+			r.itm.push_back(L->itm[j]);
+			r.stk.push_back(L->stk[j]);
+			r.pos.push_back(before[j] - lo);
+		}
+	}
+	if (r.uid.empty()) {
+		_rescued.erase(i);
+	} else {
+		_rescued[i] = std::move(r);
+	}
+}
+
+// (take_first) belt_sim.gd's _take_rescued: a take whose belt was read as of its tick or later before it came
+// takes the items those reads moved out of their lanes that its hand was near, nearest first.
+i64 BeltSimNative::_take_rescued(i64 at, i64 unit, i64 item, i64 n, i64 hx, i64 hy, i64 ins) {
+	if (_rescued.empty()) {
+		return 0;
+	}
+	_relink();
+	double reach2 = (double)TAKE_REACH * (double)TAKE_REACH;
+	std::vector<TakeCand> cands;
+	for (int ln = 1; ln <= 8; ln++) {
+		int i = _lane_index(unit * 8 + ln);
+		if (i < 0) {
+			continue;
+		}
+		// (take_edge) And what a read of the lane ahead (another belt's) moved back out of it that was on this belt
+		// at the take's tick (belt_sim.gd's): its places there less that lane's length are this lane's.
+		int srcs[2] = { i, -1 };
+		if (take_edge && l_next[i] >= 0 && _unit(l_key[l_next[i]]) != unit) {
+			srcs[1] = l_next[i];
+		}
+		for (int src : srcs) {
+			if (src < 0) {
+				continue;
+			}
+			auto rit = _rescued.find(src);
+			if (rit == _rescued.end()) {
+				continue;
+			}
+			const Rescued &r = rit->second;
+			i64 rt = r.tick;
+			if (rt < at - TAKE_LEAD || rt > at + RESCUE_WINDOW) {
+				continue;
+			}
+			_project(i, (double)hx, (double)hy);
+			double ph = _pj_pos;
+			double dl2 = _pj_d2;
+			if (dl2 > reach2) {
+				continue;
+			}
+			i64 off = src == i ? 0 : -(i64)l_len[src];
+			i64 back = (i64)l_step[i] * (std::max<i64>(rt - at, 0) + TAKE_LEAD);
+			double moved = (double)((rt - at) * (i64)l_step[i]);
+			for (size_t k = 0; k < r.uid.size(); k++) {
+				if ((item > 0 && r.itm[k] != item) || !_uid_line.count(r.uid[k])) {
+					continue;
+				}
+				i64 q = (i64)r.pos[k] + off;
+				if (src != i && q < -back) {
+					continue;
+				}
+				double p = (double)q;
+				double da = std::abs(p - ph);
+				if (rt != at) {
+					da = std::min(da, std::abs(p - (ph - moved)));
+				}
+				double d2 = dl2 + da * da;
+				if (d2 > reach2) {
+					continue;
+				}
+				size_t x = cands.size();
+				while (x > 0 && (cands[x - 1].d2 > d2 || (cands[x - 1].d2 == d2 && cands[x - 1].uid > r.uid[k]))) {
+					x--;
+				}
+				cands.insert(cands.begin() + x, TakeCand{ d2, r.uid[k], r.stk[k], i, src == i ? (i64)r.pos[k] : std::max<i64>(q, 0) });
+			}
+		}
+	}
+	i64 got = 0;
+	for (const TakeCand &c : cands) {
+		if (got >= std::max<i64>(n, 1)) {
+			break;
+		}
+		_take_one(c.uid, at);
+		_hand_out(c.uid, at, ins, l_key[c.lane], c.pos, HAND_TAKEN);
+		n_take_rescued += 1;
+		got += std::max<i64>(c.stk, 1);
+	}
+	return got;
+}
+
+void BeltSimNative::_hand_out(i64 uid, i64 at, i64 ins, i64 key, i64 pos, int why) {
+	n_hand[why] += 1;
+	if (!emit_changes) {
+		return;
+	}
+	out_hand_uid.push_back(uid);
+	out_hand_tick.push_back(at);
+	out_hand_ins.push_back(ins);
+	out_hand_key.push_back(key);
+	out_hand_pos.push_back((int32_t)pos);
+	out_hand_why.push_back(why);
 }
 
 i64 BeltSimNative::next_of(i64 key) {
@@ -419,7 +909,7 @@ i64 BeltSimNative::next_of(i64 key) {
 }
 
 // belt_sim.gd's lane_fronts.
-PackedInt32Array BeltSimNative::lane_fronts(const PackedInt64Array &keys) {
+PackedInt32Array BeltSimNative::lane_fronts(const PackedInt64Array &keys, int speed_of) {
 	_relink();
 	int nk = (int)keys.size();
 	PackedInt32Array out;
@@ -438,7 +928,7 @@ PackedInt32Array BeltSimNative::lane_fronts(const PackedInt64Array &keys) {
 		want.push_back(q);
 		want.push_back(i);
 	}
-	std::vector<i64> first, fv, cnt;
+	std::vector<i64> first, fv, cnt, mv, mvv, fu;
 	for (auto &e : by_line) {
 		Line *L = _lines[e.first].get();
 		if (L == nullptr || L->uid.empty()) {
@@ -448,6 +938,9 @@ PackedInt32Array BeltSimNative::lane_fronts(const PackedInt64Array &keys) {
 		first.assign(nl, 0);
 		fv.assign(nl, 0);
 		cnt.assign(nl, 0);
+		mv.assign(nl, 0);
+		mvv.assign(nl, 0);
+		fu.assign(nl, 0);
 		i64 d = std::max<i64>(tick - L->ft, 0);
 		i64 pos = L->f - (L->mode == 1 ? L->s * d : 0);
 		size_t li = 0;
@@ -464,8 +957,7 @@ PackedInt32Array BeltSimNative::lane_fronts(const PackedInt64Array &keys) {
 				li += 1;
 			}
 			cnt[li] += 1;
-			if (cnt[li] == 1) {
-				first[li] = pos - L->base[li];
+			if (cnt[li] == 1 || speed_of >= 1) {
 				i64 v = 0;
 				if (L->mode == 1) {
 					v = L->s;
@@ -477,7 +969,17 @@ PackedInt32Array BeltSimNative::lane_fronts(const PackedInt64Array &keys) {
 					}
 					v = r < L->rv.size() ? std::max<i64>(L->rv[r], 0) : 0;
 				}
-				fv[li] = v;
+				if (cnt[li] == 1) {
+					first[li] = pos - L->base[li];
+					fv[li] = v;
+					if (speed_of == 2) {
+						fu[li] = L->uid[j] & 0x7fffffff;
+					}
+				}
+				if (speed_of >= 1 && v > 0) {
+					mv[li] += 1;
+					mvv[li] = std::max<i64>(mvv[li], v);
+				}
 			}
 		}
 		const std::vector<int> &want = e.second;
@@ -492,8 +994,8 @@ PackedInt32Array BeltSimNative::lane_fronts(const PackedInt64Array &keys) {
 				continue;
 			}
 			o[q * 3] = (int32_t)first[li2];
-			o[q * 3 + 1] = (int32_t)fv[li2];
-			o[q * 3 + 2] = (int32_t)cnt[li2];
+			o[q * 3 + 1] = (int32_t)(speed_of == 0 ? fv[li2] : (2 * mv[li2] > cnt[li2] ? mvv[li2] : 0));
+			o[q * 3 + 2] = (int32_t)(speed_of == 2 ? fu[li2] : cnt[li2]);
 		}
 	}
 	return out;
@@ -603,11 +1105,40 @@ void BeltSimNative::_apply_queue(i64 now) {
 	if (due.empty()) {
 		return;
 	}
-	std::stable_sort(due.begin(), due.end(), [](const QItem &x, const QItem &y) { return x.seq < y.seq; });
+	if (take_line) {
+		// (By tick, a tick's takes first, then as they came.)
+		std::stable_sort(due.begin(), due.end(), [](const QItem &x, const QItem &y) {
+			if (x.tick != y.tick) {
+				return x.tick < y.tick;
+			}
+			bool tx = x.kind == 5;
+			if (tx != (y.kind == 5)) {
+				return tx;
+			}
+			return x.seq < y.seq;
+		});
+	} else {
+		std::stable_sort(due.begin(), due.end(), [](const QItem &x, const QItem &y) { return x.seq < y.seq; });
+	}
 	for (QItem &q : due) {
 		i64 c0 = profile ? now_usec() : 0;
 		switch (q.kind) {
 			case 0:
+				if (!_qload.empty()) {
+					auto ql = _qload.find(q.a);
+					if (ql != _qload.end() && !ql->second.empty()) {
+						ql->second.erase(ql->second.begin());
+						if (ql->second.empty()) {
+							_qload.erase(ql);
+						}
+					}
+				}
+				{
+					int ri = _lane_index(q.a);
+					if (ri >= 0 && q.tick > l_read[ri]) {
+						l_read[ri] = q.tick;
+					}
+				}
 				if (profile) {
 					q_loads += 1;
 					int li = _lane_index(q.a);
@@ -638,6 +1169,16 @@ void BeltSimNative::_apply_queue(i64 now) {
 			}
 			case 4:
 				_apply_hold(q.a, q.items);
+				break;
+			case 5: {
+				i64 nt = take_first ? _take_left(q.a, q.seq, q.c) : q.c;
+				if (nt > 0) {
+					_apply_take(q.tick, q.a, q.b, nt, q.items[0], q.items[1], q.items[2]);
+				}
+				break;
+			}
+			case 6:
+				_apply_put(q.tick, q.a, q.b, q.c, q.d, q.items[0], q.items[1]);
 				break;
 		}
 		if (profile) {
@@ -712,6 +1253,9 @@ void BeltSimNative::_apply_load(i64 key, const std::vector<i64> &items) {
 		_fresh.clear();
 		_fresh_tick = tick;
 	}
+	if (take_first && !_takes.empty()) {
+		_takes_first(i, items);
+	}
 	i64 pc = profile ? now_usec() : 0;
 	auto part = [&](int k) {
 		if (profile) {
@@ -779,7 +1323,16 @@ void BeltSimNative::_apply_load(i64 key, const std::vector<i64> &items) {
 		gone_between[j] = 1;
 	}
 	if (read_conserve && n > 0) {
+		std::vector<i64> before;
+		if (take_first) {
+			before = P;
+		}
 		_rescue(L, P, RV, idx, items, lo, hi, gone_between);
+		if (take_first) {
+			_note_rescued(i, L, P, before, lo);
+		}
+	} else if (take_first) {
+		_rescued.erase(i);
 	}
 	std::vector<Carried> past;  // (read_bound) carried back (_carry_back)
 	if (total >= 0) {
@@ -1702,6 +2255,7 @@ void BeltSimNative::_apply_check(i64 key, i64 count, i64 front, i64 back, i64 fr
 	// (A packed lane a whole gap off has the same count, front and back: its items' ids tell.)
 	if (c != count || f != front || b != back || (front_uid != 0 && (fu != front_uid || bu != back_uid))) {
 		out_mismatch.push_back(key);
+		out_mismatch_n.push_back(c != count ? 1 : 0);
 	}
 }
 
@@ -1752,6 +2306,9 @@ int BeltSimNative::_new_lane() {
 	l_y0.push_back(0);
 	l_x1.push_back(0);
 	l_y1.push_back(0);
+	l_xm.push_back(0);
+	l_ym.push_back(0);
+	l_read.push_back(-1);
 	l_next.push_back(0);
 	l_side.push_back(0);
 	l_side_at.push_back(0);
@@ -1895,6 +2452,31 @@ bool BeltSimNative::_ug_back_half(int i) const {
 	return v >= 0 && l_kind[v] == UG_VISIBLE;
 }
 
+// (ug_guard, belt_sim.gd's _tunnel_leads_on) Whether tunnel lane h leads on: the bridge names its exit (loaded or
+// not), or (named none) an underground's visible half (another's) starts at its end; or no next to go by (next_named).
+bool BeltSimNative::_tunnel_leads_on(int h) const {
+	if (l_xnext[h] != 0 || !next_named) {
+		return true;  // (its exit named, loaded or not; or no next to go by)
+	}
+	i64 cx = _floordiv(l_x0[h], 32);
+	i64 cy = _floordiv(l_y0[h], 32);
+	for (int dx = -1; dx < 2; dx++) {
+		for (int dy = -1; dy < 2; dy++) {
+			auto it = _entry_grid.find(_cell(cx + dx, cy + dy));
+			if (it == _entry_grid.end()) {
+				continue;
+			}
+			for (int b : it->second) {
+				if (b != h && l_kind[b] == UG_VISIBLE && _unit(l_key[b]) != _unit(l_key[h]) && !_ug_back_half(b)
+						&& _near(l_x0[h], l_y0[h], l_x1[b], l_y1[b])) {
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
 void BeltSimNative::_link(int a) {
 	int nxt = -1;
 	int kind = l_kind[a];
@@ -1915,11 +2497,21 @@ void BeltSimNative::_link(int a) {
 				}
 				for (int b : it->second) {
 					if (b != a && l_kind[b] != UG_HIDDEN && !_ug_back_half(b) && _near(l_x0[a], l_y0[a], l_x1[b], l_y1[b])) {
+						// (ug_guard, belt_sim.gd's) A tunnel comes out only into an underground's visible half.
+						if (ug_guard && kind == UG_HIDDEN && (l_kind[b] != UG_VISIBLE || _unit(l_key[b]) == _unit(l_key[a]))) {
+							continue;
+						}
 						nxt = b;
 					}
 				}
 			}
 		}
+	}
+	// (ug_guard) An entrance whose tunnel leads nowhere ends at its own end; nor does it side-load.
+	bool dead_end = false;
+	if (ug_guard && kind == UG_VISIBLE && nxt >= 0 && l_kind[nxt] == UG_HIDDEN && !_tunnel_leads_on(nxt)) {
+		nxt = -1;
+		dead_end = true;
 	}
 	if (kind == SPLIT_IN) {
 		nxt = -1;
@@ -1930,6 +2522,9 @@ void BeltSimNative::_link(int a) {
 	}
 	if (nxt >= 0 || kind == SPLIT_IN) {
 		return;
+	}
+	if (ug_guard && (kind == UG_HIDDEN || dead_end)) {
+		return;  // (ug_guard: a tunnel never side-loads, nor an entrance whose tunnel leads nowhere)
 	}
 	double best_d = 0.0;
 	int best = -1;
@@ -2100,6 +2695,7 @@ void BeltSimNative::_relink() {
 		_reline();
 		return;
 	}
+	links_ver += 1;
 	for (int i : _relines.v) {
 		if (!_dirty_f[i]) {
 			_dirty_f[i] = 1;
@@ -2107,6 +2703,20 @@ void BeltSimNative::_relink() {
 		}
 	}
 	_relines.clear();
+	if (ug_guard) {
+		// (ug_guard) A tunnel relinked: its entrance too.
+		size_t n0 = _dirty_v.size();
+		for (size_t q = 0; q < n0; q++) {
+			int i = _dirty_v[q];
+			if (l_kind[i] == UG_HIDDEN) {
+				int e = _lane_index(l_key[i] - 2);
+				if (e >= 0 && !_dirty_f[e]) {
+					_dirty_f[e] = 1;
+					_dirty_v.push_back(e);
+				}
+			}
+		}
+	}
 	std::vector<int> lanes;
 	lanes.swap(_dirty_v);
 	for (int i : lanes) {
@@ -2192,6 +2802,7 @@ void BeltSimNative::_relink() {
 			asked.insert(L->id);
 			for (int x : L->lanes) {
 				out_mismatch.push_back(l_key[x]);
+				out_mismatch_n.push_back(1);
 			}
 		}
 	}
@@ -2960,7 +3571,7 @@ void BeltSimNative::_step_line(Line *A, i64 t) {
 	// A lane leading out: its wall (set_wall). wall_i: the wall item's index when items run off ahead of it.
 	i64 wall_i = -1;
 	i64 wall_p = 0;
-	bool wall_on = nx < 0 && !sidesplit && !_out_keys.empty() && _out_keys.count(l_key[l0]);
+	bool wall_on = nx < 0 && !sidesplit && _walled(l_key[l0]);
 	if (wall_on) {
 		lk = 1;
 		const Wall *w = _wall_at(l_key[l0], t);
@@ -3938,7 +4549,7 @@ void BeltSimNative::_schedule(Line *A, i64 t) {
 		K = mini(K, Ka);
 	}
 	// A lane leading out (set_wall): stepped every tick until its front stands at a wall no later one moves.
-	bool wall_lane = nx < 0 && !sidesplit && !_out_keys.empty() && _out_keys.count(l_key[l0]);
+	bool wall_lane = nx < 0 && !sidesplit && _walled(l_key[l0]);
 	bool wall_blocked = false;
 	if (wall_lane) {
 		K = 0;
@@ -4579,10 +5190,15 @@ void BeltSimNative::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("run_of", "key"), &BeltSimNative::run_of);
 	ClassDB::bind_method(D_METHOD("put_item", "key", "uid", "item", "stack", "pos"), &BeltSimNative::put_item);
 	ClassDB::bind_method(D_METHOD("take_item", "uid", "gone"), &BeltSimNative::take_item, DEFVAL(true));
+	ClassDB::bind_method(D_METHOD("take_at", "at_tick", "unit", "item", "n", "hx", "hy", "inserter"), &BeltSimNative::take_at);
+	ClassDB::bind_method(D_METHOD("put_at", "at_tick", "key", "uid", "item", "stack", "pos", "inserter"), &BeltSimNative::put_at);
+	ClassDB::bind_method(D_METHOD("peek_take", "at_tick", "unit", "item", "n", "hx", "hy"), &BeltSimNative::peek_take);
+	ClassDB::bind_method(D_METHOD("get_n_hand"), &BeltSimNative::get_n_hand);
+	ClassDB::bind_method(D_METHOD("set_n_hand", "a"), &BeltSimNative::set_n_hand);
 	ClassDB::bind_method(D_METHOD("take_changes"), &BeltSimNative::take_changes);
 	ClassDB::bind_method(D_METHOD("next_of", "key"), &BeltSimNative::next_of);
 	ClassDB::bind_method(D_METHOD("items_state"), &BeltSimNative::items_state);
-	ClassDB::bind_method(D_METHOD("lane_fronts", "keys"), &BeltSimNative::lane_fronts);
+	ClassDB::bind_method(D_METHOD("lane_fronts", "keys", "speed_of"), &BeltSimNative::lane_fronts, DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("stats"), &BeltSimNative::stats);
 	ClassDB::bind_method(D_METHOD("mark_split_holds"), &BeltSimNative::mark_split_holds);
 	ClassDB::bind_method(D_METHOD("debug_links"), &BeltSimNative::debug_links);
@@ -4620,6 +5236,30 @@ void BeltSimNative::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_n_same"), &BeltSimNative::get_n_same);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "read_skip_same"), "set_read_skip_same", "get_read_skip_same");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "n_same"), "set_n_same", "get_n_same");
+	ClassDB::bind_method(D_METHOD("set_take_line", "v"), &BeltSimNative::set_take_line);
+	ClassDB::bind_method(D_METHOD("get_take_line"), &BeltSimNative::get_take_line);
+	ClassDB::bind_method(D_METHOD("set_n_take_known", "v"), &BeltSimNative::set_n_take_known);
+	ClassDB::bind_method(D_METHOD("get_n_take_known"), &BeltSimNative::get_n_take_known);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "take_line"), "set_take_line", "get_take_line");
+	ClassDB::bind_method(D_METHOD("set_take_edge", "v"), &BeltSimNative::set_take_edge);
+	ClassDB::bind_method(D_METHOD("get_take_edge"), &BeltSimNative::get_take_edge);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "take_edge"), "set_take_edge", "get_take_edge");
+	ClassDB::bind_method(D_METHOD("set_ug_guard", "v"), &BeltSimNative::set_ug_guard);
+	ClassDB::bind_method(D_METHOD("get_ug_guard"), &BeltSimNative::get_ug_guard);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "ug_guard"), "set_ug_guard", "get_ug_guard");
+	ClassDB::bind_method(D_METHOD("set_next_named", "v"), &BeltSimNative::set_next_named);
+	ClassDB::bind_method(D_METHOD("get_next_named"), &BeltSimNative::get_next_named);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "next_named"), "set_next_named", "get_next_named");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "n_take_known"), "set_n_take_known", "get_n_take_known");
+	ClassDB::bind_method(D_METHOD("set_take_first", "v"), &BeltSimNative::set_take_first);
+	ClassDB::bind_method(D_METHOD("get_take_first"), &BeltSimNative::get_take_first);
+	ClassDB::bind_method(D_METHOD("set_n_take_read", "v"), &BeltSimNative::set_n_take_read);
+	ClassDB::bind_method(D_METHOD("get_n_take_read"), &BeltSimNative::get_n_take_read);
+	ClassDB::bind_method(D_METHOD("set_n_take_rescued", "v"), &BeltSimNative::set_n_take_rescued);
+	ClassDB::bind_method(D_METHOD("get_n_take_rescued"), &BeltSimNative::get_n_take_rescued);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "take_first"), "set_take_first", "get_take_first");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "n_take_read"), "set_n_take_read", "get_n_take_read");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "n_take_rescued"), "set_n_take_rescued", "get_n_take_rescued");
 	ClassDB::bind_method(D_METHOD("set_shift_keep", "v"), &BeltSimNative::set_shift_keep);
 	ClassDB::bind_method(D_METHOD("get_shift_keep"), &BeltSimNative::get_shift_keep);
 	ClassDB::bind_method(D_METHOD("set_split_wake", "v"), &BeltSimNative::set_split_wake);
@@ -4627,6 +5267,8 @@ void BeltSimNative::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_n_woke", "v"), &BeltSimNative::set_n_woke);
 	ClassDB::bind_method(D_METHOD("get_n_woke"), &BeltSimNative::get_n_woke);
 	ClassDB::bind_method(D_METHOD("set_hold_inputs", "v"), &BeltSimNative::set_hold_inputs);
+	ClassDB::bind_method(D_METHOD("set_dead_walls", "v"), &BeltSimNative::set_dead_walls);
+	ClassDB::bind_method(D_METHOD("get_dead_walls"), &BeltSimNative::get_dead_walls);
 	ClassDB::bind_method(D_METHOD("get_hold_inputs"), &BeltSimNative::get_hold_inputs);
 	ClassDB::bind_method(D_METHOD("set_n_held", "v"), &BeltSimNative::set_n_held);
 	ClassDB::bind_method(D_METHOD("get_n_held"), &BeltSimNative::get_n_held);
@@ -4645,6 +5287,9 @@ void BeltSimNative::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_step_us"), &BeltSimNative::get_step_us);
 	ClassDB::bind_method(D_METHOD("set_why_tick", "v"), &BeltSimNative::set_why_tick);
 	ClassDB::bind_method(D_METHOD("get_why_tick"), &BeltSimNative::get_why_tick);
+	ClassDB::bind_method(D_METHOD("set_links_ver", "v"), &BeltSimNative::set_links_ver);
+	ClassDB::bind_method(D_METHOD("get_links_ver"), &BeltSimNative::get_links_ver);
+	ClassDB::bind_method(D_METHOD("links_pending"), &BeltSimNative::links_pending);
 	ClassDB::bind_method(D_METHOD("set_us_relink", "v"), &BeltSimNative::set_us_relink);
 	ClassDB::bind_method(D_METHOD("get_us_relink"), &BeltSimNative::get_us_relink);
 	ClassDB::bind_method(D_METHOD("set_us_queue", "v"), &BeltSimNative::set_us_queue);
@@ -4670,16 +5315,19 @@ void BeltSimNative::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "n_forward_gone"), "set_n_forward_gone", "get_n_forward_gone");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "shift_keep"), "set_shift_keep", "get_shift_keep");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "hold_inputs"), "set_hold_inputs", "get_hold_inputs");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "dead_walls"), "set_dead_walls", "get_dead_walls");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "split_wake"), "set_split_wake", "get_split_wake");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "n_woke"), "set_n_woke", "get_n_woke");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "n_held"), "set_n_held", "get_n_held");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "n_past_back"), "set_n_past_back", "get_n_past_back");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "n_carried"), "set_n_carried", "get_n_carried");
+	ADD_PROPERTY(PropertyInfo(Variant::PACKED_INT64_ARRAY, "n_hand"), "set_n_hand", "get_n_hand");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "profile"), "set_profile", "get_profile");
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_INT64_ARRAY, "prof"), "set_prof", "get_prof");
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_INT64_ARRAY, "step_us"), "set_step_us", "get_step_us");
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_INT64_ARRAY, "why_tick"), "set_why_tick", "get_why_tick");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "us_relink"), "set_us_relink", "get_us_relink");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "links_ver"), "set_links_ver", "get_links_ver");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "us_queue"), "set_us_queue", "get_us_queue");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "us_step"), "set_us_step", "get_us_step");
 	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "why_mark"), "set_why_mark", "get_why_mark");

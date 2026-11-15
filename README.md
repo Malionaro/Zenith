@@ -20,9 +20,11 @@ Get the latest release from the [Releases page](../../releases/latest):
   and start `Zenith.exe` (Windows) or `Zenith.x86_64` (Linux); `START HERE.txt` inside says the rest.
   The bridge mod and the server scripts come with it.
 - **factorio-3d-bridge_<version>.zip**: the bridge mod on its own, for a server you run yourself.
-- **cinematic-camera_<version>.zip**: an optional camera add-on (free camera, tracking shots,
-  timelapses, recording). Drop the zip, as it is, into Zenith's `addons` folder. Its source and
-  guide: [Zenith-Cinematic-Camera](https://github.com/unjustodin/Zenith-Cinematic-Camera).
+- Zenith's own add-ons come inside the game's zip: the Cinematic look and the
+  [Cinematic camera](https://github.com/unjustodin/Zenith-Cinematic-Camera) (free camera, tracking
+  shots, timelapses, recording, screenshots on F12), both on, and
+  [Terrain Elevation](https://github.com/unjustodin/Terrain-Elevation)'s hills, off until you switch
+  them on in the Add-ons menu.
 
 ## What works today
 
@@ -66,7 +68,7 @@ This is an early release, and it still has rough edges:
   [docs/MODELLERS.md](docs/MODELLERS.md) is the guide for anyone making them.
 - Single-player "hybrid" mode, where the 3D client attaches to a normal Factorio window, has
   been played once, side by side, but not tried much yet.
-- It's only been tested on Windows 11 with Factorio 2.1.23.
+- It's only been tested on Windows 11 with Factorio 2.1.23 and 2.1.24.
 
 Known bugs are on the issue tracker.
 
@@ -108,9 +110,9 @@ My part:
 None of it is generated blind and shipped. Every feature has to pass:
 - tests of the mod against a strict fake of Factorio's API;
 - a mock server and protocol validator that check every message;
-- a UI test that clicks through the interface (nearly 1,000 checks);
+- a UI test that clicks through the interface (about 2,500 checks);
 - a checker for every model's scale, origin and triangle budget;
-- a live check against a real Factorio 2.1 server (361 checks on the last full run).
+- a live check against a real Factorio 2.1 server (402 checks on the last full run).
 
 All of these run on every push.
 

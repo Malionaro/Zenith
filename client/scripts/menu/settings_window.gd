@@ -220,7 +220,10 @@ func _exit_tree() -> void:
 
 
 ## The preset shows what the settings match as they change (Custom once one is set by hand).
-func _on_setting(section: String, _key: String) -> void:
+func _on_setting(section: String, key: String) -> void:
+	if section == "camera":
+		_show_choice(section, key)  # F7 in the game while the window is open (owner's I19)
+		return
 	if section != "graphics" or not is_instance_valid(_preset):
 		return
 	var now := Settings.preset_now()
@@ -349,7 +352,7 @@ func _graphics() -> void:
 	_check(grid, "Hold the game at 60 UPS", "graphics", "hold_ups",
 		"eases off when the game slows|While the game runs under 60 UPS, the bridge's updates, the distances above, the minimap's refreshes and then the frame rate go lower for a while (the F4 line says what). Your settings stay as they are.")
 	_check(grid, "Give the server the CPU first", "graphics", "server_first",
-		"with the server on this PC|When the server runs on this PC, the client runs at a lower process priority, so the game's tick gets a core first whenever every core is busy (joining, loading chunks). The client's frame rate stays the same when there is room.")
+		"with the server on this PC|When the server runs on this PC, the client runs at a lower process priority, so the game's tick gets a core first whenever every core is busy (joining, loading chunks). The client's frame rate stays the same when there is room. A server on another PC (through its relay) needs nothing here.")
 	_check(grid, "Show all smoke and particles", "graphics", "effects", "smoke, dust, flashes, explosions")
 	_slider(grid, "Items in 3D", "graphics", "item_models_max", 0, Settings.ITEM_MODELS_ALL, 500, func(v: float) -> String:
 		if int(v) <= 0:
@@ -364,6 +367,8 @@ func _graphics() -> void:
 		return "%d tiles" % int(v), false, false, "thinner further out|Full detail to 80 tiles, then half and a quarter further out.")
 	_dropdown(grid, "3D grass", "graphics", "grass_3d", [["Off", "off"], ["30 tiles, still", "short"], ["40 tiles, with wind", "normal"],
 		["50 tiles, with wind", "far"]], "grass and low plants with height, near you|Grass and low plants near the character rise up from their flat pictures, which take over further out. Costs a little GPU; off in the Low preset. Needs Decoratives on.")
+	_slider(grid, "Smog", "graphics", "smog", 0.0, 1.0, 0.05, func(v: float) -> String: return "Off" if v <= 0.0 else "%d%%" % roundi(v * 100.0), false, true,
+		"haze over polluted ground|A brownish haze lies over the ground where pollution is heavy, thicker the more polluted the chunk; trees there grey and lose their leaves and lakes turn green whatever this says. 0% switches the haze off (one full-screen pass, cheap, and none where there is no pollution).")
 	_dropdown(grid, "Look", "graphics", "look", Looks.choices(),
 		"light and colour|How the world is lit and coloured. Factorio: matched to Factorio's own pictures (its shadows' angle, its colours, its colour grading for each planet and time of day). Classic Zenith: the look before 0.1.4. Add-ons can add their own looks here.").item_selected.connect(reopen)  # rows a look sets itself grey out
 	var open_models := MenuKit.button("Open folder")
@@ -574,7 +579,8 @@ func _interface() -> void:
 	_heading("Interaction")
 	grid = _grid()
 	_check(grid, "Smart belt building", "interface", "smart_belt_building", "dragged belts jump obstacles with undergrounds")
-	_check(grid, "Lock belt building to straight line", "interface", "lock_belt_straight", "dragged belts don't turn corners")
+	_check(grid, "Lock belt building to straight line", "interface", "lock_belt_straight",
+		"dragged belts keep to the held belt's line, as in Factorio (R turns it); off, they follow the cursor round corners")
 
 	_heading("UI scale")
 	grid = _grid()
@@ -687,12 +693,11 @@ func _camera() -> void:
 	_dropdown(grid, "View when a game starts", "camera", "default_view", [["Angled view", "angled"], ["Factorio's view", "factorio"], ["First person", "first_person"]], "F6 and F5 switch in the game")
 	_dropdown(grid, "Projection", "camera", "orthographic", [["Perspective", false], ["Orthographic", true]], "for the angled view; Factorio's view (F6) is always orthographic; F7 switches")
 	_dropdown(grid, "Projection on the map", "camera", "map_orthographic", [["Perspective", false], ["Orthographic", true]], "the remote view, zoomed in from the map; F7 there switches it")
+	_dropdown(grid, "Projection in first person", "camera", "first_person_orthographic", [["Perspective", false], ["Orthographic", true]], "F7 in first person switches it")
 	_slider(grid, "Furthest zoom", "camera", "max_zoom", 60.0, 400.0, 10.0, func(v: float) -> String: return "%d tiles" % int(v), false, false, "the default is 140; far out, more of the world must be drawn")
 	_slider(grid, "Zoom out to the map at", "camera", "map_zoom_out", 80.0, 480.0, 10.0, func(v: float) -> String: return "%d tiles" % int(v), false, false, "the view zoomed in from the map goes back to the map when zoomed out this far; the default is 240")
 	_slider(grid, "Mouse sensitivity", "camera", "look_sensitivity", 0.25, 3.0, 0.05, func(v: float) -> String: return "%.2f×" % v)
 	_check(grid, "Invert mouse look", "camera", "invert_y", "first person and middle-drag tilt")
-	_check(grid, "Camera follows the hills", "camera", "follow_hills",
-		"with a hills add-on|Off (the default): the camera stays level as you walk over an add-on's hills, and only first person rides them. On: it rises and falls with the ground under the character.")
 
 
 func _factorio() -> void:
@@ -887,6 +892,20 @@ func _dropdown(grid: GridContainer, text: String, section: String, key: String, 
 			Settings.apply_window(get_tree().root))
 	_row(grid, text, o, note)
 	return o
+
+
+## A dropdown (`_dropdown`, named section-key) shows the setting's value again, when it was changed
+## elsewhere (F7's projection).
+func _show_choice(section: String, key: String) -> void:
+	if not is_instance_valid(_pane):
+		return
+	var o := _pane.find_child(section + "-" + key, true, false) as OptionButton
+	if o == null:
+		return
+	var value = Settings.get_value(section, key)
+	for i in o.item_count:
+		if o.get_item_metadata(i) == value and o.selected != i:
+			o.select(i)
 
 
 ## A row the look in use sets itself (Settings.look_overrides): greyed out, its note saying where to

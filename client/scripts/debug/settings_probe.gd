@@ -250,6 +250,7 @@ func _walk() -> void:
 	await _row("Graphics", "graphics", "decorative_distance", 64, func() -> float: return main.decoratives.distance, 64.0, true, 90)
 	await _row("Graphics", "graphics", "grass_3d", "off", func() -> float: return main.decoratives.grass_range, 0.0, true)
 	await _row("Graphics", "graphics", "grass_3d", "far", func() -> float: return main.decoratives.grass_range, func(r: float) -> bool: return r >= 50.0, true)
+	await _row("Graphics", "graphics", "smog", 0.0, func() -> float: return main.pollution.strength(), 0.0)
 	await _row("Graphics", "graphics", "look", "classic", func() -> String: return main.looks.current, "classic", true, 60)
 	# Advanced
 	for aa in ["off", "fxaa", "smaa", "taa", "msaa4"]:
@@ -286,7 +287,6 @@ func _walk() -> void:
 	await _row("Camera", "camera", "map_zoom_out", 100.0, func() -> float: return float(Settings.get_value("camera", "map_zoom_out")), 100.0)
 	await _row("Camera", "camera", "look_sensitivity", 2.0, func() -> float: return main.rig.look_speed, 2.0)
 	await _row("Camera", "camera", "invert_y", true, func() -> float: return main.rig.look_sign, -1.0)
-	await _row("Camera", "camera", "follow_hills", true, func() -> bool: return bool(Settings.get_value("camera", "follow_hills")), true)
 	await _row("Camera", "camera", "default_view", "first_person", func() -> String: return str(Settings.get_value("camera", "default_view")), "first_person")
 
 	# Interface
@@ -295,7 +295,7 @@ func _walk() -> void:
 	await _row("Interface", "interface", "alt_mode", true, func() -> bool: return ui.alt_mode, true, true)
 	await _row("Interface", "interface", "alt_inserter_arrows", true, func() -> bool: return bool(Settings.get_value("interface", "alt_inserter_arrows")), true)
 	await _row("Interface", "interface", "smart_belt_building", false, func() -> bool: return bool(Settings.get_value("interface", "smart_belt_building")), false)
-	await _row("Interface", "interface", "lock_belt_straight", true, func() -> bool: return bool(Settings.get_value("interface", "lock_belt_straight")), true)
+	await _row("Interface", "interface", "lock_belt_straight", false, func() -> bool: return bool(Settings.get_value("interface", "lock_belt_straight")), false)
 	await _row("Interface", "interface", "ui_scale", "1.5", func() -> float: return Settings.chosen_ui_scale(), 1.5, true, 30)
 	await _row("Interface", "interface", "tooltip_delay", 1.5, func() -> float: return float(ProjectSettings.get_setting("gui/timers/tooltip_delay_sec")), 1.5)
 	await _row("Interface", "interface", "entity_info", false, func() -> bool: return bool(ui.entity_info.get_meta("enabled", true)), false)

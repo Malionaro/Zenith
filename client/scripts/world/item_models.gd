@@ -5,6 +5,7 @@ extends RefCounted
 ## item type shares one plain material and draws as one MultiMesh (item_cards.gd).
 
 const ItemShader := preload("res://shaders/item.gdshader")
+const Probing := preload("res://scripts/debug/probing.gd")
 const DIR := "res://assets/models/items/"
 ## Item colours are picked from icons that are drawn lit already; under the sun they'd read
 ## brighter than the icon (compared side by side with the icon cards).
@@ -14,45 +15,31 @@ static var _cache := {}  # item name -> Mesh, or null when it has no model
 static var _material: ShaderMaterial
 
 
-## The item's model, or null (the item keeps its icon card).
+## The item's model, or null (the item keeps its icon card). Read on the main thread, once per item (10-40 ms
+## the first time an item came into view while walking; the probe's `gi_model_load`). They were read on
+## worker threads (ResourceLoader.load_threaded_request), but those reads could deadlock against the main
+## thread at start: with Factorio's own folder in reach, the menu's belts asked for four item models at once,
+## their four worker threads stood on a lock while the main thread waited for a worker (Zenith
+## froze before the main menu on most starts; read here, 5 starts in 5 came up).
 static func mesh_for(item: String) -> Mesh:
 	if _cache.has(item):
 		return _cache[item]
 	var path := DIR + item + ".glb"
 	var mesh: Mesh = null
 	if item != "" and ResourceLoader.exists(path):
+		var t0 := Time.get_ticks_usec()
 		mesh = _mesh_of(load(path) as PackedScene)
+		Probing.add("gi_model_load", t0)
 	_cache[item] = mesh
 	return mesh
 
 
-## Whether mesh_for(item) answers at once; if not, its model is read on a thread meanwhile. Reading
-## one on the main thread took 10-40 ms the first time an item came into view while walking.
+## Whether mesh_for(item) answers at once: always now (it reads the model there and then, see above).
+## Kept for its callers, which leave an item its icon card while this says no.
 static func ready(item: String) -> bool:
-	if _cache.has(item):
-		return true
-	var path := DIR + item + ".glb"
-	if not _loading.has(item):
-		if item == "" or not ResourceLoader.exists(path):
-			_cache[item] = null
-			return true
-		if ResourceLoader.load_threaded_request(path, "PackedScene") != OK:
-			mesh_for(item)
-			return true
-		_loading[item] = path
-		return false
-	match ResourceLoader.load_threaded_get_status(path):
-		ResourceLoader.THREAD_LOAD_IN_PROGRESS:
-			return false
-		ResourceLoader.THREAD_LOAD_LOADED:
-			_cache[item] = _mesh_of(ResourceLoader.load_threaded_get(path) as PackedScene)
-		_:
-			_cache[item] = null
-	_loading.erase(item)
+	mesh_for(item)
 	return true
 
-
-static var _loading := {}  # item name -> its model's path, being read on a thread
 
 
 static func _mesh_of(packed: PackedScene) -> Mesh:

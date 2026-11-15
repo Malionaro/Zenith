@@ -1,14 +1,21 @@
 extends RefCounted
 ## A Source RCON client (the protocol Factorio's --rcon-port speaks, like tools/rcon.py), for the
-## server the menu started: saving, quitting. Calls are awaited and give up after a timeout.
+## server the menu started (saving, quitting) or, through a relay that carries RCON
+## (server/relay.py --rcon-port), a server on another PC (pausing). Calls are awaited and give up
+## after a timeout.
 ##
 ##   var rcon := Rcon.new()
 ##   if await rcon.open(tree, port, password): print(await rcon.run(tree, "/server-save"))
+##   if await rcon.open(tree, 34200, password, "192.168.1.20", true): ...   # through the relay there
 
 const AUTH := 3
 const EXEC := 2
 const AUTH_RESPONSE := 2
 const TIMEOUT_MSEC := 10000
+## What a relay's RCON pipe is asked for with, and answers when the server's RCON took it; or
+## RELAY_REFUSED and a length-prefixed reason (docs/PROTOCOL.md, "Over the network").
+const RELAY_RCON := "ZRC1"
+const RELAY_REFUSED := "ZRL!"
 
 var error := ""
 var _tcp := StreamPeerTCP.new()
@@ -21,11 +28,13 @@ func is_open() -> bool:
 	return _tcp.get_status() == StreamPeerTCP.STATUS_CONNECTED
 
 
-## Connects and logs in. False (and `error`) if the server isn't listening or refuses.
-func open(tree: SceneTree, port: int, password: String) -> bool:
+## Connects and logs in. False (and `error`) if the server isn't listening or refuses. `relay`: `port`
+## is a Zenith relay's at `host`, which pipes the connection to the server's RCON.
+func open(tree: SceneTree, port: int, password: String, host := "127.0.0.1", relay := false) -> bool:
 	close()
-	if _tcp.connect_to_host("127.0.0.1", port) != OK:
-		error = "Can't connect to RCON on port %d" % port
+	var where := "%s:%d" % [host, port] if relay else "port %d" % port
+	if _tcp.connect_to_host(host, port) != OK:
+		error = "Can't connect to RCON on %s" % where
 		return false
 	var started := Time.get_ticks_msec()
 	while true:
@@ -34,10 +43,13 @@ func open(tree: SceneTree, port: int, password: String) -> bool:
 		if status == StreamPeerTCP.STATUS_CONNECTED:
 			break
 		if status == StreamPeerTCP.STATUS_ERROR or status == StreamPeerTCP.STATUS_NONE or Time.get_ticks_msec() - started > TIMEOUT_MSEC:
-			error = "RCON on port %d doesn't answer" % port
+			error = "RCON on %s doesn't answer" % where
 			close()
 			return false
 		await tree.process_frame
+	if relay and not await _through_relay(tree, where):
+		close()
+		return false
 	_send(1, AUTH, password)
 	while true:
 		var packet: Array = await _read(tree)
@@ -75,6 +87,37 @@ func run(tree: SceneTree, command: String, timeout_msec := TIMEOUT_MSEC) -> Stri
 func close() -> void:
 	_tcp.disconnect_from_host()
 	_buffer = PackedByteArray()
+
+
+## Asks the relay for the server's RCON and waits for its answer: true once the pipe is open.
+func _through_relay(tree: SceneTree, where: String) -> bool:
+	_tcp.put_data(RELAY_RCON.to_ascii_buffer())
+	var started := Time.get_ticks_msec()
+	while Time.get_ticks_msec() - started < TIMEOUT_MSEC:
+		_tcp.poll()
+		if _tcp.get_status() != StreamPeerTCP.STATUS_CONNECTED:
+			break
+		var available := _tcp.get_available_bytes()
+		if available > 0:
+			var got: Array = _tcp.get_partial_data(available)
+			if int(got[0]) == OK:
+				_buffer.append_array(got[1])
+		if _buffer.size() >= 4:
+			var said := _buffer.slice(0, 4).get_string_from_ascii()
+			if said == RELAY_RCON:
+				_buffer = _buffer.slice(4)
+				return true
+			if said != RELAY_REFUSED:
+				error = "%s isn't a Zenith relay" % where
+				return false
+			if _buffer.size() >= 8:
+				var size := (_buffer[4] << 24) | (_buffer[5] << 16) | (_buffer[6] << 8) | _buffer[7]
+				if _buffer.size() >= 8 + size:
+					error = "The relay at %s: %s" % [where, _buffer.slice(8, 8 + size).get_string_from_utf8()]
+					return false
+		await tree.process_frame
+	error = "The relay at %s doesn't answer for RCON" % where
+	return false
 
 
 func _send(id: int, kind: int, body: String) -> void:

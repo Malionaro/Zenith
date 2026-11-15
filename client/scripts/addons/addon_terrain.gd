@@ -21,7 +21,8 @@ func _init(host, api) -> void:
 ## Sets the heights: `heights` an Image (FORMAT_RF, heights in tiles; other formats are converted,
 ## their red channel read), its first texel's corner at world `origin` (x east, z south), each
 ## texel `tiles_per_texel` tiles square. Between texel centres the height is bilinear, outside
-## the image it is 0: fade the edges to 0 yourself. Main thread only.
+## the image it is 0: fade the edges to 0 yourself. An image with the meta `lift_range` (Vector2:
+## its lowest and highest height) isn't measured (ground_height.gd). Main thread only.
 func set_heights(heights: Image, origin: Vector2, tiles_per_texel: float) -> void:
 	GroundHeight.set_field(heights, origin, tiles_per_texel)
 	_host.set("_terrain_owner", _api.id)

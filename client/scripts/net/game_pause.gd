@@ -4,16 +4,16 @@ extends RefCounted
 ##
 ## A tick-paused game runs no mod code: the bridge neither reads nor sends until it resumes (real
 ## 2.1.24; RCON still runs). So:
-## - Zenith pauses only where it can resume: over RCON (a server Zenith's menu started). Single-
-##   player (hybrid) and a server started elsewhere have none, and a game paused there would be one
-##   Zenith couldn't leave.
+## - Zenith pauses only where it can resume: over RCON (a server Zenith's menu started, or a server
+##   on another PC whose relay carries RCON, server/relay.py --rcon-port). Single-player (hybrid) and
+##   other servers have none, and a game paused there would be one Zenith couldn't leave.
 ## - The pause goes through the bridge's `/f3d-debug pause on`, so the console's rule applies (in
 ##   multiplayer only admins may); its answer waits until the game resumes, unless it was refused.
 ## - The connection's timeout is held off meanwhile (Bridge.expect_quiet): the silence is the pause.
 ## - It resumes over RCON, never through the bridge, which a paused game doesn't run.
 
 const RESUME := "/sc game.tick_paused = false"
-const NO_RCON := "Pausing needs RCON, which only a server Zenith's menu started has: a paused game runs no mod code, so Zenith couldn't resume it. Pause in Factorio itself (Ctrl+F9)"
+const NO_RCON := "Pausing needs RCON, which only a server Zenith's menu started has, or a server on another PC whose relay carries RCON (its password given when connecting): a paused game runs no mod code, so Zenith couldn't resume it. Pause in Factorio itself (Ctrl+F9)"
 const STAYS_PAUSED := "The game stays paused: press Ctrl+F9 and type /c game.tick_paused = false in Factorio"
 
 

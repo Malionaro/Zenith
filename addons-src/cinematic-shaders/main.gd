@@ -15,7 +15,8 @@ extends Node
 ##   - reflections of the sky on metal
 ##   - depth haze that grows with distance
 ##   - clouds: a layer of soft, shaded clouds in the sky and their shadows drifting over the factory, from
-##     the same pattern (Zenith's own flat clouds are off while the look is on)
+##     the same pattern, drawn once into a texture (shaders/cloud_field.gdshader; Zenith's own flat
+##     clouds are off while the look is on)
 ##   - against sparkle: no model shinier than roughness 0.55, the roughness limiter and a cap on bloom,
 ##     so small shiny parts don't flash highlights smaller than a pixel; temporal anti-aliasing as an
 ##     option (off: Zenith's shader-animated parts, inserter arms and belts, flicker under it)
@@ -27,8 +28,16 @@ extends Node
 ## the haze off (looks.gd's SPACE_ENV) and the grade leaves the black backdrop and its stars alone.
 
 const LOOK := "cinematic-shaders/cinematic"
+## The clouds' pattern, drawn once into a texture the grade reads (shaders/cloud_field.gdshader): it
+## repeats every FIELD_PERIOD of the pattern (about 1,800 tiles at the grade's cloud_scale), on
+## FIELD_SIZE texels a side (about 1.7 tiles a texel; 8 MB of video memory at 16 bits a channel).
+const FIELD_SIZE := 1024
+const FIELD_PERIOD := 16.0
 
 var api
+## The viewport the pattern is drawn in, once (its texture lives as long as it does); null until the
+## clouds are first on.
+var _field: SubViewport
 
 
 func addon_start(a) -> void:
@@ -147,4 +156,38 @@ func _register() -> void:
 	}
 	if not bool(s.value("sun_moves")):
 		look["sun_angle"] = Vector2(-42.0, -112.0)
+	var field: Texture2D = _cloud_field() if float(s.value("clouds")) > 0.0 else null
+	if field != null:
+		var params: Dictionary = look["passes"][0]["params"]
+		params["cloud_field"] = field
+		params["cloud_period"] = FIELD_PERIOD
 	api.shaders.add_look(LOOK, look)
+
+
+## The clouds' pattern as a texture: drawn by the GPU in a viewport of its own the first time it is
+## asked for, once, and kept. The grade worked the noise out in its place before (0.4.4), on every
+## pixel of the ground and every step of its march through the sky. null (no clouds: the grade reads
+## black) if its shader can't be read.
+func _cloud_field() -> Texture2D:
+	if _field == null:
+		var shader := load(str(api.dir).path_join("shaders/cloud_field.gdshader")) as Shader
+		if shader == null:
+			api.note("shaders/cloud_field.gdshader can't be read: no clouds")
+			return null
+		_field = SubViewport.new()
+		_field.name = "CloudField"
+		_field.size = Vector2i(FIELD_SIZE, FIELD_SIZE)
+		_field.disable_3d = true
+		# 16-bit floats: the pattern's fine steps for the clouds' soft edges, and values a little
+		# outside 0-1 kept as they are.
+		_field.use_hdr_2d = true
+		_field.render_target_update_mode = SubViewport.UPDATE_ONCE
+		var m := ShaderMaterial.new()
+		m.shader = shader
+		m.set_shader_parameter("period", FIELD_PERIOD)
+		var rect := ColorRect.new()
+		rect.size = Vector2(FIELD_SIZE, FIELD_SIZE)
+		rect.material = m
+		_field.add_child(rect)
+		add_child(_field)
+	return _field.get_texture()

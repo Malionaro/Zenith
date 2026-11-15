@@ -20,6 +20,7 @@ const MoverRecords := preload("res://scripts/world/mover_records.gd")
 const RobotShader := preload("res://shaders/factorio_material_robot.gdshader")
 const RobotAlphaShader := preload("res://shaders/factorio_material_robot_alpha.gdshader")
 const ShadowShader := preload("res://shaders/robot_shadow.gdshader")
+const Probing := preload("res://scripts/debug/probing.gd")
 
 ## The robots drawn here: their models' parts are all this knows how to move. Combat robots have a
 ## body only and don't bob (vehicle_anim.gd never rigged them); capture robots' cables stay nodes.
@@ -206,21 +207,30 @@ func drawn(bot: Bot) -> Array:
 
 
 ## A model change (Settings > Graphics > Model look, a reload) gives the robots their new meshes.
-func refresh() -> void:
+## Batches whose model changed (ModelLibrary.generation) are made again on the new mesh, for at most
+## `usec` a call (at least one; 0: all at once). True once every batch is on its current mesh.
+func refresh(usec := 0) -> bool:
+	var t0 := Time.get_ticks_usec()
+	var made := 0
 	for name in _batches.keys():
 		var batch: Batch = _batches[name]
-		if ModelLibrary.mesh_for(name) != batch.source:
-			var bots := batch.bots
-			_free_batch(batch)
-			var fresh := _make_batch(name)
-			fresh.bots = bots
-			for bot in bots:
-				bot.batch = fresh
-			_grow(fresh, bots.size())
-			for bot in bots:
-				_write_instance(fresh, bot.slot, bot.record)
-			fresh.dirty = true
-			_batches[name] = fresh
+		if ModelLibrary.mesh_for(name) == batch.source:
+			continue
+		if usec > 0 and made > 0 and Time.get_ticks_usec() - t0 > usec:
+			return false
+		var bots := batch.bots
+		_free_batch(batch)
+		var fresh := _make_batch(name)
+		fresh.bots = bots
+		for bot in bots:
+			bot.batch = fresh
+		_grow(fresh, bots.size())
+		for bot in bots:
+			_write_instance(fresh, bot.slot, bot.record)
+		fresh.dirty = true
+		_batches[name] = fresh
+		made += 1
+	return true
 
 
 ## Once a frame (movers.gd): instances that came or went go to the MultiMeshes, cargo lamps follow
@@ -332,8 +342,13 @@ func _make_batch(proto_name: String) -> Batch:
 		var mesh: Mesh = entry[0]
 		if mesh == null:
 			continue
-		batch.parts.append(_instance(_robot_mesh(mesh, int(entry[1]), entry[2], batch.kind != ""), null))
+		var t0 := Time.get_ticks_usec()
+		var robot_mesh := _robot_mesh(mesh, int(entry[1]), entry[2], batch.kind != "")
+		Probing.add("rb_mesh", t0)
+		t0 = Time.get_ticks_usec()
+		batch.parts.append(_instance(robot_mesh, null))
 		batch.shadows.append(_instance(mesh, _shadow()))
+		Probing.add("rb_instances", t0)
 	return batch
 
 
@@ -360,8 +375,14 @@ static func _robot_mesh(mesh: Mesh, code: int, pivot: Transform3D, bobs: bool) -
 	var source := mesh as ArrayMesh
 	for i in mesh.get_surface_count():
 		var custom := source.surface_get_format(i) & ModelLods.CUSTOM_FORMATS if source != null else 0
-		out.add_surface_from_arrays(mesh.surface_get_primitive_type(i), ModelLods.arrays_of(mesh, i), [], {}, custom)
+		var t0 := Time.get_ticks_usec()
+		var arrays := ModelLods.arrays_of(mesh, i)
+		Probing.add("rb_arrays", t0)
+		t0 = Time.get_ticks_usec()
+		out.add_surface_from_arrays(mesh.surface_get_primitive_type(i), arrays, [], {}, custom)
 		out.surface_set_material(i, mesh.surface_get_material(i))
+		Probing.add("rb_surface", t0)
+	var tm := Time.get_ticks_usec()
 	for i in out.get_surface_count():
 		var material := out.surface_get_material(i) as ShaderMaterial
 		var alpha := material != null and material.shader == ModelLibrary.FactorioAlphaShader
@@ -385,6 +406,7 @@ static func _robot_mesh(mesh: Mesh, code: int, pivot: Transform3D, bobs: bool) -
 		copy.set_shader_parameter("robot_bob", VehicleAnim.ROBOT_BOB if bobs else 0.0)
 		copy.set_shader_parameter("robot_bob_rate", VehicleAnim.ROBOT_BOB_RATE)
 		out.surface_set_material(i, copy)
+	Probing.add("rb_materials", tm)
 	return out
 
 

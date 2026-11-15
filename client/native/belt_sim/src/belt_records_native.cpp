@@ -9,17 +9,29 @@
 using namespace godot;
 using namespace godot::beltn;
 
+// belt_records.gd `small`: pages of 4 rows, 8 at the start (else 16 rows, one at the start). Only before the
+// first alloc.
+void Records::set_small(bool small) {
+	if (pages > 0 || top > 0) {
+		return;
+	}
+	rows = small ? SMALL_ROWS : PAGE_ROWS;
+	start_pages = small ? START_PAGES : 1;
+	per_page = ROW * rows / TEXELS;
+	page_floats = per_page * FLOATS;
+}
+
 void Records::grow(int n) {
-	int need = (n + PER_PAGE - 1) / PER_PAGE;
+	int need = (n + per_page - 1) / per_page;
 	if (need <= pages) {
 		return;
 	}
-	int p = std::max(1, pages);
+	int p = std::max(start_pages, pages);
 	while (p < need) {
 		p *= 2;
 	}
 	pages = p;
-	data.resize((size_t)pages * PAGE_FLOATS, 0.0f);
+	data.resize((size_t)pages * page_floats, 0.0f);
 	all_dirty = true;
 }
 
@@ -34,7 +46,7 @@ void Records::mark(int page) {
 }
 
 void Records::mark_range(int start, int n) {
-	for (int p = start / PER_PAGE; p <= (start + std::max(n, 1) - 1) / PER_PAGE; p++) {
+	for (int p = start / per_page; p <= (start + std::max(n, 1) - 1) / per_page; p++) {
 		mark(p);
 	}
 }
@@ -79,7 +91,7 @@ void Records::hide(int r) {
 		data[o + k] = 0.0f;
 	}
 	data[o + 11] = HIDDEN;
-	mark(r / PER_PAGE);
+	mark(r / per_page);
 }
 
 Dictionary Records::take_pages() {
@@ -95,11 +107,11 @@ Dictionary Records::take_pages() {
 	}
 	for (int p : which) {
 		PackedByteArray bytes;
-		bytes.resize((int64_t)PAGE_FLOATS * 4);
-		memcpy(bytes.ptrw(), &data[(size_t)p * PAGE_FLOATS], (size_t)PAGE_FLOATS * 4);
+		bytes.resize((int64_t)page_floats * 4);
+		memcpy(bytes.ptrw(), &data[(size_t)p * page_floats], (size_t)page_floats * 4);
 		Array e;
 		e.push_back(p);
-		e.push_back(Image::create_from_data(ROW, PAGE_ROWS, false, Image::FORMAT_RGBAF, bytes));
+		e.push_back(Image::create_from_data(ROW, rows, false, Image::FORMAT_RGBAF, bytes));
 		list.push_back(e);
 	}
 	dirty.clear();

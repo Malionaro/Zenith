@@ -24,6 +24,9 @@ const FACING_MARGIN := 0.03
 ## The pincers close until their outer halves reach the plane between them, at most this far (radians).
 const MAX_CLOSE := 1.2
 const CLOSE_STEP := 0.01
+## Holding an item they stop this far (tiles) either side of that plane, on its sides: half an item model's
+## width (they are 0.2 to 0.27 across). Closed all the way, they met through the held item and hid it (K8).
+const HELD_HALF := 0.1
 
 
 ## Each joint's part (Part, or BASE), or empty when the skin isn't an inserter rig (no Lower Arm,
@@ -166,6 +169,7 @@ static func _placed(arrays: Array, xform: Transform3D) -> Array:
 ##   lengths  [shoulder to elbow, elbow to grip]
 ##   hinge    the axis the arm bends about at rest (across the arm, from pincer A towards B)
 ##   heads    per Part its joint; axes and angles per pincer: the axis it closes about and how far
+##            (to the plane between them); grip_angles: how far onto a held item's sides (HELD_HALF)
 static func build(parts: Array, base_points: PackedVector3Array, xform: Transform3D, bake: Dictionary,
 		roles: PackedInt32Array) -> Dictionary:
 	var binds: Array = bake.get("binds", [])
@@ -243,8 +247,10 @@ static func build(parts: Array, base_points: PackedVector3Array, xform: Transfor
 	var grip := wrist + along * (reach * 0.5)
 	var axes: Array = []
 	var angles: Array = []
+	var grips: Array = []
 	axes.resize(Part.size())
 	angles.resize(Part.size())
+	grips.resize(Part.size())
 	for p: int in pincers:
 		var side: Vector3 = sides[p]
 		if side.length() < 0.001:
@@ -254,10 +260,11 @@ static func build(parts: Array, base_points: PackedVector3Array, xform: Transfor
 		var axis := side.cross(along).normalized()
 		axes[p] = axis
 		angles[p] = _close_angle(parts[p][Mesh.ARRAY_VERTEX], (heads[p] as Vector3) - wrist, axis, side)
+		grips[p] = _close_angle(parts[p][Mesh.ARRAY_VERTEX], (heads[p] as Vector3) - wrist, axis, side, HELD_HALF)
 	var pivot: Vector3 = heads[Part.TURNTABLE] if heads[Part.TURNTABLE] != null and parts[Part.TURNTABLE] != null else shoulder
 	return {"turn": turn, "pivot": pivot, "shoulder": shoulder, "elbow": elbow, "wrist": wrist, "grip": grip,
 		"lengths": [shoulder.distance_to(elbow), elbow.distance_to(grip)], "hinge": hinge,
-		"heads": heads, "axes": axes, "angles": angles}
+		"heads": heads, "axes": axes, "angles": angles, "grip_angles": grips}
 
 
 ## The yaw (radians, a quarter turn's multiple) that turns the platform's furthest-reaching side to
@@ -285,9 +292,9 @@ static func facing(points: PackedVector3Array) -> float:
 
 
 ## How far a pincer turns about `axis` (through its joint) before its outer half reaches the plane
-## between the pincers. `verts` are relative to the joint, `joint` is the joint relative to the
-## wrist, `side` points from that plane towards this pincer.
-static func _close_angle(verts: PackedVector3Array, joint: Vector3, axis: Vector3, side: Vector3) -> float:
+## between the pincers (or comes within `gap` of it). `verts` are relative to the joint, `joint` is the
+## joint relative to the wrist, `side` points from that plane towards this pincer.
+static func _close_angle(verts: PackedVector3Array, joint: Vector3, axis: Vector3, side: Vector3, gap := 0.0) -> float:
 	var far := 0.0
 	for v in verts:
 		far = maxf(far, v.length())
@@ -300,7 +307,7 @@ static func _close_angle(verts: PackedVector3Array, joint: Vector3, axis: Vector
 		var turned := Basis(axis, a + CLOSE_STEP)
 		var met := false
 		for v in outer:
-			if (turned * v + joint).dot(side) <= 0.0:
+			if (turned * v + joint).dot(side) <= gap:
 				met = true
 				break
 		if met:

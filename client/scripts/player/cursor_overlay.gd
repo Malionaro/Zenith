@@ -4,8 +4,10 @@ extends MeshInstance3D
 ## round the hovered entity or vehicle; the yellow arrows of inserters (where they pick up and
 ## drop), of belts, splitters, undergrounds and loaders being placed (the way they run), of mining
 ## drills (where they drop) and of fluid connections (in, out, or both ways); and the areas of
-## roboports (logistic orange, construction green) and mining drills; and the lines between linked
-## roboports (H14, roboport_links.gd).
+## roboports (logistic orange, construction green) and mining drills; the lines between linked
+## roboports (H14, roboport_links.gd); electric poles' supply areas in Factorio's blue, one tint
+## where several meet (J4, pole_coverage.gd); and a held underground's connection and reach (J24,
+## underground_pairs.gd).
 ##
 ## marks_for() works the marks out as plain data from the mod's `eprops` overlay (ui_model.eprops
 ## "x"), so the UI test can check them; show_marks() draws a list of marks.
@@ -23,6 +25,9 @@ const MINING_EDGE := Color(0.55, 0.8, 1.0, 0.6)
 ## A link between two roboports of one logistic network: the logistic area's orange, and how wide (tiles).
 const LINK := Color(1.0, 0.53, 0.0, 0.9)
 const LINK_WIDTH := 0.12
+## Electric poles' supply areas (J4): the colour of Factorio's electric-pole-radius-visualization.png,
+## see-through.
+const SUPPLY := Color(55.0 / 255.0, 85.0 / 255.0, 217.0 / 255.0, 0.28)
 ## Arrows are this long and wide (tiles).
 const ARROW := Vector2(0.5, 0.42)
 const LIFT := 0.06
@@ -54,6 +59,102 @@ static func arrow(at: Vector2, towards: Vector2, both := false, color := YELLOW)
 
 static func area(rect: Rect2, fill: Color, edge: Color) -> Dictionary:
 	return {"k": "area", "rect": rect, "fill": fill, "edge": edge}
+
+
+## Areas filled in one colour and no edge, `rects` not overlapping (union_rects), so where several
+## meet the tint doesn't stack: poles' supply areas.
+static func cover(rects: Array, fill := SUPPLY) -> Dictionary:
+	return {"k": "cover", "rects": rects, "c": fill}
+
+
+## The union of rectangles as rectangles that don't overlap: the bands between their top and bottom
+## edges, each band's spans merged, a span carried down while the next band has the same one.
+static func union_rects(rects: Array) -> Array:
+	var ys := {}
+	for r: Rect2 in rects:
+		ys[r.position.y] = true
+		ys[r.end.y] = true
+	var edges: Array = ys.keys()
+	edges.sort()
+	var by_top := rects.duplicate()
+	by_top.sort_custom(func(a: Rect2, b: Rect2) -> bool: return a.position.y < b.position.y)
+	var out: Array = []
+	var open := {}  # span (Vector2 x0, x1) of the band above -> its rectangle's index in `out`
+	var active: Array = []
+	var next := 0
+	for i in range(edges.size() - 1):
+		var y0: float = edges[i]
+		var y1: float = edges[i + 1]
+		while next < by_top.size() and (by_top[next] as Rect2).position.y <= y0:
+			active.append(by_top[next])
+			next += 1
+		var spans: Array = []
+		var still: Array = []
+		for r: Rect2 in active:
+			if r.end.y > y0:
+				still.append(r)
+				spans.append(Vector2(r.position.x, r.end.x))
+		active = still
+		var now := {}
+		for s: Vector2 in _merged(spans):
+			if open.has(s):
+				var k: int = open[s]
+				var grown: Rect2 = out[k]
+				grown.size.y = y1 - grown.position.y
+				out[k] = grown
+				now[s] = k
+			else:
+				now[s] = out.size()
+				out.append(Rect2(s.x, y0, s.y - s.x, y1 - y0))
+		open = now
+	return out
+
+
+## `r` less what `cut` covers, as rectangles that don't overlap.
+static func minus(r: Rect2, cut: Array) -> Array:
+	var clipped: Array = []
+	for c: Rect2 in cut:
+		var i := r.intersection(c)
+		if i.has_area():
+			clipped.append(i)
+	if clipped.is_empty():
+		return [r]
+	var ys := {r.position.y: true, r.end.y: true}
+	for c: Rect2 in clipped:
+		ys[c.position.y] = true
+		ys[c.end.y] = true
+	var edges: Array = ys.keys()
+	edges.sort()
+	var out: Array = []
+	for i in range(edges.size() - 1):
+		var y0: float = edges[i]
+		var y1: float = edges[i + 1]
+		var spans: Array = []
+		for c: Rect2 in clipped:
+			if c.position.y <= y0 and c.end.y >= y1:
+				spans.append(Vector2(c.position.x, c.end.x))
+		var x := r.position.x
+		for s: Vector2 in _merged(spans):
+			if s.x > x:
+				out.append(Rect2(x, y0, s.x - x, y1 - y0))
+			x = maxf(x, s.y)
+		if x < r.end.x:
+			out.append(Rect2(x, y0, r.end.x - x, y1 - y0))
+	return out
+
+
+## Spans (Vector2 x0, x1) sorted and joined where they touch or overlap.
+static func _merged(spans: Array) -> Array:
+	spans.sort_custom(func(a: Vector2, b: Vector2) -> bool: return a.x < b.x)
+	var out: Array = []
+	for s: Vector2 in spans:
+		if not out.is_empty() and s.x <= (out[-1] as Vector2).y:
+			var last: Vector2 = out[-1]
+			last.y = maxf(last.y, s.y)
+			out[-1] = last
+		else:
+			out.append(s)
+	return out
 
 
 ## A straight line on the ground from `a` to `b` (tiles): roboport links.
@@ -119,6 +220,9 @@ func show_marks(marks: Array) -> void:
 				_quad(r.position, Vector2(r.end.x, r.position.y), r.end, Vector2(r.position.x, r.end.y), m["fill"], LIFT * 0.5)
 				var w := clampf(r.size.x * 0.004, 0.06, 0.2)
 				_frame(r, w, m["edge"])
+			"cover":
+				for r: Rect2 in m["rects"]:
+					_quad(r.position, Vector2(r.end.x, r.position.y), r.end, Vector2(r.position.x, r.end.y), m["c"], LIFT * 0.5)
 			"brackets":
 				_brackets(m["at"], m["half"], float(m["yaw"]), m["c"])
 			"arrow":
@@ -128,6 +232,8 @@ func show_marks(marks: Array) -> void:
 				var b: Vector2 = m["b"]
 				var side := (b - a).normalized().orthogonal() * float(m["w"]) * 0.5
 				_quad(a + side, b + side, b - side, a - side, m["c"])
+			"tunnel":
+				_tunnel(m["at"], m["dir"], m["c"], bool(m.get("arrow", true)))
 	_mesh.surface_end()
 
 
@@ -173,6 +279,33 @@ func _arrow(at: Vector2, d: Vector2, both: bool, c: Color) -> void:
 		_tri(tail, base2 - side * ARROW.y * 0.5, base2 + side * ARROW.y * 0.5, c)
 		tail = base2
 	_quad(tail + side * shaft * 0.5, base + side * shaft * 0.5, base - side * shaft * 0.5, tail - side * shaft * 0.5, c)
+
+
+## One tile of an underground connection (J24, underground_pairs.gd), as Factorio's
+## underground-lines.png draws it on a 64-pixel tile pointing up: the lane's two edges as dashes 10
+## pixels wide (rows 10-26 and 42-58), and for belts a hollow arrow (apex at row 24, base at row 40,
+## 34 pixels wide), all in `c`.
+func _tunnel(at: Vector2, flow: Vector2, c: Color, arrow: bool) -> void:
+	var f := flow.normalized()
+	var side := Vector2(-f.y, f.x)
+	var bar := 10.0 / 64.0
+	for s: float in [-1.0, 1.0]:
+		var mid: Vector2 = at + side * s * (0.5 - bar * 0.5)
+		for dash: Vector2 in [Vector2(0.094, 0.344), Vector2(-0.406, -0.156)]:
+			var a := mid + f * dash.x
+			var b := mid + f * dash.y
+			var w := side * bar * 0.5
+			_quad(a - w, b - w, b + w, a + w, c)
+	if not arrow:
+		return
+	var apex := at + f * 0.125
+	var left := at - f * 0.125 - side * 0.27
+	var right := at - f * 0.125 + side * 0.27
+	for edge: Array in [[apex, left], [left, right], [right, apex]]:
+		var p: Vector2 = edge[0]
+		var q: Vector2 = edge[1]
+		var n := (q - p).normalized().orthogonal() * 0.025
+		_quad(p - n, q - n, q + n, p + n, c)
 
 
 func _tri(a: Vector2, b: Vector2, c: Vector2, color: Color, lift := LIFT) -> void:

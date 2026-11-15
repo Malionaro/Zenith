@@ -18,6 +18,7 @@ the mod's own state (`/c __factorio-3d-bridge__ ...`), which disables achievemen
 A second server instance on other ports (run-server.ps1 -UdpPort/-RconPort):
     python3 tools/live_check.py --factorio-port 34210 --client-port 34211 --rcon-port 34298
 `--only platforms` runs just the handshake and the space platform checks (needs Space Age);
+`--only pickup` F taking items off belts and the ground (`pku`), after an INFO line on Factorio's own picking_state;
 `--only ride` riding a rocket up to a platform's hub and a cargo pod down (`ride`, `land`);
 `--only collectors` asteroid collectors' arms (`acol`: arm count, speed, filters, caught chunks);
 `--only space` Space Age's screens (a silo launching a new platform's starter pack, the hub's
@@ -43,7 +44,8 @@ chooser's groups, productivity, burners, drills, temperature, labs, a requester'
 (Lua commands with its prelude over RCON, `cmd`, and /cheat, which researches everything); `--only remote` the 3D remote view leaving out moving things no radar sees (`cov`); `--only remnants` what destroyed buildings leave (extra.rm) and
 linked belts' ends; `--only barrier` the error barrier (barrier.lua): a tick step and an event handler
 made to fail, the game and the other steps going on (`--server-log` points at the server's
-factorio-current.log when it isn't server/data's).
+factorio-current.log when it isn't server/data's); `--only research` research finishing (`rdone`: a
+technology researched by script named once, an infinite one by the level it finished).
 """
 
 import argparse
@@ -61,11 +63,21 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import protocol  # noqa: E402
 import rcon  # noqa: E402
 
+# A check's text can hold any character (≥, item names): on Windows, output to a file or pipe is in
+# the system's code page, and one character it lacks stopped the whole run with UnicodeEncodeError.
+sys.stdout.reconfigure(errors="backslashreplace")
+
 MOD = "__factorio-3d-bridge__"
 FACTORIO_PORT, CLIENT_PORT = 34200, 34201
 SECOND_CLIENT_PORT = 0  # the two-client check's second client; 0: the client port + 1
 SERVER_LOG = None  # --server-log
 results = []
+# Seconds to wait for a `surface` message after a surface change. It is reliable and comes after
+# everything queued before it, chunk snapshots too: after the remote view came back to Nauvis the
+# platform's `surface` once took longer than the 3 s these waits had, the boarding check failed
+# and the character, left on the platform, failed 11 checks after it (a local full run). The waits
+# end as soon as it comes.
+SURFACE_WAIT = 15
 
 
 def report(ok, what, detail=""):
@@ -183,7 +195,10 @@ def clean_spot(c, hello, half=14):
     trees about. A character in a vehicle gets out first (it can't be teleported in one), and one
     still coming down in a cargo pod (after the planets check) is waited for. Nothing
     near the character: the nearest such square to the force's spawn. The 3x3
-    chunks around the spot must all exist, since watch_around waits for their snapshots."""
+    chunks around the spot must all exist, since watch_around waits for their snapshots. No empty
+    square within 160 tiles of either (a forest, the base the earlier checks built: 0.1.2's CI run
+    found none for the alt check): the nearest square with only trees, rocks, fish and cliffs on it,
+    cleared, its water filled with landfill. (No Lua comments below: the code is sent as one line.)"""
     end = time.time() + 30
     while time.time() < end and mod_lua("local c = storage.f3d.puppet local ok, pod = pcall(function() return c.cargo_pod end) "
                                         "rcon.print((not c or (ok and pod)) and 'pod' or 'free')") != "free":
@@ -205,6 +220,33 @@ for _, o in pairs({{ c.position, spawn }}) do
   for r = 0, 160, 8 do
     for dy = -r, r, 8 do for dx = -r, r, 8 do
       if math.max(math.abs(dx), math.abs(dy)) == r and clean(x0 + dx, y0 + dy) then
+        c.teleport({{ x0 + dx + 0.5, y0 + dy + 0.5 }})
+        rcon.print(c.position.x .. " " .. c.position.y) return
+      end
+    end end
+  end
+end
+local NATURAL = {{ "tree", "simple-entity", "fish", "cliff" }}
+local function clearable(x, y)
+  local area = {{ {{ x - {half}, y - {half} }}, {{ x + {half}, y + {half} }} }}
+  for dy = -1, 1 do for dx = -1, 1 do
+    if not s.is_chunk_generated({{ math.floor(x / 32) + dx, math.floor(y / 32) + dy }}) then return nil end
+  end end
+  local others = {{ "character", "corpse", "tree", "simple-entity", "fish", "cliff" }}
+  return s.count_entities_filtered({{ area = area, type = others, invert = true, limit = 1 }}) == 0 and area or nil
+end
+for _, o in pairs({{ c.position, spawn }}) do
+  local x0, y0 = math.floor(o.x), math.floor(o.y)
+  for r = 0, 160, 8 do
+    for dy = -r, r, 8 do for dx = -r, r, 8 do
+      local area = math.max(math.abs(dx), math.abs(dy)) == r and clearable(x0 + dx, y0 + dy)
+      if area then
+        for _, e in pairs(s.find_entities_filtered({{ area = area, type = NATURAL }})) do e.destroy() end
+        local tiles = {{}}
+        for _, t in pairs(s.find_tiles_filtered({{ area = area, collision_mask = "water_tile" }})) do
+          tiles[#tiles + 1] = {{ name = "landfill", position = t.position }}
+        end
+        if #tiles > 0 then s.set_tiles(tiles) end
         c.teleport({{ x0 + dx + 0.5, y0 + dy + 0.5 }})
         rcon.print(c.position.x .. " " .. c.position.y) return
       end
@@ -540,12 +582,27 @@ rcon.print(helpers.table_to_json(made))""".replace("\n", " "))
         if name in made:
             report(targeted(name) and shots(name) > 0, f"ts: a {name}'s target and shots", str(recs.get(made[name], [])[-3:]))
     if "railgun-turret" in made:
-        # It aims (within its turn_range of north) but hasn't fired here: the ammo going down once
-        # is the round it loads. Its shots are counted the same way as the others' (mock-checked).
+        # It aims but seldom fires here: the ammo going down once is the round it loads. Its shots
+        # are counted the same way as the others' (mock-checked). Its turn_range (0.2) is where it
+        # takes targets, not a stop for its head: following a biter that walked out of it the head
+        # went 0.217 from north on 0.2.0's CI (783; the old check failed there). So the head is
+        # checked against the target it reports: on it, within 0.02 of the bearing from the turret,
+        # once raised (its orientation reads 0 while it raises, the target already set). And loosely
+        # the arc: the biters come from the north-west to the row, all within 0.26 of north from here.
         rail_recs = recs.get(made["railgun-turret"], [])
-        report(targeted("railgun-turret") and all(r[1] >= 795 or r[1] <= 205 for r in rail_recs),
-               "ts: a railgun turret's target and its head's orientation within turn_range 0.2 of its facing",
-               f"{shots('railgun-turret')} shots; orientations {sorted({r[1] for r in rail_recs})}; {rail_recs[-3:]}; {rail}")
+        at = mod_lua("for _, e in pairs(storage.f3d.puppet.surface.find_entities_filtered({ name = 'railgun-turret' })) do "
+                     f"if e.unit_number == {made['railgun-turret']} then rcon.print(e.position.x .. ' ' .. e.position.y) end end").split()
+        px, py = (float(v) for v in at) if len(at) == 2 else (x + 12, y + 1)
+
+        def off_target(r):
+            bearing = (math.atan2(r[4] / 256 - px, -(r[5] / 256 - py)) / (2 * math.pi)) % 1
+            d = abs(r[1] / 1000 - bearing) % 1
+            return min(d, 1 - d)
+        aims = [off_target(r) for r in rail_recs if len(r) == 6 and r[1] != 0]
+        report(any(d < 0.02 for d in aims) and all(r[1] >= 700 or r[1] <= 300 for r in rail_recs),
+               "ts: a railgun turret's target, its head turned onto it (within 0.02 of its bearing), within 0.3 of its facing",
+               f"{shots('railgun-turret')} shots; {sum(d < 0.02 for d in aims)} of {len(aims)} raised aims on the target "
+               f"(closest {min(aims) if aims else '-'}); orientations {sorted({r[1] for r in rail_recs})}; {rail_recs[-3:]}; {rail}")
     art = recs.get(made.get("artillery-turret"), [])
     report(art and shots("artillery-turret") > 0 and any(400 < r[1] < 600 for r in art),
            "ts: an artillery turret's cannon turned south to a nest 40 tiles off (relative_turret_orientation), its shells "
@@ -587,7 +644,7 @@ def check_platforms(c, hello):
     # stays put; building waits; si 0 brings Nauvis back.
     psi = int(mod_lua(f'rcon.print(game.forces.player.platforms[{index}].surface.index)') or 0)
     c.send({"t": "view", "si": psi, "x": 0, "y": 0})
-    msgs = c.pump(3, every=hello, until=lambda m: m.get("t") == "surface")
+    msgs = c.pump(SURFACE_WAIT, every=hello, until=lambda m: m.get("t") == "surface")
     vs = of_type(msgs, "surface")
     c.send({"t": "sub", "c": [[0, 0], [-1, -1], [-1, 0], [0, -1]]})
     # Building from the remote view puts a ghost on that surface. A new platform's foundation
@@ -655,18 +712,21 @@ def check_platforms(c, hello):
            "map: a platform's ungenerated chunks chart as unknown, no Map error (F6)", f"{[(m['cx'], m['cy'], m['n']) for m in charts]}")
     mod_lua(f'local s = game.get_surface({psi}) for _, e in pairs(s.find_entities_filtered{{name = {{"assembling-machine-2", "entity-ghost"}}}}) do e.destroy() end')
     c.send({"t": "view", "si": 0})
-    msgs = c.pump(3, every=hello, until=lambda m: m.get("t") == "surface")
+    msgs = c.pump(SURFACE_WAIT, every=hello, until=lambda m: m.get("t") == "surface")
     vs = of_type(msgs, "surface")
     report(bool(vs) and vs[0].get("planet") == "nauvis" and "view" not in vs[0], "view 0: back to the character's surface", str(vs[:1]))
     c.pump(0.5, every=hello)
 
     c.send({"t": "plat_board", "i": index})
-    msgs = c.pump(3, every=hello, until=lambda m: m.get("t") == "surface")
+    msgs = c.pump(SURFACE_WAIT, every=hello, until=lambda m: m.get("t") == "surface")
     surf = of_type(msgs, "surface")
     report(bool(surf) and surf[0].get("pf") == index and "planet" not in surf[0] and not of_type(msgs, "welcome"),
            "plat_board: the character crosses to the platform (teleport to another surface), and `surface` says so",
-           str(surf[:1]))
+           f"{surf[:1]} {[m['text'] for m in of_type(msgs, 'msg')][-2:]}")
     if not surf:
+        # Back on Nauvis whatever happened, so the checks after this don't all fail from the platform.
+        rcon.run("/f3d-platform leave nauvis")
+        c.pump(SURFACE_WAIT, every=hello, until=lambda m: m.get("t") == "surface")
         return
     x, y = surf[0]["x"] / 256, surf[0]["y"] / 256
     cx, cy = int(x // 32), int(y // 32)
@@ -729,7 +789,7 @@ def check_platforms(c, hello):
            "plat_board 0 while travelling is refused")
     mod_lua(f'local p = game.forces.player.platforms[{index}] p.space_location = "nauvis" p.paused = true')
     c.send({"t": "plat_board", "i": 0})
-    msgs = c.pump(3, every=hello, until=lambda m: m.get("t") == "surface")
+    msgs = c.pump(SURFACE_WAIT, every=hello, until=lambda m: m.get("t") == "surface")
     surf = of_type(msgs, "surface")
     report(bool(surf) and surf[0].get("planet") == "nauvis" and "pf" not in surf[0],
            "plat_board 0: back down to the planet the platform is stopped at", str(surf[:1]))
@@ -1031,7 +1091,7 @@ rcon.print(silo.unit_number .. " " .. silo.position.x .. " " .. silo.position.y 
             return
     c.send({"t": "close"})
     c.send({"t": "plat_board", "i": index})
-    msgs = c.pump(3, every=hello, until=lambda m: m.get("t") == "surface")
+    msgs = c.pump(SURFACE_WAIT, every=hello, until=lambda m: m.get("t") == "surface")
     surf = of_type(msgs, "surface")
     if not surf:
         report(False, "space: boarding the platform", str(of_type(msgs, "msg")[-2:]))
@@ -1111,7 +1171,7 @@ rcon.print(silo.unit_number .. " " .. silo.position.x .. " " .. silo.position.y 
             report(any(t.startswith("Can't build here:") for t in texts), f"building {name} on a platform says why it can't", str(texts[-2:]))
     c.send({"t": "close"})
     c.send({"t": "plat_board", "i": 0})
-    c.pump(3, every=hello, until=lambda m: m.get("t") == "surface")
+    c.pump(SURFACE_WAIT, every=hello, until=lambda m: m.get("t") == "surface")
     c.pump(1.0, every=hello)
 
     # --- a landing pad, module effects, recipe quality, belt item quality (back on the planet) ----
@@ -1178,7 +1238,7 @@ def check_collectors(c, hello):
         report(False, "collectors: /f3d-platform new", out)
         return
     c.send({"t": "plat_board", "i": index})
-    msgs = c.pump(3, every=hello, until=lambda m: m.get("t") == "surface")
+    msgs = c.pump(SURFACE_WAIT, every=hello, until=lambda m: m.get("t") == "surface")
     if not of_type(msgs, "surface"):
         report(False, "collectors: boarding the platform", str(of_type(msgs, "msg")[-2:]))
         return
@@ -1215,7 +1275,7 @@ def check_collectors(c, hello):
     rows = [r for m in of_type(msgs, "acol") for r in m.get("l", []) if r[0] == col_u]
     report(bool(rows) and rows[-1][3] == 2, "acol: without power the arms fold home (2)", str(rows[-1:]))
     c.send({"t": "plat_board", "i": 0})
-    msgs = c.pump(3, every=hello, until=lambda m: m.get("t") == "surface")
+    msgs = c.pump(SURFACE_WAIT, every=hello, until=lambda m: m.get("t") == "surface")
     msgs += c.pump(1.0, every=hello)  # the clear comes on the next 10-tick look, after `surface`
     cleared = [m for m in msgs if m.get("t") == "acol" and m.get("l") in ([], {})]
     report(bool(cleared), "acol: an empty list once the client's world leaves the platform", str(of_type(msgs, "acol")[-1:]))
@@ -1241,7 +1301,7 @@ def check_planets(c, hello):
 s.request_to_generate_chunks({{0, 0}}, 2) s.force_generate_chunk_requests()
 local p = s.find_non_colliding_position("character", {{0, 0}}, 64, 0.5) or {{x = 0, y = 0}}
 c.teleport(p, s)""")
-        msgs = c.pump(3, every=hello, until=lambda m: m.get("t") == "planet")
+        msgs = c.pump(SURFACE_WAIT, every=hello, until=lambda m: m.get("t") == "planet" and m.get("name") == planet)
         planet_msg = of_type(msgs, "planet")
         surf = of_type(msgs, "surface")
         report(bool(planet_msg) and planet_msg[-1]["name"] == planet and "gravity" in planet_msg[-1].get("props", {})
@@ -1364,7 +1424,7 @@ end""")
     lua("for _, e in pairs(storage.f3d_live_planets or {}) do if e.valid then e.destroy() end end storage.f3d_live_planets = nil")
     if len(home) == 2:
         lua(f'storage.f3d.puppet.teleport({{ {home[0]}, {home[1]} }}, game.surfaces.nauvis)')
-        c.pump(2, every=hello, until=lambda m: m.get("t") == "surface")
+        c.pump(SURFACE_WAIT, every=hello, until=lambda m: m.get("t") == "surface")
     out = rcon.run("/f3d-platform new").strip()
     try:
         index = int(out.split("platform ")[1].split(" ")[0])
@@ -1372,7 +1432,7 @@ end""")
         report(False, "land: build a platform to land from", out)
         return
     c.send({"t": "plat_board", "i": index})
-    c.pump(3, every=hello, until=lambda m: m.get("t") == "surface")
+    c.pump(SURFACE_WAIT, every=hello, until=lambda m: m.get("t") == "surface")
     c.send({"t": "land"})
     msgs = c.pump(15, every=hello, until=lambda m: m.get("t") == "surface" and m.get("planet") == "nauvis")
     texts = [m["text"] for m in of_type(msgs, "msg")]
@@ -1591,6 +1651,60 @@ def check_triggers(c, hello):
            f"labs counted {before} -> {out[:1]}, researched and recipe {out[1:3]}, labs held {out[3:]}")
 
 
+def check_research(c, hello):
+    """K23: research finishing (`rdone`, research.lua). A technology of one level researched by script
+    is named once, level 0, with the tick it finished in, and an `rs` follows; an infinite one names
+    the level it finished, read against LuaTechnology.level before and after (the bridge takes the
+    level read in the event as the next one). Both are undone afterwards."""
+    picked = mod_lua("local f = storage.f3d.puppet.force local one, inf = {}, {} "
+                     "for name, t in pairs(f.technologies) do local p = t.prototype "
+                     "if t.enabled and not p.hidden then "
+                     "if not t.researched and p.max_level == p.level then one[#one + 1] = name end "
+                     "if p.max_level == 4294967295 then inf[#inf + 1] = name end end end "
+                     "table.sort(one) table.sort(inf) rcon.print((one[1] or '-') .. ' ' .. (inf[1] or '-'))").split()
+    if len(picked) != 2 or picked[0] == "-":
+        report(False, "research: a technology of one level to research by script", str(picked))
+        return
+    one, inf = picked
+    tech = 'storage.f3d.puppet.force.technologies["%s"]'
+    c.pump(0.5, every=hello)
+    mod_lua(f"{tech % one}.researched = true")
+    msgs = c.pump(1.5, every=hello, until=lambda m: m.get("t") == "rdone")
+    msgs += c.pump(0.5, every=hello)
+    done = of_type(msgs, "rdone")
+    named = [e for m in done for e in m["l"]]
+    report(named == [[one, 0]] and len(done) == 1 and isinstance(done[0].get("tick"), int),
+           "rdone: a finished research named once, level 0, with its tick (on_research_finished)", str(done)[:300])
+    after = msgs[msgs.index(done[0]) + 1:] if done else []
+    report(bool(of_type(after, "rs")), "rdone: the research status (rs) follows it", str([m["t"] for m in after][:20]))
+    mod_lua(f"{tech % one}.researched = false")
+    if inf == "-":
+        print("INFO research: no infinite technology in this game, its level not checked")
+        return
+    before = mod_lua(f"rcon.print({tech % inf}.level)")
+    if not before.isdigit():
+        report(False, "research: an infinite technology's level", f"{inf}: {before}")
+        return
+    c.pump(0.5, every=hello)
+    # Setting researched on an infinite technology researches its level (2.1's LuaTechnology); if that
+    # raises nothing, writing the level ("the same as researching the technology to the previous level").
+    how = "researched = true"
+    tried = mod_lua(f"local ok, err = pcall(function() {tech % inf}.researched = true end) rcon.print(tostring(ok) .. ' ' .. tostring(err))")
+    msgs = c.pump(1.5, every=hello, until=lambda m: m.get("t") == "rdone")
+    if not of_type(msgs, "rdone"):
+        how = "level = level + 1"
+        mod_lua(f"{tech % inf}.level = {int(before) + 1}")
+        msgs += c.pump(1.5, every=hello, until=lambda m: m.get("t") == "rdone")
+    msgs += c.pump(0.3, every=hello)
+    now = mod_lua(f"rcon.print({tech % inf}.level)")
+    now = int(now) if now.isdigit() else -1
+    named = [e for m in of_type(msgs, "rdone") for e in m["l"]]
+    report(named == [[inf, int(before)]] and now == int(before) + 1,
+           "rdone: an infinite research names the level it finished, its level goes on",
+           f"{inf}: level {before} -> {now} by {how} ({tried}), rdone {named}")
+    mod_lua(f"{tech % inf}.level = {int(before)}")
+
+
 def check_walk(c, hello):
     """B7: `walk` with an angle. The mod steps each tick in one of the two 8-way directions either side
     of it (puppet.lua angle_step); in the real game the path must follow the line within a few
@@ -1598,16 +1712,23 @@ def check_walk(c, hello):
     if not clean_spot(c, hello):
         report(False, "walk: no clean spot found", SPOT_WHY)
         return
-    # The walks reach about 22 tiles from the spot, past clean_spot's square: whatever the map
-    # put there (trees, rocks, cliffs, water) would turn the character aside and fail the path
-    # checks on some maps and not others, so the route is cleared first.
-    mod_lua("local c = storage.f3d.puppet local s = c.surface local p = c.position "
-            "local area = { { p.x - 32, p.y - 32 }, { p.x + 32, p.y + 32 } } "
-            "for _, e in pairs(s.find_entities_filtered({ area = area, type = { 'tree', 'simple-entity', 'cliff', 'fish' } })) do e.destroy() end "
-            "local tiles = {} for _, t in pairs(s.find_tiles_filtered({ area = area, collision_mask = 'water_tile' })) do "
-            "tiles[#tiles + 1] = { name = 'landfill', position = t.position } end "
-            "if #tiles > 0 then s.set_tiles(tiles) end rcon.print('ok')")
+    # The walks go up to 25 tiles from the spot, past clean_spot's square: whatever the map put
+    # there (trees, rocks, cliffs, water) would turn the character aside and fail the path checks
+    # on some maps and not others, so the ground 32 tiles round is cleared first. Each walk starts
+    # from the spot again: one after another they used to end some 35 tiles out, past the cleared
+    # ground, where water or trees stopped the wall check (it failed on every CI run since 0.1.2)
+    # and nudged the angled path off its line (0.19 tiles on 0.2.0's CI).
+    spot = mod_lua("local c = storage.f3d.puppet local s = c.surface local p = c.position "
+                   "local area = { { p.x - 32, p.y - 32 }, { p.x + 32, p.y + 32 } } "
+                   "for _, e in pairs(s.find_entities_filtered({ area = area, type = { 'tree', 'simple-entity', 'cliff', 'fish' } })) do e.destroy() end "
+                   "local tiles = {} for _, t in pairs(s.find_tiles_filtered({ area = area, collision_mask = 'water_tile' })) do "
+                   "tiles[#tiles + 1] = { name = 'landfill', position = t.position } end "
+                   "if #tiles > 0 then s.set_tiles(tiles) end rcon.print(p.x .. ' ' .. p.y)")
     c.pump(0.5, every=hello)
+
+    def back():
+        mod_lua(f"storage.f3d.puppet.teleport({{ {spot.split()[0]}, {spot.split()[1]} }})")
+        c.pump(0.4, every=hello)
 
     def walk(msg, seconds):
         msgs = c.pump(seconds, every=(0.15, msg))
@@ -1622,7 +1743,9 @@ def check_walk(c, hello):
         return dist / max(1, b["k"] - a["k"])
 
     straight = speed(walk({"t": "walk", "d": 4}, 1.5))
+    back()
     diagonal = speed(walk({"t": "walk", "d": 2}, 1.5))
+    back()
     report(straight > 0.1 and abs(diagonal - straight) < 0.005, "walk: Factorio's character walks diagonally at its straight speed",
            f"{straight:.4f} and {diagonal:.4f} tiles a tick")
     a = 56  # 20.16 degrees east of north
@@ -1668,6 +1791,150 @@ rcon.print(table.concat(out, " "))
     stop = c.me["x"], c.me["y"]
     c.pump(0.6, every=hello)
     report((c.me["x"], c.me["y"]) == stop and c.me["w"] == 0 and "a" not in c.me, "walk: walk -1 stops an angled walk", str(c.me)[:200])
+    back()
+    # J26: walking with the mining button held and the cursor ahead over a line of belts mines every belt
+    # in turn, as Factorio's own mining does: the client sends only where its cursor is from the
+    # character (`mine` `n`, `ox`, `oy`), the bridge's sweep follows that point each tick, and the
+    # character stands while it mines.
+    x, y = c.me["x"] / 256, c.me["y"] / 256
+    bx, by = math.floor(x) + 2.5, math.floor(y) - 1.5
+    belts = mod_lua(f"""
+local c = storage.f3d.puppet local s = c.surface local out = {{}}
+for i = 0, 4 do
+  local e = s.create_entity({{ name = "transport-belt", position = {{ {bx} + i, {by} }}, direction = defines.direction.east, force = c.force }})
+  out[#out + 1] = e and e.unit_number or 0
+end
+rcon.print(table.concat(out, " "))
+""".replace("\n", " ")).split()
+    c.pump(0.3, every=hello)
+    sweep = {"t": "mine", "n": 1, "ox": int(round((bx - x) * 256)), "oy": int(round((by - y) * 256))}
+    mes = []
+    for i in range(30):
+        if i % 5 == 0:
+            c.send(hello[1])  # the keep-alive (commands don't count towards it)
+        c.send({"t": "walk", "d": 4})
+        c.send(sweep)
+        mes += of_type(c.pump(0.15), "me")
+        left = mod_lua(f"rcon.print(storage.f3d.puppet.surface.count_entities_filtered({{ name = 'transport-belt', "
+                       f"area = {{ {{ {bx - 0.4}, {by - 0.4} }}, {{ {bx + 4.4}, {by + 0.4} }} }} }}))")
+        if left.strip() == "0":
+            break
+    c.send({"t": "walk", "d": -1})
+    c.send({"t": "mine_stop"})
+    c.pump(0.4, every=hello)
+    # Moved while mining: two `me` in a row mining the same belt from different places.
+    moved = [(a["k"], b["k"], a["x"], b["x"], a.get("m"), b.get("m"), a["w"], b["w"]) for a, b in zip(mes, mes[1:])
+             if "m" in a and "m" in b and (a["mx"], a["my"]) == (b["mx"], b["my"]) and (a["x"], a["y"]) != (b["x"], b["y"])]
+    report(left.strip() == "0" and any("m" in m for m in mes) and not moved,
+           "walk: J26, walking with the button held mines every belt of a line in turn, standing while it mines",
+           f"{left.strip()} of 5 left; {sum(1 for m in mes if 'm' in m)} `me` mining; moved while mining: {moved[:4]}; "
+           f"walking flag with m: {[(m['k'], m['x'], m['m'], m['w']) for m in mes if 'm' in m and m['w'] == 1][:4]}")
+    destroy_units([int(u) for u in belts])
+    back()  # on the clean, watched spot, for whatever comes next
+
+
+def check_pickup(c, hello):
+    """Issue #18: F (`pickup`) takes the items on belts within the character's item pickup distance too, as
+    Factorio's "Pick up items" does, each said at once (`pku`), with an item on the ground as before. First
+    Factorio's own rule is measured on the bridge's player-less character (picking_state: whether the game picks
+    up for it at all, how far, how many), printed as INFO to compare with; then the bridge's own is checked.
+    The belts are a packed column east of the character, backed up against its north end, so nothing moves
+    until something is taken. (No Lua comments: each snippet is sent as one line.)"""
+    if not clean_spot(c, hello):
+        report(False, "pickup: no clean spot found", SPOT_WHY)
+        return
+    x, y = c.me["x"] / 256, c.me["y"] / 256
+    bx, y0 = math.floor(x) + 1.5, math.floor(y)
+    reach = float(mod_lua("rcon.print(storage.f3d.puppet.item_pickup_distance)") or 1) + 0.5  # puppet.lua's PICKUP_SLACK
+
+    def build():
+        return mod_lua(f"""
+local c = storage.f3d.puppet local s = c.surface local out = {{}}
+for i = -3, 3 do
+  local b = s.create_entity({{ name = "transport-belt", position = {{ {bx}, {y0} + i + 0.5 }}, direction = defines.direction.north, force = c.force }})
+  if b then
+    for l = 1, 2 do for q = 0.125, 0.875, 0.25 do b.get_transport_line(l).insert_at(q, {{ name = "iron-plate", count = 1 }}) end end
+    out[#out + 1] = b.unit_number
+  end
+end
+local f = s.create_entity({{ name = "transport-belt", position = {{ {bx} + 10, {y0} + 0.5 }}, direction = defines.direction.north, force = c.force }})
+if f then f.get_transport_line(1).insert_at(0.5, {{ name = "iron-plate", count = 1 }}) out[#out + 1] = f.unit_number end
+rcon.print(table.concat(out, " "))
+""".replace("\n", " ")).split()
+
+    def items(units):
+        """{unique id: (x, y)} of the items on these belts' lanes now."""
+        out = mod_lua("local want = {} for _, u in pairs({ " + ", ".join(units) + " }) do want[u] = true end "
+                      "local c = storage.f3d.puppet local p0 = c.position local out = {} "
+                      "for _, e in pairs(c.surface.find_entities_filtered({ type = 'transport-belt', force = c.force, "
+                      "area = { { p0.x - 16, p0.y - 16 }, { p0.x + 16, p0.y + 16 } } })) do "
+                      "if want[e.unit_number] then for l = 1, 2 do local line = e.get_transport_line(l) "
+                      "for _, it in pairs(line.get_detailed_contents()) do local p = line.get_line_item_position(it.position) "
+                      "out[#out + 1] = it.unique_id .. ',' .. p.x .. ',' .. p.y end end end end "
+                      "rcon.print(table.concat(out, ' '))")
+        return {int(u): (float(a), float(b)) for u, a, b in (w.split(",") for w in out.split())}
+
+    # Factorio's own: picking_state held on the player-less character for a second.
+    units = build()
+    c.pump(1.0, every=hello)
+    px, py = c.me["x"] / 256, c.me["y"] / 256
+    before = items(units)
+    plates = inv_count("iron-plate")
+    took = mod_lua("local ok = pcall(function() storage.f3d.puppet.picking_state = true end) rcon.print(ok and 'set' or 'refused')")
+    end = time.time() + 1.0
+    while time.time() < end:
+        c.pump(0.1, every=hello)
+        mod_lua("pcall(function() storage.f3d.puppet.picking_state = true end)")
+    mod_lua("pcall(function() storage.f3d.puppet.picking_state = false end)")
+    c.pump(0.3, every=hello)
+    after = items(units)
+    dist = {u: math.hypot(p[0] - px, p[1] - py) for u, p in before.items()}
+    gone = [u for u in before if u not in after]
+    print(f"INFO pickup: Factorio's own picking_state on the bridge's player-less character ({took}) took {len(gone)} of "
+          f"{len(before)} belt items in a second (+{inv_count('iron-plate') - plates} plates), the furthest "
+          f"{max((dist[u] for u in gone), default=0):.2f} tiles off as they lay; the nearest not taken "
+          f"{min((dist[u] for u in before if u in after), default=0):.2f}; item_pickup_distance {reach - 0.5}")
+    destroy_units([int(u) for u in units])
+    c.pump(0.3, every=hello)
+
+    # The bridge's own: F held for a second.
+    units = build()
+    ground = mod_lua(f"local c = storage.f3d.puppet local e = c.surface.create_entity({{ name = 'item-on-ground', "
+                     f"position = {{ {x} - 0.7, {y} }}, stack = {{ name = 'wood', count = 1 }} }}) rcon.print(e and 'ok' or 'none')")
+    c.pump(1.0, every=hello)
+    px, py = c.me["x"] / 256, c.me["y"] / 256
+    before = items(units)
+    near = {u for u, p in before.items() if math.hypot(p[0] - px, p[1] - py) <= reach - 0.05}
+    far = {u for u, p in before.items() if p[0] > bx + 5}
+    plates, wood = inv_count("iron-plate"), inv_count("wood")
+    msgs = c.pump(1.0, every=(0.15, {"t": "pickup"}))
+    msgs += c.pump(1.0, every=hello)
+    after = items(units)
+    recs = [r for m in of_type(msgs, "pku") for r in m["l"]]
+    on_belt = [r for r in recs if r[4]]
+    taken = {r[5] for r in on_belt}
+    belt_units = {int(u) for u in units}
+    report(on_belt and taken <= set(before) and all(r[0] == "iron-plate" and r[4] // 8 in belt_units and r[6] == 0 for r in on_belt),
+           "pickup: F takes the items on belts in reach, each said at once (pku: its lane and unique id)",
+           f"{len(on_belt)} said, {len(near)} in reach at the start; {on_belt[:2]}")
+    report(near <= taken and not taken & set(after) and far <= set(after),
+           "pickup: every item in reach comes off its lane, none said taken is still there, a belt out of reach keeps its own",
+           f"in reach and not said: {sorted(near - taken)[:4]}; said and still there: {sorted(taken & set(after))[:4]}")
+    off = [round(math.hypot(r[2] / 256 - px, r[3] / 256 - py), 3) for r in on_belt]
+    report(off and max(off) <= reach + 0.02, "pickup: each where the game had it, within the pickup distance",
+           f"furthest {max(off, default=0)} tiles, reach {reach}")
+    report(inv_count("iron-plate") - plates == sum(r[1] for r in on_belt),
+           "pickup: the inventory got what pku says, no more", f"{inv_count('iron-plate') - plates} plates, said {sum(r[1] for r in on_belt)}")
+    ground_recs = [r for r in recs if not r[4]]
+    report(ground != "ok" or (ground_recs and ground_recs[0][0] == "wood" and inv_count("wood") == wood + 1),
+           "pickup: and the item lying on the ground, said too (lane 0)", str(ground_recs[:1]))
+    ks = [m["k"] for m in of_type(msgs, "pku")]
+    later_bi = [v for m in of_type(msgs, "bi") if ks and m.get("k", 0) > max(ks) + 12 for v in m["l"][0::4]]
+    if later_bi:
+        report(not taken & set(later_bi), "pickup: the belt items it took are gone from the belt items sent after",
+               str(sorted(taken & set(later_bi))[:4]))
+    destroy_units([int(u) for u in units])
+    c.pump(0.3, every=hello)
 
 
 def check_input(c, hello):
@@ -2578,9 +2845,60 @@ rcon.print(f.unit_number)""".replace("\n", " "))
     c.send({"t": "close"})
     rows = [r for m in msgs if m.get("t") == "aiu" for r in m["l"] if r[0] == gu]
     report(rows and rows[-1][1:3] == ["recipe", "pipe"], "#9: a recipe set from the screen sends its icon in aiu", str(rows))
+    check_alt_machines(c, hello_now, x0, y0)
     if not keep:
         mod_lua(f'for _, e in pairs(storage.f3d.puppet.surface.find_entities_filtered({{ area = {{ {{ {x0 - 30}, {y0 - 30} }}, '
-                f'{{ {x0 + 30}, {y0 + 30} }} }}, name = {{ "steel-furnace", "chemical-plant", "oil-refinery", "assembling-machine-2", "recycler" }} }})) do e.destroy() end rcon.print("ok")')
+                f'{{ {x0 + 30}, {y0 + 30} }} }}, name = {{ "steel-furnace", "chemical-plant", "oil-refinery", "assembling-machine-2", "recycler", '
+                f'"assembling-machine-3", "lab", "beacon" }} }})) do e.destroy() end rcon.print("ok")')
+
+
+def check_alt_machines(c, hello_now, x0, y0):
+    """K1, K2: what 2.1 says of Alt-mode's icon placement (LuaEntityPrototype.icons_positioning and
+    icon_draw_specification, as eprops ids and isq), and `am` while Alt-mode is on: an assembling machine 3's
+    four modules in slot order with a quality kept, a lab's packs a slot each and its two modules, a
+    beacon's modules."""
+    facts = mod_lua("""local out = {} for _, n in pairs({ 'assembling-machine-3', 'lab', 'beacon', 'electric-mining-drill' }) do
+ local p = prototypes.entity[n] local ok, ip = pcall(function() return p.icons_positioning end)
+ out[#out + 1] = n .. ' ids=' .. serpent.line(p.icon_draw_specification) .. ' ip=' .. (ok and serpent.line(ip) or 'error') end
+ rcon.print(table.concat(out, ' | '))""".replace("\n", " "))
+    print("  icons_positioning:", facts)
+    ep = {name: (((c.eprops or {}).get(c.proto_id(name)) or [None] * 4)[3:] or [{}])[0] or {}
+          for name in ("assembling-machine-3", "lab", "beacon")}
+    report(ep["assembling-machine-3"].get("ids") == [0, -0.3, 1]
+           and ep["assembling-machine-3"].get("isq") == [["m", 0, 0.7, 0.5, 4, 2, 1.1, -0.1]],
+           "K1: eprops: the assembling machine 3's icon 0.3 up, its modules' row from Factorio's defaults", str(ep["assembling-machine-3"]))
+    lab_rows = {r[0]: r for r in ep["lab"].get("isq", [])}
+    report(lab_rows.get("l") == ["l", 0, 0, 0.5, 6, 2, 0.909, -0.1] and lab_rows.get("m", [None] * 3)[2] == 0.9,
+           "K2: eprops: Space Age's lab, six packs a row and its modules under them", str(ep["lab"]))
+    packs = ["automation-science-pack", "logistic-science-pack", "military-science-pack", "chemical-science-pack",
+             "production-science-pack", "utility-science-pack", "space-science-pack"]
+    pack_list = ", ".join(f'"{p}"' for p in packs)
+    out = mod_lua(f"""
+local c = storage.f3d.puppet local s = c.surface local out = {{}}
+local a = s.create_entity({{ name = "assembling-machine-3", position = {{ {x0} - 12, {y0} + 14 }}, force = c.force, raise_built = true }})
+local m = a.get_module_inventory()
+m.insert({{ name = "speed-module-3", count = 1 }}) m.insert({{ name = "speed-module-3", count = 1, quality = "rare" }})
+m.insert({{ name = "productivity-module-3", count = 2 }})
+local l = s.create_entity({{ name = "lab", position = {{ {x0} - 6, {y0} + 14 }}, force = c.force, raise_built = true }})
+for _, p in pairs({{ {pack_list} }}) do l.insert({{ name = p, count = 1 }}) end
+l.get_module_inventory().insert({{ name = "speed-module", count = 2 }})
+local b = s.create_entity({{ name = "beacon", position = {{ {x0}, {y0} + 14 }}, force = c.force, raise_built = true }})
+b.get_module_inventory().insert({{ name = "speed-module-2", count = 2 }})
+rcon.print(a.unit_number .. " " .. l.unit_number .. " " .. b.unit_number)""".replace("\n", " "))
+    units = [int(v) for v in out.split()] if all(v.isdigit() for v in out.split()) and len(out.split()) == 3 else []
+    if not units:
+        report(False, "K1, K2: an assembler, a lab and a beacon with modules built", out)
+        return
+    c.send({"t": "altc", "on": 1, "g": 41})
+    msgs = c.pump(4.0, every=(1.0, hello_now))
+    c.send({"t": "altc", "on": 0})
+    rows = {r[0]: r for m in msgs if m.get("t") == "am" and m.get("g") == 41 for r in m["l"]}
+    a, l, b = units
+    report(rows.get(a) == [a, ["speed-module-3", ["speed-module-3", "rare"], "productivity-module-3", "productivity-module-3"]],
+           "K1: `am`: the assembler's four modules in slot order, the rare one's quality kept", str(rows.get(a)))
+    report(rows.get(l) == [l, ["speed-module", "speed-module"], packs],
+           "K2: `am`: the lab's seven packs a slot each and its two modules", str(rows.get(l)))
+    report(rows.get(b) == [b, ["speed-module-2", "speed-module-2"]], "K1: `am`: the beacon's modules", str(rows.get(b)))
 
 
 def check_belt_switch(c, hello):
@@ -2846,6 +3164,17 @@ def check_build_marks(c, hello, x, y):
         ok = ok and game.get((px, py)) == (d, want) and sent is not None and len(sent) > 5 and sent[5].get("u") == want[0]
     report(ok, "undergrounds built in all four directions: entrance then exit (create_entity type), both facing the "
            "way items go, sent as extra.u", f"{out} | sent {[a[2:] for a in adds.values()]}")
+    # J23: R on the east pair's entrance turns both ends (the game flips a pair together and tells of
+    # only the one turned): both come back turned, facing west, entrance and exit swapped.
+    east_in, east_out = adds.get((fx(bx - 0.5), fx(by - 6.5))), adds.get((fx(bx + 2.5), fx(by - 6.5)))
+    if east_in and east_out:
+        c.send({"t": "rotate", "u": east_in[0], "p": ug, "x": east_in[2], "y": east_in[3], "rev": 0})
+        turned = {m["e"][0]: (m["e"][4], m["e"][5].get("u")) for m in of_type(c.pump(1.0, every=hello), "upd")
+                  if m["e"][1] == ug and len(m["e"]) > 5}
+        report(turned.get(east_in[0]) == (12, "o") and turned.get(east_out[0]) == (12, "i"),
+               "J23: R on an underground's entrance sends both ends turned (facing back, entrance and exit swapped)", str(turned))
+    else:
+        report(False, "J23: the east underground pair to turn", str(list(adds)))
     mod_lua("for _, e in pairs(storage.f3d.puppet.surface.find_entities_filtered({ name = 'underground-belt', "
             f"area = {{ {{ {bx - 8}, {by - 10} }}, {{ {bx + 8}, {by - 5} }} }} }})) do e.destroy({{ raise_destroy = true }}) end")
 
@@ -4350,7 +4679,9 @@ rcon.print(p.unit_number .. " " .. eei.unit_number .. " " .. pole.unit_number ..
 
 def check_states(c, hello):
     """States beyond working or not (`st`, movers.lua): rail and chain signals by colour, an
-    accumulator charging and then discharging, a power switch on and off. A track with a signal and
+    accumulator charging and then discharging, a power switch on and off, a powered lamp off by day
+    (status turned_off_during_daytime), set to Always on at noon lit with `ao` 1 (K20; its status
+    printed) and on at midnight (working; J19). A track with a signal and
     a chain signal by it is green while empty and red once a locomotive stands in the block beyond;
     an accumulator charges from a solar panel at noon and discharges into a radar once that is gone
     (an electric energy interface won't do: it gives power at tertiary priority, as accumulators
@@ -4388,13 +4719,14 @@ local acc = s.create_entity({{ name = 'accumulator', position = {{ px + 7, py - 
 local sol = s.create_entity({{ name = 'solar-panel', position = {{ px + 2.5, py - 6.5 }}, force = c.force, raise_built = true }})
 local switch = s.create_entity({{ name = 'power-switch', position = {{ px + 1, py - 10 }}, force = c.force, raise_built = true }})
 switch.power_switch_state = true
-storage.f3d_states = {{ sig = sig, chain = chain, acc = acc, sol = sol, switch = switch, pole = pole }}
-rcon.print((sig and sig.unit_number or 0) .. ' ' .. (chain and chain.unit_number or 0) .. ' ' .. acc.unit_number .. ' ' .. switch.unit_number)
+local lamp = s.create_entity({{ name = 'small-lamp', position = {{ px + 5.5, py - 2.5 }}, force = c.force, raise_built = true }})
+storage.f3d_states = {{ sig = sig, chain = chain, acc = acc, sol = sol, switch = switch, pole = pole, lamp = lamp }}
+rcon.print((sig and sig.unit_number or 0) .. ' ' .. (chain and chain.unit_number or 0) .. ' ' .. acc.unit_number .. ' ' .. switch.unit_number .. ' ' .. lamp.unit_number)
 """.replace("\n", " "))
     try:
-        sig, chain, acc, switch = (int(v) for v in out.split())
+        sig, chain, acc, switch, lamp = (int(v) for v in out.split())
     except ValueError:
-        report(False, "states: built a track with signals, an accumulator and a power switch", out)
+        report(False, "states: built a track with signals, an accumulator, a power switch and a lamp", out)
         return
     report(sig and chain, "states: a rail signal and a chain signal placed by the track", out)
 
@@ -4409,9 +4741,35 @@ rcon.print((sig and sig.unit_number or 0) .. ' ' .. (chain and chain.unit_number
            f"signal {got.get(sig)}, chain {got.get(chain)}")
     report(got.get(acc) == 1, "st: an accumulator charging from the network is 1 (status charging)", str(got.get(acc)))
     report(got.get(switch) == 1, "st: a power switch that is on is 1", str(got.get(switch)))
-    # A locomotive in the track's blocks, the switch off, the solar panel swapped for a radar.
+    report(got.get(lamp) == 0, "st: a powered lamp at noon is 0 (status turned_off_during_daytime)", str(got.get(lamp)))
+    # K20: the lamp set to Always on at noon. Printed: the status 2.1 gives it (working, or still
+    # turned_off_during_daytime, which the bridge reads past through always_on); then `st` 1 with `ao` 1,
+    # which lets the client light it by day, and 0 again with Always on off.
+    def lamp_msgs(seconds):
+        st_got, ao_got = {}, {}
+        for m in of_type(c.pump(seconds, every=hello), "st"):
+            for i in range(0, len(m["l"]), 2):
+                st_got[m["l"][i]] = m["l"][i + 1]
+            a = m.get("ao") or []
+            for i in range(0, len(a), 2):
+                ao_got[a[i]] = a[i + 1]
+        return st_got, ao_got
+    out = mod_lua("storage.f3d_states.lamp.always_on = true rcon.print('ok')")
+    st_got, ao_got = lamp_msgs(4.0)
+    status = mod_lua("local l = storage.f3d_states.lamp local n = tostring(l.status) "
+                     "for k, v in pairs(defines.entity_status) do if v == l.status then n = k end end "
+                     "rcon.print(n .. ', always_on ' .. tostring(l.always_on))")
+    print(f"  K20: a lamp set to Always on at noon reads status {status}")
+    report(out == "ok" and st_got.get(lamp) == 1 and ao_got.get(lamp) == 1,
+           "st: a lamp set to Always on at noon is 1 with ao 1: the client lights it by day (K20)",
+           f"{out}; st {st_got.get(lamp)}, ao {ao_got.get(lamp)}; status {status}")
+    out = mod_lua("storage.f3d_states.lamp.always_on = false rcon.print('ok')")
+    st_got, _ = lamp_msgs(4.0)
+    report(out == "ok" and st_got.get(lamp) == 0, "st: Always on turned off again at noon: 0 (K20)", f"{out}; st {st_got.get(lamp)}")
+    # A locomotive in the track's blocks, the switch off, the solar panel swapped for a radar, midnight.
     out = mod_lua(f"""
 local t = storage.f3d_states local s = t.acc.surface
+s.daytime = 0.5
 t.switch.power_switch_state = false
 t.sol.destroy({{ raise_destroy = true }})
 t.acc.energy = 5000000
@@ -4427,13 +4785,139 @@ rcon.print(loco and 'ok' or 'no loco')""".replace("\n", " "))
            "st: with a locomotive standing in its block a signal turns red (3)", f"{out}; signal {got.get(sig)}, chain {got.get(chain)}")
     report(got.get(acc) == 2, "st: the accumulator feeding a radar with the supply gone is 2 (discharging)", str(got.get(acc)))
     report(got.get(switch) == 0, "st: the power switch turned off is 0", str(got.get(switch)))
+    report(got.get(lamp) == 1, "st: the lamp at midnight, fed by the accumulator, is 1 (working): the client lights it (J19)",
+           str(got.get(lamp)))
+    # K10: the lit lamp's colour (`st` `lc`, movers.lua). First what 2.1 reads for a lamp as built (printed:
+    # LuaEntity.color, whether it has a control behaviour), then the colour set in its window, then its
+    # circuit's (a constant combinator's signal-red on a red wire, Use colors on, the colour mapping).
+    def lamp_colours(seconds):
+        got = {}
+        for m in of_type(c.pump(seconds, every=hello), "st"):
+            l = m.get("lc") or []
+            for i in range(0, len(l), 2):
+                got[l[i]] = l[i + 1]
+        return got
+    col = "local function col(v) return v and string.format('%.3f,%.3f,%.3f', v.r or v[1] or -1, v.g or v[2] or -1, v.b or v[3] or -1) or 'nil' end "
+    out = mod_lua(col + "local l = storage.f3d_states.lamp local ok, cb = pcall(function() return l.get_control_behavior() end) "
+                  "rcon.print('LuaEntity.color ' .. col(l.color) .. ', control behaviour ' .. tostring(ok and cb ~= nil))")
+    print(f"  K10: a lamp as built reads {out}")
+    out = mod_lua("storage.f3d_states.lamp.color = { r = 0, g = 1, b = 0, a = 1 } rcon.print('ok')")
+    got = lamp_colours(3.0)
+    report(out == "ok" and got.get(lamp) == 0x00FF00, "st lc: a lit lamp's window colour (LuaEntity.color) goes to the client (K10)",
+           f"{out}; lc {got.get(lamp)}")
+    out = mod_lua("""local t = storage.f3d_states local l = t.lamp local s = l.surface
+local cc = s.create_entity({ name = 'constant-combinator', position = { l.position.x + 2.5, l.position.y }, force = l.force, raise_built = true })
+t.cc = cc
+local b = cc.get_or_create_control_behavior()
+local sec = (b.sections_count > 0 and b.get_section(1)) or b.add_section()
+sec.set_slot(1, { value = { type = 'virtual', name = 'signal-red', quality = 'normal' }, min = 1 })
+l.get_wire_connector(defines.wire_connector_id.circuit_red, true).connect_to(cc.get_wire_connector(defines.wire_connector_id.circuit_red, true))
+local cb = l.get_or_create_control_behavior()
+cb.use_colors = true
+cb.color_mode = defines.control_behavior.lamp.color_mode.color_mapping
+rcon.print('ok')""".replace("\n", " "))
+    # The colour is sent once, when it changes: it can come in this first second already.
+    early = lamp_colours(1.0)
+    shown = mod_lua(col + "local cb = storage.f3d_states.lamp.get_control_behavior() rcon.print(col(cb and cb.color))")
+    print(f"  K10: with Use colors and signal-red on its wire, LuaLampControlBehavior.color reads {shown}")
+    got = {**early, **lamp_colours(3.0)}
+    report(out == "ok" and got.get(lamp) == 0xFF0000,
+           "st lc: with Use colors, its circuit network's colour (signal-red) instead of its window's (K10)",
+           f"{out}; cb.color {shown}; lc {got.get(lamp)}")
     mod_lua("""local t = storage.f3d_states local s = t.acc.surface
 for _, e in pairs(s.find_entities_filtered({ area = { { t.acc.position.x - 40, t.acc.position.y - 20 }, { t.acc.position.x + 20, t.acc.position.y + 30 } },
-  type = { 'straight-rail', 'rail-signal', 'rail-chain-signal', 'locomotive', 'accumulator', 'radar', 'electric-pole', 'power-switch' } })) do
+  type = { 'straight-rail', 'rail-signal', 'rail-chain-signal', 'locomotive', 'accumulator', 'radar', 'electric-pole', 'power-switch', 'lamp',
+    'constant-combinator' } })) do
   e.destroy({ raise_destroy = true })
 end
 s.daytime = storage.f3d_states_day[1] s.freeze_daytime = storage.f3d_states_day[2]
 storage.f3d_states = nil rcon.print('ok')""".replace("\n", " "))
+
+
+def check_repair(c, hello):
+    """K13: repair packs (repair.lua). First whether Factorio's own LuaControl.repair_state does anything for the
+    bridge's player-less character (printed: the bridge doesn't use it), then the bridge's `repair`: a wall and a
+    chest damaged by script, a repair pack in the inventory, the client's command repeated as the button is held;
+    health per tick, durability used, `me` `rp`, the bar in `hp`, and nothing for another force's building."""
+    if not clean_spot(c, hello):
+        report(False, "repair: an empty spot", SPOT_WHY)
+        return
+    x, y = c.me["x"] / 256, c.me["y"] / 256
+    fx = lambda v: math.floor(v * 256 + 0.5)  # world.fixed
+    pid = {v[0]: k for k, v in c.protos.items()}
+    out = mod_lua(f"""local c = storage.f3d.puppet local s = c.surface
+local w = s.create_entity({{ name = 'stone-wall', position = {{ {x} + 2.5, {y} + 0.5 }}, force = c.force, raise_built = true }})
+local en = s.create_entity({{ name = 'wooden-chest', position = {{ {x} - 2.5, {y} + 2.5 }}, force = 'enemy', raise_built = true }})
+c.get_main_inventory().insert({{ name = 'repair-pack', count = 3 }})
+w.health = 100 en.health = 20
+storage.f3d_repair = {{ w = w, en = en }}
+rcon.print(w.unit_number .. ' ' .. en.unit_number .. ' ' .. w.max_health .. ' ' .. w.position.x .. ' ' .. w.position.y
+  .. ' ' .. en.position.x .. ' ' .. en.position.y)""".replace("\n", " "))
+    try:
+        wall, enemy, wall_max, wx, wy, ex, ey = (float(v) for v in out.split())
+        wall, enemy = int(wall), int(enemy)
+    except ValueError:
+        report(False, "repair: a damaged wall and an enemy chest, repair packs in the inventory", out)
+        return
+    # Factorio's own repair_state on the player-less character, the wall selected: does its health move?
+    out = mod_lua("""local c = storage.f3d.puppet local t = storage.f3d_repair
+local okc, cur = pcall(function() return c.cursor_stack end)
+local oks = pcall(function() c.selected = t.w end)
+local ok, err = pcall(function() c.repair_state = { repairing = true, position = t.w.position } end)
+t.before = t.w.health
+rcon.print('cursor_stack ' .. tostring(okc and cur ~= nil) .. ', selected ' .. tostring(oks) .. ', repair_state written ' .. tostring(ok) .. ' ' .. tostring(err or ''))""".replace("\n", " "))
+    c.pump(1.0, every=hello)
+    after = mod_lua("""local c = storage.f3d.puppet local t = storage.f3d_repair
+local ok, st = pcall(function() return c.repair_state end)
+rcon.print(string.format('health %.1f -> %.1f, repair_state reads %s', t.before, t.w.health, ok and tostring(st and st.repairing) or 'error'))
+pcall(function() c.repair_state = { repairing = false, position = c.position } end)
+t.w.health = 100""".replace("\n", " "))
+    print(f"  K13: Factorio's repair_state for a player-less character: {out}; after a second {after}")
+    report(True, "repair: repair_state's answer printed (the bridge repairs itself)", f"{out}; {after}")
+
+    def health(name):
+        try:
+            return float(mod_lua(f"rcon.print(storage.f3d_repair.{name}.health)"))
+        except ValueError:
+            return -1.0
+
+    def pack():
+        return mod_lua("local s = storage.f3d.puppet.get_main_inventory().find_item_stack('repair-pack') "
+                       "rcon.print(s and (s.count .. ' ' .. s.durability) or 'none')")
+    w0 = health("w")
+    pack0 = pack()
+    t0 = int(mod_lua("rcon.print(game.tick)") or 0)
+    cmd = {"t": "repair", "u": wall, "p": pid.get("stone-wall", 0), "x": fx(wx), "y": fx(wy), "item": "repair-pack"}
+    msgs = []
+    end = time.time() + 1.0
+    while time.time() < end:
+        c.send(cmd)
+        msgs += c.pump(0.15, every=hello)
+    c.send({"t": "repair"})
+    msgs += c.pump(0.3, every=hello)
+    w1 = health("w")
+    ticks = int(mod_lua("rcon.print(game.tick)") or 0) - t0
+    pack1 = pack()
+    rp = [m for m in of_type(msgs, "me") if m.get("rp") == 1]
+    # table_to_json writes an empty list as {}: an `hp` with no bars has no list to read.
+    hp_lists = [m["l"] if isinstance(m["l"], list) else [] for m in of_type(msgs, "hp")]
+    bars = [dict(zip(l[::2], l[1::2])).get(wall) for l in hp_lists]
+    print(f"  K13: the wall {w0:.0f} -> {w1:.0f} of {wall_max:.0f} in about {ticks} ticks; the pack {pack0} -> {pack1}")
+    report(w1 > w0 + 100 and w1 <= wall_max, "repair: the wall mends while the client repeats `repair` (4 health a tick: speed 2, modifier 2)",
+           f"{w0} -> {w1} in {ticks} ticks")
+    report(pack1 != pack0, "repair: the pack's durability is used", f"{pack0} -> {pack1}")
+    report(rp and rp[-1].get("rx") == fx(wx) and rp[-1].get("ry") == fx(wy), "repair: me says the character repairs (rp, rx, ry)",
+           str(rp[-1:]))
+    report(any(b is not None for b in bars), "repair: the wall's bar is in hp while it mends", str(bars[-3:]))
+    w2 = health("w")
+    c.pump(1.0, every=hello)
+    report(health("w") == w2, "repair: `repair` without a target stops it", f"{w2} -> {health('w')}")
+    e0 = health("en")
+    c.send({"t": "repair", "u": enemy, "p": pid.get("wooden-chest", 0), "x": fx(ex), "y": fx(ey), "item": "repair-pack"})
+    c.pump(1.0, every=hello)
+    report(health("en") == e0, "repair: another force's chest isn't mended", f"{e0} -> {health('en')}")
+    mod_lua("local t = storage.f3d_repair for _, e in pairs({ t.w, t.en }) do if e.valid then e.destroy({ raise_destroy = true }) end end "
+            "storage.f3d.puppet.get_main_inventory().remove({ name = 'repair-pack', count = 3 }) storage.f3d_repair = nil rcon.print('ok')")
 
 
 def check_map_info(c, hello):
@@ -4608,11 +5092,27 @@ def check_console(c, hello, cheat=False):
     got = rcon.run("/sc rcon.print(game.speed)").strip()
     report(got == "2", "cmd /f3d-debug speed sets game.speed", got)
     ask("/f3d-debug speed 1", 912)
-    ask("/f3d-debug pause on", 913)
-    r = ask("/f3d-debug", 914)
-    report(r.get("dbg", {}).get("pa") == 1, "cmd /f3d-debug pause: the bridge still answers while the game is tick-paused", str(r))
+    # A tick-paused game runs no mod code: the bridge reads no packet and sends nothing until it
+    # resumes, which only RCON can do (net/game_pause.gd, seen on real 2.1.24). So the pause's
+    # answer comes once RCON resumes the game, saying it paused (pa 1: game_pause.gd's refused()
+    # reads pa 0 as "didn't pause"); meanwhile RCON sees the tick stand still.
+    c.send({"t": "cmd", "id": 913, "text": "/f3d-debug pause on"})
+    paused = c.pump(3.0, every=hello, until=lambda m: m.get("t") == "cmdr" and m.get("id") == 913)
+    ticks = [rcon.run("/sc rcon.print(tostring(game.tick_paused) .. ' ' .. game.tick)").strip()]
+    time.sleep(0.5)
+    ticks.append(rcon.run("/sc rcon.print(tostring(game.tick_paused) .. ' ' .. game.tick)").strip())
+    early = [m for m in of_type(paused, "cmdr") if m.get("id") == 913]
+    rcon.run("/sc game.tick_paused = false")
+    msgs = c.pump(0.5 if early else 5.0, every=hello, until=lambda m: m.get("t") == "cmdr" and m.get("id") == 913)
+    late = [m for m in of_type(msgs, "cmdr") if m.get("id") == 913]
+    answers = early + late
+    report(ticks[0].startswith("true ") and ticks[0] == ticks[1] and answers and answers[-1].get("dbg", {}).get("pa") == 1,
+           "cmd /f3d-debug pause: the game tick-pauses (the tick stands still over RCON), and the bridge's answer says so "
+           "(pa 1), by the time RCON has resumed it",
+           f"RCON {ticks}; answered {len(early)} times while paused, {len(late)} after: {str(answers[-1:])[:200]}")
     ask("/f3d-debug pause off", 915)
-    rcon.run("/sc game.tick_paused = false")  # whether the bridge heard or not
+    r = ask("/f3d-debug", 914)
+    report(r.get("dbg", {}).get("pa") == 0, "cmd /f3d-debug pause: after RCON's resume the bridge answers again, not paused", str(r)[:200])
     ask("/f3d-debug freeze %s" % ("on" if before.get("fz") == 1 else "off"), 916)
     ask("/f3d-debug daytime %s" % before.get("dt", 0.2), 917)
     if not cheat:
@@ -4707,10 +5207,11 @@ def check_barrier(c, hello):
 
     # An event handler: on_research_finished's (research.lua) calls crafting.invalidate, replaced
     # for the length of one command by one that fails. Without the barrier the error would come out
-    # of `researched = true`.
+    # of `researched = true`. An infinite technology (its level under its max_level) never reads
+    # researched, so the change wouldn't stand: one that can is picked.
     out = mod_lua("""
 local t for _, tech in pairs(game.forces.player.technologies) do
-  if not tech.researched and tech.enabled then t = tech break end end
+  if not tech.researched and tech.enabled and tech.level == tech.prototype.max_level then t = tech break end end
 if not t then rcon.print('none') return end
 local m = package.loaded['__factorio-3d-bridge__/scripts/crafting.lua']
 local orig = m.invalidate
@@ -4846,7 +5347,7 @@ def parse_args():
     parser.add_argument("--server-log", help="the server's factorio-current.log, for the barrier check (default: server/data's, "
                                              "when it is this server's)")
     parser.add_argument("--only", choices=["platforms", "planets", "space", "ride", "collectors", "ui", "input", "cliffs", "save", "gear", "planners", "circuits", "build", "info",
-                                           "alerts", "multi", "remnants", "machines", "logic", "vehicles", "hud", "turrets", "weapons", "enemies", "console", "remote", "walk", "states", "mapinfo", "triggers", "minevehicles", "alt", "asplayer", "modgfx", "beltswitch", "barrier"], help="run just these checks after the handshake")
+                                           "alerts", "multi", "remnants", "machines", "logic", "vehicles", "hud", "turrets", "weapons", "enemies", "console", "remote", "walk", "pickup", "states", "repair", "mapinfo", "triggers", "minevehicles", "alt", "asplayer", "modgfx", "beltswitch", "barrier", "research"], help="run just these checks after the handshake")
     args = parser.parse_args()
     FACTORIO_PORT, CLIENT_PORT, rcon.PORT = args.factorio_port, args.client_port, args.rcon_port
     rcon.PASSWORD = args.rcon_password
@@ -4893,15 +5394,15 @@ def main():
         print(f"\n{results.count(True)} passed, {results.count(False)} failed")
         sys.exit(0 if all(results) else 1)
 
-    if args.only in ("cliffs", "save", "gear", "build", "alerts", "multi", "remnants", "turrets", "weapons", "enemies", "remote", "walk", "states", "mapinfo", "triggers", "minevehicles", "alt", "beltswitch", "asplayer", "barrier"):
+    if args.only in ("cliffs", "save", "gear", "build", "alerts", "multi", "remnants", "turrets", "weapons", "enemies", "remote", "walk", "pickup", "states", "repair", "mapinfo", "triggers", "minevehicles", "alt", "beltswitch", "asplayer", "barrier", "research"):
         if handshake(c):
             hello = (1.0, {"t": "hello", "v": 1, "sid": c.sid, "w": 1})
             c.pump(1.0, every=hello)
             {"cliffs": check_cliffs, "save": check_save, "gear": check_gear, "build": check_build_tools,
              "alerts": check_alerts, "multi": check_multi, "remnants": check_remnants, "turrets": check_turrets, "weapons": check_weapons,
-             "enemies": check_enemies, "remote": check_remote_view, "walk": check_walk, "states": check_states,
-             "mapinfo": check_map_info, "triggers": check_triggers, "minevehicles": check_mine_vehicles, "alt": check_alt, "beltswitch": check_belt_switch, "asplayer": check_as_player,
-             "barrier": check_barrier}[args.only](c, hello)
+             "enemies": check_enemies, "remote": check_remote_view, "walk": check_walk, "pickup": check_pickup, "states": check_states,
+             "repair": check_repair, "mapinfo": check_map_info, "triggers": check_triggers, "minevehicles": check_mine_vehicles, "alt": check_alt, "beltswitch": check_belt_switch, "asplayer": check_as_player,
+             "barrier": check_barrier, "research": check_research}[args.only](c, hello)
             report(not c.invalid, "every message passes tools/protocol.py", str(c.invalid[:3]))
         report_step_errors()
         print(f"\n{results.count(True)} passed, {results.count(False)} failed")
@@ -4965,11 +5466,10 @@ def main():
     c.pump(1.0, every=hello)
     report(c.me["x"] == stop_x and c.me["w"] == 0, "walk -1 stops it", f"drift {(c.me['x'] - stop_x) / 256:.2f} tiles")
     check_walk(c, hello)
+    check_pickup(c, hello)
 
     # --- building and rotating -----------------------------------------------------------------
-    # check_walk leaves the character some 35 tiles east and north of its clean spot, often past
-    # the 3x3 chunks it watches (the bridge sends no add there) and among trees: start again
-    # from a clean, watched spot.
+    # Start from a clean, watched spot (check_walk ends on its own, so this is usually that one).
     if not clean_spot(c, hello):
         report(False, "build: no clean spot found", SPOT_WHY)
     # The starter kit is freeplay's, which has no chests or inserters.
@@ -5051,13 +5551,23 @@ rcon.print(n .. " items placed")
            f"{[(m['fx'] / 256, m['fy'] / 256, m['fr']) for m in squared[:2]]}")
     lanes = sorted({v[2] - (row * 256 + 128) for v in on_row})
     report(lanes and min(lanes) < 0 < max(lanes), "the two lanes sit either side of the belt centre", f"y offsets {lanes} / 256")
-    # What each lane carries, for drawing belts far away (bfar).
+    # #2 / B2: what each lane carries, for drawing belts far away (bfar). With no near square (n 0):
+    # a chunk wholly inside the square the last `bi` covered isn't read for far lanes (G16; the
+    # client draws its items), and whether the test belts' chunk was depended on where in its chunk
+    # the spot fell (the 0.2.0 CI run's spot passed, the next spot over didn't). The rounds come
+    # once the bridge reaches them: waited for, up to 6 s, not a fixed 2 s.
     cx0, cy0 = int((x0 + 4) // 32), int(row // 32)
     c.send({"t": "sub", "c": [[cx0 + dx, cy0 + dy] for dy in (-1, 0, 1) for dx in (-1, 0, 1)]})
-    c.send({"t": "bfar", "r": 100})
-    far_msgs = [m for m in c.pump(2.0, every=hello) if m.get("t") == "bfar"]
-    rows = [m["l"][i:i + 5] for m in far_msgs for i in range(0, len(m["l"]), 5)]
-    ours = [r for r in rows if r[1] == row * 256 + 128 and x0 * 256 <= r[0] <= (x0 + 8) * 256]
+    c.send({"t": "bfar", "r": 100, "n": 0})
+
+    def our_rows(msgs):
+        rows = [m["l"][i:i + 5] for m in msgs for i in range(0, len(m["l"]), 5)]
+        return rows, [r for r in rows if r[1] == row * 256 + 128 and x0 * 256 <= r[0] <= (x0 + 8) * 256]
+    far_msgs = []
+    far_end = time.time() + 6.0
+    while time.time() < far_end and len(our_rows(far_msgs)[1]) < 8:
+        far_msgs += [m for m in c.pump(0.5, every=hello) if m.get("t") == "bfar"]
+    rows, ours = our_rows(far_msgs)
     plate = next((i for i, n in c.items.items() if n == "iron-plate"), None)
     report(len(ours) >= 4 and all(r[2] == 4 for r in ours) and any(plate in r[3:5] for r in ours),
            "bfar: each belt's direction and what its lanes carry (LuaTransportLine.get_contents)", f"{len(rows)} belts, ours {ours[:3]}")
@@ -5470,10 +5980,10 @@ table.sort(done) rcon.print(table.concat(done, " "))
         # tree's resend. Undone afterwards (on_research_reversed).
         mod_lua(f'storage.f3d.puppet.force.technologies["{first}"].researched = true')
         msgs = c.pump(1.0, every=hello)
-        done = [m for m in of_type(msgs, "msg") if m.get("tech") == first]
+        done = [e for m in of_type(msgs, "rdone") for e in m["l"]]
         techs_now = {r[0]: r[6] for m in of_type(msgs, "techs") for r in m["l"]}
-        report(bool(done) and techs_now.get(first) == 2, "research finished: a msg naming the tech, and the tree resent",
-               f"{done[:1]}; state {techs_now.get(first)}")
+        report(done == [[first, 0]] and techs_now.get(first) == 2, "research finished: one rdone naming the tech, and the tree resent",
+               f"{done[:3]}; state {techs_now.get(first)}")
         mod_lua(f'storage.f3d.puppet.force.technologies["{first}"].researched = false')
     if unlocked:
         mod_lua(f"for _, n in pairs({{ {', '.join(repr(n) for n in unlocked)} }}) do game.forces.player.technologies[n].researched = false end")
@@ -5759,14 +6269,37 @@ rcon.print(u(a) .. " " .. u(b) .. " " .. u(lamp) .. " " .. u(heat) .. " " .. u(p
                f"state {state}, connected {parts[6]}")
         ht = [v for m in of_type(msgs, "ht") for v in m["l"]]
         report(dict(zip(ht[::2], ht[1::2])).get(heat_u) == 600, "ht: a heat pipe's temperature", str(ht[:8]))
+        # A script's wire raises no event: the bridge looks at the focus square in 8 strips, one every
+        # 30 ticks (tracker.lua wire_strips), so it sees each wire within 4 s, measured from the wires
+        # it last sent. The poles wired themselves as they were built, then the script cut them: first
+        # the client's view of both (their last add or upd) is waited for to show the cut, then the
+        # wire goes back and both must be updated. Each wait up to 6 s; a fixed 0.8 s passed only when
+        # the poles' strip happened to come next, and wiring them back before the bridge had looked
+        # left nothing to send.
+        view = {}
+
+        def note(ms):
+            for m in ms:
+                if m.get("t") in ("add", "upd") and m["e"][0] in (pole_a, pole_b):
+                    view[m["e"][0]] = (m["e"][5:] or [{}])[0].get("w", [])
+
+        def wait_for(cond):
+            until = time.time() + 6.0
+            while time.time() < until and not cond():
+                note(c.pump(0.5, every=hello))
+            return cond()
+        note(msgs)
+        cut = wait_for(lambda: pole_a in view and pole_b in view and pole_b not in view[pole_a] and pole_a not in view[pole_b])
+        cut_view = dict(view)
+        view.clear()
         # By the entities kept in storage: get_entity_by_unit_number doesn't find poles.
         mod_lua(f"local by = {{}} for _, e in pairs(storage.f3d_live_net) do if e.valid then by[e.unit_number] = e end end "
                 f"local a, b = by[{pole_a}], by[{pole_b}] "
                 "rcon.print(tostring(a.get_wire_connector(defines.wire_connector_id.pole_copper, true).connect_to("
                 "b.get_wire_connector(defines.wire_connector_id.pole_copper, true))))")
-        upds = {m["e"][0]: m["e"] for m in of_type(c.pump(0.8, every=hello), "upd")}
-        report(pole_b in (upds.get(pole_a, [])[5:] or [{}])[0].get("w", []) and pole_a in upds,
-               "a wire added between two existing poles updates both within a second", str({k: upds[k] for k in (pole_a, pole_b) if k in upds}))
+        wired = wait_for(lambda: pole_b in view.get(pole_a, []) and pole_a in view.get(pole_b, []))
+        report(cut and wired, "a wire cut and added again by script between two existing poles updates both within the "
+               "bridge's look for wires (4 s)", f"cut {cut_view}, then {view}")
     else:
         report(False, "place pipes, a lamp, a heat pipe and poles for the network data checks", out)
     mod_lua("for _, e in pairs(storage.f3d_live_net or {}) do if e.valid then e.destroy() end end storage.f3d_live_net = nil")
@@ -6093,6 +6626,9 @@ rcon.print({"", "25 chunks, ", tostring(n), " entities: ", profiler})
 
     # --- signals, accumulators and power switches report their states ---------------------------
     check_states(c, hello)
+
+    # --- repair packs (K13) ---------------------------------------------------------------------
+    check_repair(c, hello)
 
     # --- space platforms (Space Age) -----------------------------------------------------------
     check_platforms(c, hello)

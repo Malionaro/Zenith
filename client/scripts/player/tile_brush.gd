@@ -7,7 +7,7 @@ extends Node3D
 ## (`tile`, `tile_mine`); the world redraws them from `tiles`.
 
 const WorldMirror := preload("res://scripts/world/world.gd")
-const Visuals := preload("res://scripts/world/visuals.gd")
+const GroundHeight := preload("res://scripts/world/ground_height.gd")
 
 const MAX_SIZE := 32
 const REPEAT := 0.1
@@ -35,9 +35,8 @@ func _ready() -> void:
 	_mm.use_colors = true
 	_mm.mesh = quad
 	_mmi.multimesh = _mm
-	var m := Visuals.ghost_material(Color.WHITE)
-	m.vertex_color_use_as_albedo = true
-	_mmi.material_override = m
+	# Each tile's colour, riding on an add-on's hills (ground_height.gd) as the ground does.
+	_mmi.material_override = GroundHeight.mark_material(Color.WHITE)
 	_mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(_mmi)
 	visible = false

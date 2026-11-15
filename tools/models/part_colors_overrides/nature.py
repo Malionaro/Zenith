@@ -66,7 +66,7 @@ OVERRIDES.update({
     **{_n: dict(SOFT, exposure=0.85, saturation=0.9) for _n in ("big-rock", "huge-rock")},
     "big-sand-rock": dict(SOFT, exposure=0.72, saturation=0.7),
     # Nauvis. The weeping tree's leaves hang where its sprite has bark: olive green, as the sprite.
-    # Leafy crowns (trees.leafy_crown): their cards' light and shade come from the model, and the
+    # Leafy crowns (trees.clump_crown): their cards' light and shade come from the model, and the
     # sun lights them brighter than the sprite's dark, muted leaves: darker and duller.
     **{"tree-0%d%s" % (_i, _v): dict(SOFT, exposure=0.62, saturation=0.85) for _i in (1, 2, 3, 4, 7, 8, 9)
        for _v in ("", "-*")},

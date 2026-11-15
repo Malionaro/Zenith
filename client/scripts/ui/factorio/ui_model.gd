@@ -3,7 +3,7 @@ extends RefCounted
 ## actions into commands). The windows only read from here and redraw on the signals.
 ##
 ## A mod with the UI data (docs/PROTOCOL.md, "Factorio's windows") sends `slots`, `qb`, `rdet`,
-## `craftable`, `cq`, `techs` and `rs`; older mods only `inv` (item totals, no slots) and
+## `craftable`, `cq`, `techs`, `rs` and `rdone`; older mods only `inv` (item totals, no slots) and
 ## `recipes` (names only), and then the inventory is shown as those stacks in order followed by
 ## empty slots, recipes have no groups, ingredients or times, and the quickbar is kept by the
 ## client (user://quickbar.cfg).
@@ -13,6 +13,9 @@ signal recipes_changed
 signal quickbar_changed
 signal queue_changed
 signal research_changed
+## Research finished (`rdone`, one message a tick): `done` is [{"name", "level"}] in order (level 0 for a
+## technology of one level), `more` how many more finished than it names, `tick` the tick they did.
+signal research_done(done: Array, more: int, tick: int)
 signal guns_changed
 ## A chunk's map chart arrived (chunk coordinates).
 signal map_changed(chunk: Vector2i)
@@ -74,6 +77,8 @@ signal lnets_changed
 signal lnet_received(id: int)
 ## A map ping (a gps link clicked or posted in the chat): the map and minimap draw it a while.
 signal pinged
+
+const MessageDecode := preload("res://scripts/net/message_decode.gd")
 
 const QUICKBAR_SLOTS := 10
 ## The character's main inventory in 2.x, used until the mod sends the real size.
@@ -143,6 +148,11 @@ var map_charts := {}
 ## What the map view's switches draw over each chunk (the chart's `ov`): Vector2i -> [[kind, x, y,
 ## ...], ...] with positions in tiles (docs/PROTOCOL.md "Map"); a chunk without any isn't kept.
 var map_overlays := {}
+## The stamps of the pictures the map holds (a chart's `st`), by surface: si -> {Vector2i -> stamp}. A request
+## names them (`map` h), and the bridge answers an unchanged chunk with `same` instead of its picture.
+var map_stamps := {}
+## The last chart was `same` (the picture held is still the chunk's: map_cache.gd keeps it).
+var map_chart_same := false
 ## The trains on the map's surface (`mtr`), six numbers per carriage: x, y (1/256 tile),
 ## orientation (1/1000 turn), length, width (1/256 tile), colour 0xRRGGBB.
 var map_trains := PackedInt32Array()
@@ -209,7 +219,9 @@ var _territory_parts: Array = []
 ## "eff" ({sp, pr, co, po, q} in thousandths), "m" ([[module, count, quality], ...]), "b" (beacons
 ## reaching it), "n" (machines a beacon reaches), "de" (a beacon's distribution effectivity), "el"
 ## (its electricity, H20: {"e" joules in its buffer, "b" the buffer's size, "mx" / "mn" its max. and
-## min. consumption in watts}), "rn" (a roboport's linked roboports, H14: [Vector2 tiles, ...])}.
+## min. consumption in watts}), "rn" (a roboport's linked roboports, H14: [Vector2 tiles, ...]),
+## "inv" (what is inside, I2: [[role, [[item, count, quality], ...]], ...]), "pr", "ps", "bn" (a
+## craft's progress, its rate a second and the fuel left, I26, thousandths), "at" (msec read)}.
 var hover_info := {}
 var _hinfo_q := 0
 var _hinfo_unit := 0
@@ -235,6 +247,10 @@ var _answered_early := {}
 ## The character's logistic requests (`clog`): [{"item", "min", "max" (-1 none), "quality"}],
 ## whether they are on, and whether unrequested items go to the trash.
 var char_requests: Array = []
+## The force has researched the character's logistics: the bridge sends `clog` only once the
+## character has a requester point (character_logistic_requests), so the first one says so (J8: the
+## character window's Logistics tab shows from then on).
+var char_logistics := false
 var char_requests_on := true
 var char_trash_unrequested := false
 ## Its logistic sections one by one (`clog.sec`, the hub's form: {"i", "g", "on", "m", "man", "f"}),
@@ -434,12 +450,23 @@ func handle(msg: Dictionary) -> bool:
 				return true
 			var chunk := Vector2i(int(msg.get("cx", 0)), int(msg.get("cy", 0)))
 			var n := int(msg.get("n", 0))
-			var pal := _array(msg.get("pal"))
-			var px := _array(msg.get("px"))
-			var image: Image = null
-			if n > 0 and px.size() == n * n:
-				image = chart_image(n, pal, px)
-			map_charts[chunk] = image
+			# `same`: the picture held (its stamp named in the request) is still the chunk's; pollution and
+			# the overlay come as they are now.
+			map_chart_same = msg.has("same")
+			if not map_chart_same:
+				var pal := _array(msg.get("pal"))
+				var px := _array(msg.get("px"))
+				# Made on the bridge's parsing thread when the message was read (message_decode.gd).
+				var image: Image = msg.get("_img") if msg.get("_img") is Image else null
+				if image == null and n > 0 and px.size() == n * n:
+					image = chart_image(n, pal, px)
+				map_charts[chunk] = image
+				var stamps: Dictionary = map_stamps.get(int(msg.get("si", shown_surface())), {})
+				if image != null and msg.has("st"):
+					stamps[chunk] = int(msg["st"])
+					map_stamps[int(msg.get("si", shown_surface()))] = stamps
+				else:
+					stamps.erase(chunk)
 			if msg.has("pol"):
 				map_pollution[chunk] = int(msg["pol"])
 			else:
@@ -456,10 +483,11 @@ func handle(msg: Dictionary) -> bool:
 					ov.append(entry)
 			if ov.is_empty():
 				map_overlays.erase(chunk)
-			elif n > 0:
+			elif n > 0 or map_chart_same:
 				map_overlays[chunk] = ov
 			map_changed.emit(chunk)
 		"clog":
+			char_logistics = true
 			char_requests = _requests(msg.get("l"))
 			char_requests_on = int(msg.get("on", 1)) == 1
 			char_trash_unrequested = int(msg.get("trash", 0)) == 1
@@ -669,6 +697,33 @@ func handle(msg: Dictionary) -> bool:
 					for k in ["e", "b", "mx", "mn"]:
 						el[k] = float(msg["el"].get(k, 0.0))
 					info["el"] = el
+				# I2: what is inside, [[role, [[item, count, quality], ...]], ...]
+				var inv: Array = []
+				for rec in _array(msg.get("inv")):
+					if rec is Array and rec.size() >= 2:
+						var items: Array = []
+						for it in _array(rec[1]):
+							if it is Array and it.size() >= 2:
+								items.append([str(it[0]), int(it[1]), str(it[2]) if it.size() >= 3 else "normal"])
+						if not items.is_empty():
+							inv.append([str(rec[0]), items])
+				if not inv.is_empty():
+					info["inv"] = inv
+				# I26: progress and fuel for the panel's bars, and when they were read
+				for k in ["pr", "ps", "bn"]:
+					if msg.has(k):
+						info[k] = int(msg[k])
+				# J15: a crafter's ingredients and products a second, {i, o}: [[type, name, thousandths], ...]
+				if msg.get("io") is Dictionary:
+					var io := {}
+					for k in ["i", "o"]:
+						var rows: Array = []
+						for r in _array(msg["io"].get(k)):
+							if r is Array and r.size() >= 3:
+								rows.append([str(r[0]), str(r[1]), int(r[2])])
+						io[k] = rows
+					info["io"] = io
+				info["at"] = Time.get_ticks_msec()
 				hover_info = info
 				hover_info_changed.emit()
 		"cmdr":
@@ -738,6 +793,9 @@ func handle(msg: Dictionary) -> bool:
 						u["r"] = [str(r[2]), int(r[3]) if r.size() > 3 else 0]
 					"b", "p", "m":
 						u[kind] = str(r[2])
+					"h":
+						# K13: a repair tool: [health a unit of durability mends, durability at normal quality].
+						u["h"] = [float(r[2]), float(r[3]) if r.size() > 3 else 0.0]
 				item_uses[item] = u
 		"eprops":
 			for r in _array(msg.get("l")):
@@ -854,9 +912,39 @@ func handle(msg: Dictionary) -> bool:
 			research_progress = int(msg.get("pr", 0)) / 1000.0
 			research_queue = _array(msg.get("q"))
 			research_changed.emit()
+		"rdone":
+			var done: Array = []
+			for e in _array(msg.get("l")):
+				if e is Array and not (e as Array).is_empty() and str(e[0]) != "":
+					var level := 0
+					if e.size() > 1 and (e[1] is float or e[1] is int):
+						level = maxi(0, int(e[1]))
+					done.append({"name": str(e[0]), "level": level})
+			if done.is_empty():
+				return true
+			# The research it was is over: the next `rs` (the tick after) says what follows, so the
+			# research panel shows it finished meanwhile instead of nearly done.
+			for d: Dictionary in done:
+				if research == d["name"]:
+					research = ""
+					research_progress = 0.0
+			var more = msg.get("n", 0)
+			var tick = msg.get("tick", msg.get("k", 0))
+			research_done.emit(done, maxi(0, int(more)) if (more is float or more is int) else 0,
+				int(tick) if (tick is float or tick is int) else 0)
+			research_changed.emit()
 		_:
 			return false
 	return true
+
+
+## A line of the game's own in the console (no player's name): rich text, as chat_window.gd draws it.
+func console_line(text: String) -> void:
+	var line := ["", text, Time.get_ticks_msec(), Color(0, 0, 0, 0)]
+	chat_log.append(line)
+	while chat_log.size() > 200:
+		chat_log.pop_front()
+	chat_received.emit(line[0], line[1])
 
 
 # --- inventory -------------------------------------------------------------------------------
@@ -892,8 +980,10 @@ static func _slot_dicts(slots: Array) -> Array:
 			var d := {"item": str(entry[0]), "count": int(entry[1])}
 			if entry.size() >= 3:
 				d["quality"] = str(entry[2])
-			if entry.size() >= 4:
+			if entry.size() >= 4 and int(entry[3]) >= 0:
 				d["freshness"] = int(entry[3]) / 1000.0  # spoiling items (Gleba): 1 fresh, 0 about to spoil
+			if entry.size() >= 5:
+				d["durability"] = int(entry[4]) / 1000.0  # K13: a worn tool (a repair pack): what is left of its top one
 			out.append(d)
 		else:
 			out.append({})
@@ -957,6 +1047,11 @@ func count_of(item: String) -> int:
 ## A module (`iuse` "m"): clicked on a building or ghost, it goes in or is asked for (F6).
 func is_module(item: String) -> bool:
 	return item != "" and (item_uses.get(item, {}) as Dictionary).has("m")
+
+
+## K13: whether the item is a repair tool (`iuse` "h"): held, the left button on a damaged building repairs it.
+func is_repair_tool(item: String) -> bool:
+	return item != "" and (item_uses.get(item, {}) as Dictionary).has("h")
 
 
 ## Asks for a module in an entity's module slots (`modreq`): within reach the mod puts it in,
@@ -1077,10 +1172,23 @@ func recipe(name: String) -> Dictionary:
 ## {"time", "items": {name: amount}, "expanded": whether any ingredient was broken down,
 ## "too_complex": a loop of recipes}. Kept until the recipes change: crafting_panel.gd asks for
 ## every slot's tooltip on each inventory change.
-func total_raw(name: String) -> Dictionary:
+func total_raw(name: String, given: Dictionary = {}) -> Dictionary:
 	if _raw_cache.has(name):
 		return _raw_cache[name]
 	var out := {"time": 0.0, "items": {}, "expanded": false, "too_complex": false}
+	_makers()
+	# A recipe the character can't craft (an assembler's, J14) from its details given.
+	var r := recipe(name)
+	if r.is_empty() or (r["ingredients"] as Array).is_empty():
+		r = given
+	if not r.is_empty():
+		_add_raw(r, 1.0, out, [name])
+		_raw_cache[name] = out
+	return out
+
+
+## The hand recipe that makes each item (one product), an item's own recipe first.
+func _makers() -> Dictionary:
 	if _raw_by_product.is_empty():
 		for r in recipes:
 			var products: Array = r["products"]
@@ -1089,16 +1197,65 @@ func total_raw(name: String) -> Dictionary:
 				# An item's own recipe wins over another that makes it.
 				if not _raw_by_product.has(made) or r["name"] == made:
 					_raw_by_product[made] = r
-	var r := recipe(name)
-	if not r.is_empty():
-		_add_raw(r, 1.0, out, [name])
-	_raw_cache[name] = out
+	return _raw_by_product
+
+
+## J16: the ingredients of one craft the character can't get: neither held nor hand-craftable from
+## what it holds (through intermediates, as Factorio's recipe tooltip judges; an intermediate made
+## from plates in the inventory isn't short). Taken in order from one pool, so ingredients made of
+## the same plates share them. {item: how many are left for it}.
+func short_ingredients(r: Dictionary) -> Dictionary:
+	var pool := counts.duplicate()
+	var out := {}
+	for ing in r.get("ingredients", []):
+		if not (ing is Array and ing.size() >= 2):
+			continue
+		var item := str(ing[0])
+		var left := int(pool.get(item, 0))
+		if not _supply(item, float(ing[1]), pool, [str(r.get("name", ""))]):
+			out[item] = left
 	return out
 
 
+## Takes `amount` of an item from `pool`, hand-crafting what is missing from the rest of it; false
+## (the pool untouched) when it can't.
+func _supply(item: String, amount: float, pool: Dictionary, path: Array) -> bool:
+	var have := float(pool.get(item, 0))
+	if have >= amount:
+		pool[item] = have - amount
+		return true
+	var maker: Dictionary = _makers().get(item, {})
+	if maker.is_empty() or path.has(maker["name"]) or path.size() >= RAW_DEPTH:
+		return false
+	var made := float(maker["products"][0][1])
+	var crafts := ceilf((amount - have) / made)
+	var trial := pool.duplicate()
+	trial[item] = 0.0
+	for ing in maker["ingredients"]:
+		if ing is Array and ing.size() >= 2 and not _supply(str(ing[0]), float(ing[1]) * crafts, trial, path + [maker["name"]]):
+			return false
+	trial[item] = crafts * made - (amount - have)  # what the crafts make over the need
+	pool.merge(trial, true)
+	return true
+
+
+## A recipe's details for its tooltip: the hand recipe's, else (an assembler's recipe, J14) from its
+## Factoriopedia page, asked for the first time (the tooltip has them once it arrives); {"name"}
+## alone while neither is known.
+func recipe_info(name: String) -> Dictionary:
+	var r := recipe(name)
+	if not r.is_empty() and not (r["ingredients"] as Array).is_empty():
+		return r
+	var d := pedia_data("recipe", name)
+	if d.is_empty():
+		return r if not r.is_empty() else {"name": name}
+	return {"name": name, "energy": float(d.get("time", -1.0)), "ingredients": _pairs(_array(d.get("ing"))),
+		"products": _pairs(_array(d.get("prod")))}
+
+
 func _add_raw(r: Dictionary, crafts: float, out: Dictionary, path: Array) -> void:
-	out["time"] = float(out["time"]) + maxf(0.0, float(r["energy"])) * crafts
-	for ing in r["ingredients"]:
+	out["time"] = float(out["time"]) + maxf(0.0, float(r.get("energy", 0.0))) * crafts
+	for ing in r.get("ingredients", []):
 		if not (ing is Array and ing.size() >= 2):
 			continue
 		var item := str(ing[0])
@@ -1455,10 +1612,11 @@ func set_craft_queue(entries: Array) -> void:
 
 # --- Factorio's world controls (ui_actions.lua) -------------------------------------------------
 
-## Alt-mode on or off. Nothing to ask the mod: the icons come with the entity records (`extra.ai`,
-## issue #9) whether it is on or not, so they show at once. (0.1.1's client sent `alt`.)
-func set_alt_mode(_on: bool) -> void:
-	pass
+## Alt-mode on or off. The machines' icons come with the entity records (`extra.ai`, issue #9)
+## whether it is on or not, so they show at once (0.1.1's client sent `alt`); the chests' contents,
+## which no record carries, the bridge reads only while it is on (`altc`, J6).
+func set_alt_mode(on: bool) -> void:
+	Bridge.set_alt_contents(on)
 
 
 ## A line in the game's chat.
@@ -1787,6 +1945,17 @@ func request_map(from_chunk: Vector2i, to_chunk: Vector2i, tiles_per_pixel := 4)
 		"res": tiles_per_pixel}
 	if map_si > 0:
 		cmd["si"] = map_si
+	# h: the stamps of the pictures held in the area (a bridge before them ignores it and sends pictures).
+	var stamps: Dictionary = map_stamps.get(shown_surface(), {})
+	if not stamps.is_empty():
+		var h: Array = []
+		for y in range(from_chunk.y, to_chunk.y + 1):
+			for x in range(from_chunk.x, to_chunk.x + 1):
+				var st = stamps.get(Vector2i(x, y))
+				if st != null:
+					h.append([x, y, st])
+		if not h.is_empty():
+			cmd["h"] = h
 	Bridge.send(cmd)
 
 
@@ -2069,26 +2238,7 @@ func _gather(msg: Dictionary) -> Variant:
 ## has no colour. Filled as bytes: a pixel at a time with set_pixel, the map's pages cost 1-2 ms a
 ## chunk to read while walking on a big base.
 static func chart_image(n: int, pal: Array, px: Array) -> Image:
-	var colours := PackedByteArray()
-	colours.resize(pal.size() * 3)
-	var known := PackedByteArray()
-	known.resize(pal.size())
-	for k in pal.size():
-		var c: Array = _array(pal[k])
-		if c.size() >= 3:
-			colours[k * 3] = int(c[0])
-			colours[k * 3 + 1] = int(c[1])
-			colours[k * 3 + 2] = int(c[2])
-			known[k] = 1
-	var data := PackedByteArray()
-	data.resize(n * n * 3)
-	for i in px.size():
-		var k := int(px[i])
-		if k >= 0 and k < known.size() and known[k] == 1:
-			data[i * 3] = colours[k * 3]
-			data[i * 3 + 1] = colours[k * 3 + 1]
-			data[i * 3 + 2] = colours[k * 3 + 2]
-	return Image.create_from_data(n, n, false, Image.FORMAT_RGB8, data)
+	return MessageDecode.chart_image(n, pal, px)
 
 
 static func _array(v) -> Array:

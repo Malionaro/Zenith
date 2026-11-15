@@ -86,6 +86,18 @@ static func _move_once() -> void:
 		move_from_install(repo_dir())
 
 
+## In a checkout, the saves Zenith's downloads keep in the user folder (their default_saves_dir()),
+## so a world played in a dev build is there to load from source too; "" in a download, when the
+## folder is missing or when it is the saves folder already.
+static func download_saves_dir() -> String:
+	if keep_in_user_data:
+		return ""
+	var dir := user_data_dir.path_join("saves")
+	if not DirAccess.dir_exists_absolute(dir) or dir.simplify_path() == saves_dir().simplify_path():
+		return ""
+	return dir
+
+
 ## What _move_once does, from the folder `install` (an older Zenith's, holding server/).
 static func move_from_install(install: String) -> void:
 	var old_saves := install.path_join("server/saves")

@@ -2,8 +2,9 @@ extends PanelContainer
 ## The research in progress at the top of the side menu (side_menu.gd), as Factorio 2.1 draws it:
 ## a 240x40 panel with the technology's icon, its name, a thin bar and the percentage right of it.
 ## Without research it says "Press T to start a new research." beside the technology icon; when
-## a research finishes it says "<name> finished. Press T." over a full bar until the next one
-## starts. Click opens the technology screen (T).
+## a research finishes (`rdone`) it shows that technology's icon and "<name> finished. Press T."
+## (core.cfg's gui-current-research; an infinite one with the level done) over a full bar until the
+## next one starts. Click opens the technology screen (T).
 
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
@@ -28,6 +29,7 @@ var _key: Label
 var _shown := "-"
 var _last := ""  # the research seen last, to notice it finishing
 var finished := ""  # the technology that just finished, shown until the next research starts
+var finished_level := 0  # the level it finished, for a levelled one (`rdone`), else 0
 ## The research's progress seen over time, for the tooltip's graph: [msec, technology, units done].
 var _samples: Array = []
 const SAMPLE_MS := 2000
@@ -87,6 +89,19 @@ func _ready() -> void:
 	_key.add_theme_color_override("font_color", KEY_COLOR)
 	row.add_child(_hint)
 	model.research_changed.connect(_refresh)
+	model.research_done.connect(_on_done)
+	_refresh()
+
+
+## The last of a tick's finished research is the one shown (the model has cleared the current
+## research when it was this one; the next `rs` says what follows).
+func _on_done(done: Array, _more: int, _tick: int) -> void:
+	if done.is_empty():
+		return
+	var last: Dictionary = done[-1]
+	finished = str(last["name"])
+	finished_level = int(last["level"])
+	_last = ""
 	_refresh()
 
 
@@ -242,12 +257,15 @@ func _gui_input(event: InputEvent) -> void:
 
 func _refresh() -> void:
 	var tech := str(model.research)
+	# (A bridge without `rdone`: the research that went away is finished once the tree says so.)
 	if _last != "" and tech != _last:
 		var t: Dictionary = model.techs.get(_last, {})
 		if int(t.get("state", 0)) == 2:
 			finished = _last
+			finished_level = 0
 	if tech != "":
 		finished = ""
+		finished_level = 0
 	_last = tech
 	var keys := Controls.keys_text("open_technology")
 	_key.text = keys if keys != "" else "T"
@@ -268,13 +286,13 @@ func _refresh() -> void:
 		_row.add_theme_constant_override("separation", Kit.px(8 if shown != "" else 14))
 	_icon.visible = _icon.texture != null
 	if tech != "":
-		_name.text = Kit.tech_name(tech)
+		_name.text = title_of(tech)
 		_name.remove_theme_color_override("font_color")
 		_name.add_theme_color_override("font_color", Kit.WHITE)
 		_bar.value = roundi(float(model.research_progress) * 1000.0)
 		_bar.add_theme_stylebox_override("fill", Kit.bar_style(Kit.BAR_GREEN))
 	elif finished != "":
-		_name.text = "%s finished. Press %s." % [Kit.tech_name(finished), _key.text]
+		_name.text = "%s finished. Press %s." % [Kit.tech_level_name(finished, finished_level), _key.text]
 		_name.add_theme_color_override("font_color", Kit.ORANGE)
 		_bar.value = 1000
 		_bar.add_theme_stylebox_override("fill", Kit.bar_style(Kit.BAR_ORANGE))
@@ -288,6 +306,15 @@ func _refresh() -> void:
 			(l as Label).remove_theme_color_override("font_color")
 		_key.add_theme_color_override("font_color", KEY_COLOR)
 	_shown = shown
+
+
+## The research's name, a levelled one's with the level being researched (as the technology
+## screen's title_of).
+func title_of(tech: String) -> String:
+	var t: Dictionary = model.techs.get(tech, {})
+	if int(t.get("max_level", 1)) != 1:
+		return Kit.tech_level_name(tech, int(t.get("level", 1)))
+	return Kit.tech_name(tech)
 
 
 ## research_progress_inner_frame: 4 pixels around the icon and 12 right of the text; the hint has

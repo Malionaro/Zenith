@@ -35,6 +35,14 @@ const TERRITORY_STRIPE := Color(0.9, 0.12, 0.08, 0.26)
 const STRIPE_PX := 18.0
 ## Past this many territory chunks in view only the wash is drawn (zoomed far out).
 const STRIPED_CHUNKS := 3000
+## I16: the border itself is a band of warning stripes, red and dark at a slant, as Factorio's map
+## draws a territory's edge: this wide on screen (pixels, kept within), each stripe as wide again.
+const BORDER_PX := 0.3
+const BORDER_MIN_PX := 5.0
+const BORDER_MAX_PX := 10.0
+const TERRITORY_DARK := Color(0.12, 0.02, 0.01, 0.8)
+## Past this many border segments in view the border is a plain line.
+const STRIPED_EDGES := 1500
 ## defines.signal_state: open, closed, reserved, reserved by circuit network.
 const SIGNAL_COLORS := [Color(0.2, 0.9, 0.2), Color(0.95, 0.15, 0.1), Color(1.0, 0.85, 0.1), Color(0.2, 0.5, 1.0)]
 
@@ -517,6 +525,42 @@ func _draw_territories(c: Control) -> void:
 			k += period
 
 
+## I16: the territories' borders as warning tape: along each edge (chunk sides, so level or
+## upright) a dark band with red stripes at a slant, the stripes placed by x + y in tiles so they
+## run on unbroken round corners and from edge to edge. Zoomed far out (an edge only a few
+## pixels long) or with very many edges in view, a plain red line.
+func _draw_territory_border(c: Control, edges: PackedVector2Array, view: Rect2) -> void:
+	var width := clampf(BORDER_PX * scale_px, BORDER_MIN_PX, BORDER_MAX_PX)
+	var shown := PackedVector2Array()
+	for i in range(0, edges.size() - 1, 2):
+		if view.has_point(edges[i]) or view.has_point(edges[i + 1]):
+			shown.append(edges[i])
+			shown.append(edges[i + 1])
+	var striped := shown.size() / 2 <= STRIPED_EDGES and 32.0 * scale_px >= width * 4.0
+	if not striped:
+		for i in range(0, shown.size() - 1, 2):
+			c.draw_line(to_screen(shown[i]), to_screen(shown[i + 1]), TERRITORY, maxf(1.5, 0.15 * scale_px))
+		return
+	var half := width / 2.0 / scale_px  # tiles
+	var period := width * 2.0 / scale_px
+	for i in range(0, shown.size() - 1, 2):
+		var a := shown[i]
+		var b := shown[i + 1]
+		# The band round the edge, in tiles, reaching half a band past each end to close corners.
+		var band := Rect2(a.min(b) - Vector2(half, half), (b - a).abs() + Vector2(half, half) * 2.0)
+		c.draw_rect(Rect2(to_screen(band.position), band.size * scale_px), TERRITORY_DARK)
+		var low := band.position.x + band.position.y
+		var high := band.end.x + band.end.y
+		var k := floorf(low / period) * period
+		while k < high:
+			var stripe := stripe_band(band, k, k + period / 2.0)
+			if stripe.size() >= 3:
+				for j in stripe.size():
+					stripe[j] = to_screen(stripe[j])
+				c.draw_colored_polygon(stripe, TERRITORY)
+			k += period
+
+
 ## The part of the square `area` (tiles) where a <= x + y <= b, as a polygon (empty if none).
 static func stripe_band(area: Rect2, a: float, b: float) -> PackedVector2Array:
 	var poly := PackedVector2Array([area.position, Vector2(area.end.x, area.position.y), area.end,
@@ -581,10 +625,7 @@ func _draw_shade() -> void:
 		_draw_territories(shade)
 		var half := size / 2.0 / scale_px + Vector2(32, 32) + _slack()
 		var view := Rect2(centre - half, half * 2.0)
-		var edges: PackedVector2Array = model.territory_edges
-		for i in range(0, edges.size() - 1, 2):
-			if view.has_point(edges[i]) or view.has_point(edges[i + 1]):
-				shade.draw_line(to_screen(edges[i]), to_screen(edges[i + 1]), TERRITORY, maxf(1.5, 0.15 * scale_px))
+		_draw_territory_border(shade, model.territory_edges, view)
 
 
 ## Copper wires between poles, with the electric layer.

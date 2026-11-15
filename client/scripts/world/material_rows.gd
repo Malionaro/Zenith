@@ -21,11 +21,15 @@ const FLAG_GLOW := 1
 const FLAG_FADES := 2
 const FLAG_BELT := 4
 const FLAG_NO_SPRITE := 8
+## A creature's tinted skin (creature_models.gd): Factorio's two mask layers, or one over the part colour.
+const FLAG_SKIN_MASKS := 16
+const FLAG_SKIN_MASK := 32
 ## The uniforms each row has its own value of, in the table.
 const ROW_PARAMS := ["albedo", "roughness", "metallic", "emission", "emission_energy", "activity_glow", "glow_fades",
 	"glow_flicker", "glow_pulse", "glow_rate", "vertex_data", "edge_data", "view_data", "part_data", "part_colors",
 	"part_weathering", "part_light", "ao_strength", "grime", "grime_color", "ground_grime_height", "edge_wear", "edge_color",
-	"edge_metallic", "rust", "rust_color", "streaks", "dust", "dust_color", "desaturate", "value", "grain"]
+	"edge_metallic", "rust", "rust_color", "streaks", "dust", "dust_color", "desaturate", "value", "grain",
+	"skin_mode", "skin_tint2", "nature_grain"]
 ## The vec4s a row takes in material_table.
 const ROW_SIZE := 11
 ## Meta on a row changed by edit(): only those are looked at for the model's own uniforms.
@@ -133,13 +137,27 @@ static func row_vectors(row: ShaderMaterial) -> Array[Vector4]:
 	var emission: Color = v["emission"]
 	var energy := float(v["emission_energy"])
 	var light: Vector2 = v["part_light"]
+	# A skin of two masks takes its second tint where the emission was (a creature's skin glows not).
+	var skin := int(v["skin_mode"])
+	var tint2: Color = v["skin_tint2"]
+	# Slot 5.w: a skinned creature's second tint's alpha, else nature_grain (bark and rock; never both).
+	var spare := float(v["nature_grain"])
+	if skin == 1:
+		flags |= FLAG_SKIN_MASKS
+		emission = tint2
+		energy = 1.0
+		spare = tint2.a
+	elif skin == 2:
+		flags |= FLAG_SKIN_MASK
+		emission = Color.BLACK
+		spare = tint2.a
 	var out: Array[Vector4] = [
 		Vector4(albedo.r, albedo.g, albedo.b, albedo.a),
 		Vector4(emission.r * energy, emission.g * energy, emission.b * energy, flags),
 		Vector4(float(v["roughness"]), float(v["metallic"]), float(v["edge_metallic"]), float(v["ground_grime_height"])),
 		Vector4(float(v["part_data"]) if bool(v["part_colors"]) else 0.0, float(v["glow_flicker"]), float(v["glow_pulse"]), float(v["glow_rate"])),
 		Vector4(float(v["ao_strength"]), float(v["streaks"]), float(v["desaturate"]), float(v["value"])),
-		Vector4(float(v["grain"]), light.x, light.y, 0.0),
+		Vector4(float(v["grain"]), light.x, light.y, spare),
 		v["part_weathering"],
 		_with(v["grime_color"], v["grime"]),
 		_with(v["edge_color"], v["edge_wear"]),
@@ -220,8 +238,10 @@ static func _uniform_names(shader: Shader) -> PackedStringArray:
 	if not _names.has(shader):
 		if _not_lifted.is_empty():
 			# The rows' own values and flags stay in the table; belt_speed, belt_shape and the rest
-			# are the model's.
-			for u in ROW_PARAMS + ["material_table", "material_rows", "sprite_cells"]:
+			# are the model's. leaf_core stays its row's: a crown's cores share the leaf cards' surface,
+			# each vertex's UV saying which it is (factorio_material.gdshaderinc), or every card would
+			# be drawn as a core.
+			for u in ROW_PARAMS + ["material_table", "material_rows", "sprite_cells", "leaf_core"]:
 				_not_lifted[u] = true
 		var names := PackedStringArray()
 		for u: Dictionary in shader.get_shader_uniform_list():

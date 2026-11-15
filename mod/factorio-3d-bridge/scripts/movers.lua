@@ -8,6 +8,7 @@ local map = require("scripts.map")
 local rate = require("scripts.rate")
 local budget = require("scripts.budget")
 local profile = require("scripts.profile")
+local perf = require("scripts.perf")
 
 local M = {}
 
@@ -92,6 +93,29 @@ local function rescan_every(m, sig, every)
   return SCAN_TICKS
 end
 
+-- one_search (perf.lua): the cargo pods (planets.lua `cp`), spiders (`legs`), rolling stock (trains.lua `tr`)
+-- and enemy units (enemies.lua `en`) the movers' search already finds, by kind, for those jobs instead of a
+-- search of the same square each (3-4 ms each on the owner's base, about 40 searches a second in all).
+-- How many of each it found goes into storage on the search's tick (mv_scan.kinds), which every peer runs:
+-- what the other jobs put in storage (planets_busy, the learnt costs) comes from those counts. The lists
+-- themselves are module-local (scans[s].by), as the movers' list is.
+local KIND_OF = { ["cargo-pod"] = "cp", ["spider-unit"] = "legs", ["spider-vehicle"] = "legs", locomotive = "tr",
+  ["cargo-wagon"] = "tr", ["fluid-wagon"] = "tr", ["artillery-wagon"] = "tr", unit = "en" }
+
+-- The movers found, by kind: {cp = {...}, ...}, and how many of each.
+local function by_kind(found)
+  local by, n = { cp = {}, legs = {}, tr = {}, en = {} }, { cp = 0, legs = 0, tr = 0, en = 0 }
+  for _, e in pairs(found) do
+    local k = KIND_OF[e.type]
+    if k then
+      local l = by[k]
+      l[#l + 1] = e
+      n[k] = n[k] + 1
+    end
+  end
+  return by, n
+end
+
 local function movers_in_focus(surface, s)
   local f = s.focus
   local m = s.mv_scan
@@ -117,6 +141,9 @@ local function movers_in_focus(surface, s)
     local sig = signature(found)
     s.mv_scan = { tick = t, si = surface.index, x = f.x, y = f.y, r = f.r, n = #found, sig = sig,
       every = rescan_every(m, sig, every) }
+    if perf.on("one_search") then
+      scan.by, s.mv_scan.kinds = by_kind(found)
+    end
     budget.learn("mvscan", SCAN_BASE + #scan.list * SCAN_PRICE)
     return scan.list
   end
@@ -125,6 +152,7 @@ local function movers_in_focus(surface, s)
     -- registering nothing (until the next search its movers without a unit number aren't sent).
     scan = { tick = s.mv_scan and s.mv_scan.tick, list = surface.find_entities_filtered({ area = focus_area(s), type = registry.mover_types() }),
       ids = {} }
+    scan.by = by_kind(scan.list)
     scans[s] = scan
   end
   local list = {}
@@ -162,6 +190,40 @@ map.robots_in = function(surface, own, x0, y0, x1, y1)
     end
   end
   return out
+end
+
+-- (one_search) The movers of kind `kind` ("cp", "legs", "tr", "en") the last search found, and how many
+-- (from storage: what a job puts in storage goes by that count), when that search is of this surface and
+-- the focus square as it is now: nil, nil otherwise (the job searches itself, as before). The list is nil
+-- on a peer that loaded since the search (it has none): the job searches for its list then, the count
+-- still storage's.
+function M.found(kind, surface)
+  local s = storage.f3d
+  local m = s.mv_scan
+  if not (m and m.kinds and perf.on("one_search") and m.si == surface.index and m.r == s.focus.r) then
+    return nil, nil
+  end
+  local scan = scans[s]
+  local list = scan and scan.tick == m.tick and scan.by and scan.by[kind] or nil
+  if list then
+    local live = {}
+    for _, e in pairs(list) do
+      if e.valid then
+        live[#live + 1] = e
+      end
+    end
+    list = live
+  end
+  return list, m.kinds[kind] or 0
+end
+
+-- (one_search) A cargo pod or a rocket on its way (an event every peer gets): the movers' next search
+-- comes at once, so a new pod is found within a tick or two, not after the search's back-off.
+function M.wake()
+  local s = storage.f3d
+  if s and s.mv_scan and perf.on("one_search") then
+    s.mv_scan = nil
+  end
 end
 
 -- A new client or world: search again before the next send.
@@ -302,7 +364,30 @@ local function silo_phase(e)
   return silo_phase_of[e.rocket_silo_status] or (e.status == defines.entity_status.working and 1 or 0)
 end
 
+-- K20: whether a lamp is set to Always on (LuaEntity.always_on, the checkbox in its window), lit by day
+-- as well. Lamps only (other types throw); under pcall in case a version lacks it.
+local function lamp_always_on(e)
+  local ok, on = pcall(function() return e.always_on end)
+  return ok and on == true
+end
+
+-- A lamp is lit (1) while its status is working: by day a plain one is turned_off_during_daytime (0,
+-- seen in 2.1.24). One set to Always on should read working by day too; should 2.1 still call it
+-- turned_off_during_daytime, its setting is read and it counts as lit (no power, or a circuit
+-- switching it off, still reads otherwise and stays 0).
+local function lamp_state(e)
+  local status = e.status
+  if status == defines.entity_status.working then
+    return 1
+  end
+  if status == defines.entity_status.turned_off_during_daytime and lamp_always_on(e) then
+    return 1
+  end
+  return 0
+end
+
 local STATE_OF = {
+  lamp = lamp_state,
   ["rail-signal"] = signal_colour,
   ["rail-chain-signal"] = signal_colour,
   accumulator = function(e)
@@ -355,6 +440,82 @@ local function splitter_moving(e, sig)
   return (was ~= nil and was ~= now) and 1 or 0
 end
 
+-- K10: the colour a lit lamp shows, packed 0xRRGGBB, or -1 for white (Factorio's plain lamp light,
+-- which the client draws warm). Factorio 2.x colours a lamp from its circuit network's colour
+-- signals while "Use colors" is on (LuaLampControlBehavior.color, "the color the lamp is showing"),
+-- otherwise from the colour set in its window (LuaEntity.color). Either may be missing or throw in a
+-- version that differs: read under pcall, white then.
+local function lamp_color(e)
+  local c
+  local okb, cb = pcall(function() return e.get_control_behavior() end)
+  if okb and cb then
+    local okc, v = pcall(function() return cb.use_colors and cb.color or nil end)
+    c = okc and v or nil
+  end
+  if type(c) ~= "table" then
+    local okc, v = pcall(function() return e.color end)
+    c = okc and v or nil
+  end
+  if type(c) ~= "table" then
+    return -1
+  end
+  local r, g, b = tonumber(c.r or c[1]) or 1, tonumber(c.g or c[2]) or 1, tonumber(c.b or c[3]) or 1
+  -- (A Color is 0-1, or 0-255 when any part is over 1.)
+  local scale = (r > 1 or g > 1 or b > 1) and 1 or 255
+  local function part(v)
+    return math.max(0, math.min(255, math.floor(v * scale + 0.5)))
+  end
+  local R, G, B = part(r), part(g), part(b)
+  if R == 255 and G == 255 and B == 255 then
+    return -1
+  end
+  return R * 65536 + G * 256 + B
+end
+-- A lit lamp's look counts as this many entities in what the job says it read (its control
+-- behaviour, colours and Always on: up to five more reads than its status).
+local LAMP_WEIGHT = 4
+
+-- A lamp's colour for `st`'s `lc` ([unit, colour, ...]) and whether it is set to Always on for `ao`
+-- ([unit, 0/1, ...], K20). s.lamp_col and s.lamp_ao (storage) hold what the client was last told for
+-- each lamp in the square (nil: white, not always on). The client forgets both with each state it gets
+-- for a lamp, so a lamp whose state goes out now (`state_sent`) is told them again unless white and not
+-- always on; one whose state stays the same, only when they changed. Only lit lamps are read (an unlit
+-- one shows nothing): an unlit one is forgotten, as its `st` 0 makes the client do. `ao` lets the client
+-- light the lamp by day: it lights the others only when it is dark, so a lamp whose state it no longer
+-- hears (out of the focus square) doesn't stay lit into the day.
+local function lamp_change(e, unit, on, state_sent, s, lc, ao)
+  local lcol, lao = s.lamp_col, s.lamp_ao
+  if on ~= 1 then
+    lcol[unit], lao[unit] = nil, nil
+    return 0
+  end
+  local ok, col = pcall(lamp_color, e)
+  col = ok and col or -1
+  if state_sent then
+    if col ~= -1 then
+      lc[#lc + 1] = unit
+      lc[#lc + 1] = col
+    end
+  elseif (lcol[unit] or -1) ~= col then
+    lc[#lc + 1] = unit
+    lc[#lc + 1] = col
+  end
+  lcol[unit] = col ~= -1 and col or nil
+  local always = lamp_always_on(e)
+  if (state_sent and always) or (not state_sent and (lao[unit] == true) ~= always) then
+    ao[#ao + 1] = unit
+    ao[#ao + 1] = always and 1 or 0
+  end
+  lao[unit] = always or nil
+  return LAMP_WEIGHT - 1
+end
+
+local function send_state_changes(changes, lc, ao)
+  if #changes > 0 or #lc > 0 or #ao > 0 then
+    transport.send_reliable({ t = "st", l = changes, lc = #lc > 0 and lc or nil, ao = #ao > 0 and ao or nil })
+  end
+end
+
 -- Sends only machines whose working state changed since the last report. `strip` (1..STATE_STRIPS,
 -- f3d-spread-jobs): only that horizontal strip of the area, the rest on the ticks after; nil: all.
 local function send_states(surface, s, strip)
@@ -374,10 +535,12 @@ local function send_states(surface, s, strip)
   local found = surface.find_entities_filtered({ area = area, type = registry.animated_types() })
   local read = #found
   local working = defines.entity_status.working
-  local changes = {}
+  local changes, lc, ao = {}, {}, {}
   local seen = s.st_seen or {}
   local sig_was = s.split_sig or {}
   local sig = s.st_sig or {}
+  s.lamp_col, s.lamp_ao = s.lamp_col or {}, s.lamp_ao or {}
+  local lcol, lao = s.lamp_col, s.lamp_ao
   for _, e in pairs(found) do
     local unit = e.unit_number
     if unit then
@@ -396,9 +559,13 @@ local function send_states(surface, s, strip)
       end
       -- (A machine on a strip's edge is found by both strips: once is enough.)
       if seen[unit] == nil or seen[unit] ~= on then
-        if s.working[unit] ~= on then
+        local sent = s.working[unit] ~= on
+        if sent then
           changes[#changes + 1] = unit
           changes[#changes + 1] = on
+        end
+        if e.type == "lamp" then
+          read = read + lamp_change(e, unit, on, sent, s, lc, ao)
         end
         seen[unit] = on
       end
@@ -411,10 +578,137 @@ local function send_states(surface, s, strip)
     s.working = seen
     s.split_sig = sig
     s.st_seen, s.st_sig, s.st_read = nil, nil, nil
+    -- (A lamp the round no longer found: its state goes again when it comes back, its colour and
+    -- Always on with it.)
+    for _, t in pairs({ lcol, lao }) do
+      for unit in pairs(t) do
+        if seen[unit] == nil then
+          t[unit] = nil
+        end
+      end
+    end
     rate.read("st", read)
   end
-  if #changes > 0 then
-    transport.send_reliable({ t = "st", l = changes })
+  send_state_changes(changes, lc, ao)
+end
+
+-- states_near (perf.lua): the machines within STATE_NEAR tiles of the focus every round (30 ticks) as
+-- before; the rest of the focus square a quarter a round (FAR_STRIPS strips of rows, the near square cut
+-- out), so each far machine every 120 ticks and starts or stops its animation up to 2 s late. The whole
+-- square was 4 searches of 3.4 ms each twice a second on the owner's base. s.working (unit -> state
+-- sent) is kept across rounds, each area's look merged into it: s.st_at (unit -> area: 0 near, 1-4 a
+-- strip) and s.st_in (area -> {unit = true}) forget a machine its area no longer finds, so a strip not
+-- read isn't sent again. All in storage, from on_tick.
+local STATE_NEAR = 64
+local FAR_STRIPS = 4
+
+-- The areas of `region` (0: the near square; 1..FAR_STRIPS: that strip of the focus square less the
+-- near square), as boxes.
+local function region_areas(s, region)
+  local f = s.focus
+  local n = math.min(STATE_NEAR, f.r)
+  if region == 0 then
+    return { { { f.x - n, f.y - n }, { f.x + n, f.y + n } } }
+  end
+  local x0, x1 = f.x - f.r, f.x + f.r
+  local h = 2 * f.r / FAR_STRIPS
+  local ya = f.y - f.r + (region - 1) * h
+  local yb = region == FAR_STRIPS and f.y + f.r or ya + h
+  if n >= f.r then
+    return {}
+  end
+  local ny0, ny1 = f.y - n, f.y + n
+  if yb <= ny0 or ya >= ny1 then
+    return { { { x0, ya }, { x1, yb } } }
+  end
+  -- (Round the near square: above and below it within the strip, and either side of it.)
+  local out = {}
+  if ya < ny0 then
+    out[#out + 1] = { { x0, ya }, { x1, ny0 } }
+  end
+  if yb > ny1 then
+    out[#out + 1] = { { x0, ny1 }, { x1, yb } }
+  end
+  local ma, mb = math.max(ya, ny0), math.min(yb, ny1)
+  out[#out + 1] = { { x0, ma }, { f.x - n, mb } }
+  out[#out + 1] = { { f.x + n, ma }, { x1, mb } }
+  return out
+end
+
+-- One area's look: states that changed since sent, merged into s.working. Returns the entities read.
+local function state_region(surface, s, region)
+  local working = defines.entity_status.working
+  local types = registry.animated_types()
+  local sent = s.working
+  local sig = s.split_sig or {}
+  s.split_sig = sig
+  s.st_at, s.st_in = s.st_at or {}, s.st_in or {}
+  s.lamp_col, s.lamp_ao = s.lamp_col or {}, s.lamp_ao or {}
+  local at, lcol, lao = s.st_at, s.lamp_col, s.lamp_ao
+  local mine = {}
+  local changes, lc, ao = {}, {}, {}
+  local read = 0
+  for _, area in ipairs(region_areas(s, region)) do
+    local found = surface.find_entities_filtered({ area = area, type = types })
+    read = read + #found
+    for _, e in pairs(found) do
+      local unit = e.unit_number
+      -- (One on the edge of two boxes is found by both: once is enough.)
+      if unit and not mine[unit] then
+        mine[unit] = true
+        at[unit] = region
+        local state_of = STATE_OF[e.type]
+        local on
+        if SPLITTER_TYPES[e.type] then
+          read = read + SPLITTER_WEIGHT - 1
+          local ok, v = pcall(splitter_moving, e, sig)
+          on = ok and v or 0
+        elseif state_of then
+          local ok, v = pcall(state_of, e)
+          on = ok and v or 0
+        else
+          on = (e.status == working) and 1 or 0
+        end
+        local was = sent[unit]
+        if was ~= on then
+          changes[#changes + 1] = unit
+          changes[#changes + 1] = on
+          sent[unit] = on
+        end
+        if e.type == "lamp" then
+          read = read + lamp_change(e, unit, on, was ~= on, s, lc, ao)
+        end
+      end
+    end
+  end
+  -- Gone from this area and not found in another since: forgotten, as a round's replace did.
+  for unit in pairs(s.st_in[region] or {}) do
+    if not mine[unit] and at[unit] == region then
+      at[unit], sent[unit], sig[unit], lcol[unit], lao[unit] = nil, nil, nil, nil, nil
+    end
+  end
+  s.st_in[region] = mine
+  send_state_changes(changes, lc, ao)
+  return read
+end
+
+-- A round of states_near: the near square on its due tick, the far strip of the round on the next.
+local function states_by_distance(surface, s)
+  if rate.due("st", STATE_INTERVAL) then
+    -- Every few seconds report everything, so machines in freshly loaded chunks catch up.
+    if rate.crossed("st", STATE_INTERVAL * 10) then
+      s.working = {}
+    end
+    s.st_read = state_region(surface, s, 0)
+    s.st_far = (s.st_far or 0) % FAR_STRIPS + 1
+    s.st_next = game.tick + 1
+    if not settings.global["f3d-spread-jobs"].value then
+      s.st_next = nil
+      rate.read("st", s.st_read + state_region(surface, s, s.st_far))
+    end
+  elseif s.st_next and game.tick >= s.st_next then
+    s.st_next = nil
+    rate.read("st", (s.st_read or 0) + state_region(surface, s, s.st_far or 1))
   end
 end
 
@@ -425,6 +719,12 @@ function M.tick()
   if rate.due("mv", interval) then
     send_movers(surface, s, rate.period("mv", interval))
   end
+  if perf.on("states_near") then
+    s.st_strip = nil
+    states_by_distance(surface, s)
+    return
+  end
+  s.st_at, s.st_in, s.st_far, s.st_next = nil, nil, nil, nil
   if settings.global["f3d-spread-jobs"].value then
     -- (The strips on the ticks after the due one; a new due run starts over.)
     if rate.due("st", STATE_INTERVAL) then

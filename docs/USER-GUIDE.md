@@ -76,9 +76,10 @@ the file; your own saves, mods and settings aren't touched.
 Factorio's keys work as in Factorio: WASD walks, the right mouse button mines, E opens your
 inventory (or closes the window that is open), the left mouse builds what you hold or, with
 nothing held, opens the building under the mouse, R rotates, Q
-picks up the item under the mouse (pipette), T is the technology screen, M the map, 1–0 the
-quickbar, Enter gets in and out of vehicles, Esc closes windows or opens the game menu. The game
-starts in the angled view, and the camera is yours to move:
+picks up the item under the mouse (pipette), F picks up the items in reach, on the ground and on
+belts, T is the technology screen, M the map, 1–0 the quickbar, Enter gets in and out of
+vehicles, Esc closes windows or opens the game menu. The game starts in the angled view, and the
+camera is yours to move:
 
 | Input | Camera |
 |---|---|
@@ -88,11 +89,16 @@ starts in the angled view, and the camera is yours to move:
 | Page Up / Page Down | Tilt |
 | F6 | Factorio's own view from above, and back |
 | F5 | First person, and back |
-| F7 | Perspective or orthographic, for the view you're in (the map's remote view or the normal one) |
+| F7 | Perspective or orthographic, for the view you're in (first person, the map's remote view or the normal one); Settings > Camera shows it |
 | F8 | The Cinematic camera's free camera (an add-on, on by default): WASD flies it, F8 again comes back; F11 hides the interface, F12 takes a screenshot |
 
 The right mouse button mines whatever is under it, trains, wagons, cars, tanks and spidertrons
 too: they go into your inventory with what is inside them (fuel, cargo), and the rails stay.
+
+In first person (F5) the crosshair works on what it is on, as in a shooter: look at a machine, a
+belt, a tree or a car and it is the one hovered, mined, opened or turned, not the ground behind or
+under it, and something in front hides what is behind. A building you hold goes beside the side you
+look at, or where you look on the ground. Factorio's reach still applies.
 
 Alt (or the ALT button on the shortcut bar) is Factorio's Alt-mode: every machine you can see
 shows what it makes or lets through (recipes, inserter, splitter and filter chest filters), however
@@ -221,7 +227,9 @@ to 8.
   turns yellow past 10 chunks and red past 20: what is drawn grows with the square of it, so far views
   cost the graphics card, memory and the server a lot. Past 14 chunks (Ultra's view) the ground is drawn simpler, and
   there is ground only where Factorio's map has been generated.
-- **Graphics → Level of detail**: how soon far-away models are drawn simpler.
+- **Graphics → Level of detail**: how soon far-away models are drawn simpler. On a screen taller than
+  1440 lines (1080 on Low), such as 4K, models simplify at the size on screen they do at 1440p, not
+  twice as far out. Low also leaves out the ground's small bumps and cracks.
 - **Graphics → Look**: how the world is lit and coloured. **Factorio** (the default) is matched to
   Factorio's own pictures: its colours, its shadows' angle and darkness, its colour grading on each
   planet. **Classic Zenith** is the look before 0.1.4. Add-ons can add looks of their own, such as
@@ -241,12 +249,17 @@ to 8.
 - **Graphics → Preset** (Low, Medium, High, Ultra) sets shadows, level of detail, the distances,
   Moving belt items, decorative density and clouds together, turns ambient occlusion on in High and Ultra and
   contact shading on in all of them; **Shadows** alone (Off to Ultra) sets how far and how sharp
-  the sun's shadows are.
+  the sun's shadows are, and how close the camera must be for items on belts to cast them (none on
+  Low, 30 tiles on Medium, 45 on High, 60 on Ultra). Your character's lantern and flashlight cast no
+  shadows of items on belts.
 - **Graphics → Ambient occlusion** (on in High and Ultra): shading in corners and between machines, kept
   tight as Factorio's sprites have it. It shows when you are zoomed in close enough to see it and fades
-  out as you zoom out (in the angled view from about 40 to 85 tiles away at 1080p, twice that at 4K;
-  F6's view, first person and add-on cameras by the same measure, the size of a pixel where the view
-  looks), and is off altogether further out, so a zoomed-out view pays nothing for it. Up close it costs
+  out as you zoom out, from about 60 tiles away, until none of it shows past about 140 tiles from the
+  camera, whatever the screen. It is switched off, and costs nothing, once the view is about 140 tiles
+  away at 1080p and 185 at 1440p and 4K (4K is measured as 1440p, as Level of detail is; 1080p's 140 at
+  Level of detail Low) (F6's view, first person and add-on cameras by the same measure, the size of a
+  pixel where the view looks): at 1440p and 4K it still costs its time between 140 tiles and there,
+  though none of it shows. Up close it costs
   about 0.7 ms of graphics time a frame at a busy base on a desktop card, more on a laptop. The Cinematic
   look's own ambient occlusion fades the same way. While the Cinematic look is on, its own Ambient
   occlusion setting (Add-ons menu) decides, and this row is greyed out; so is **Clouds**, whose place
@@ -281,9 +294,9 @@ to 8.
   remote view you zoom into from the map; F7 switches whichever view you're in) and **Furthest
   zoom** (how far the wheel zooms out, 60 to 400 tiles; 140 by default) and **Zoom out to the map at**
   (how far the view you zoomed into from the map zooms out before the map comes back, 80 to 480 tiles;
-  240 by default). **Camera follows the hills** (off): with a hills add-on such as Terrain
-  Elevation, the camera stays level as you walk and only first person rides the hills; on, it
-  rises and falls with the ground under the character.
+  240 by default). The camera keeps the character in the middle of the screen in every view, on the
+  hills of an add-on such as Terrain Elevation too, rising and falling with them; where a hill would
+  come between the camera and the character, it tilts up over it instead of going into the ground.
 - **Interface → UI scale**, and Ctrl+= / Ctrl+- / Ctrl+0 while playing.
 - **The bridge's own settings** are in Factorio's Mod settings (Map tab), or Settings → Mod
   settings in a game the menu started: how much it sends per tick, how far moving things are
@@ -310,6 +323,12 @@ while it's open. It's for testing and for reports when something runs slowly:
   bug report. Keep your hands off the keys while one runs; Esc stops it.
 - **Tests**: checks and overlays for finding problems (a frame-time graph, counters, chunk borders,
   the bridge's self-test) and spots to move your character to (the same rule as Time).
+- **Updates**: see where and when the game sends Zenith its updates. Tick a kind (chunks arriving,
+  buildings built, removed or changed, machines starting and stopping, belt lanes read or checked,
+  inserters' takes, movers, power, alerts...) and each update outlines what it touched on the ground,
+  in its colour, fading over a second; a legend at the left counts them a second. Three show a state
+  instead: the chunks still to come, how each belt lane is drawn, and packed belts drawn standing while
+  their items move.
 
 <!-- /dev -->
 ## Add-ons
@@ -345,16 +364,37 @@ nothing is recorded meanwhile.
   console or the bridge's `/f3d-*` commands in Factorio's) are for admins. A player playing through
   Zenith on their own machine needs to be an admin (`/promote` them); Zenith on the server's own
   computer always may.
+- **The server on another PC**: see the next section.
 - **Single-player (hybrid)**: start Factorio normally with `--enable-lua-udp 34200` and connect
   the client (Single player → Single-player (hybrid) → Connect). It plays your own character; both
   windows show the same game. It has been tried less than a server: if it doesn't work, use
   Single player → New game or Load game instead.
+
+## The server on another PC
+
+To keep the game's work off the PC you play on, the headless server can run on another PC on your
+network. Factorio only talks to programs on its own PC, so a small relay runs beside it and passes
+everything along:
+
+1. On the server PC: start the server (`server/run-headless.sh` on Linux, `server\run-server.ps1` on
+   Windows), then the relay: `python3 server/relay.py`. It prints the address to use.
+2. Open TCP port 34200 in that PC's firewall, for your home network only.
+3. In Zenith: Play → Connect to address, and type that PC's address, like `192.168.1.20:34200`.
+
+The relay lets in only PCs on your local network (`--allow` sets your own list). Never open the port to
+the internet: whoever gets in plays on your server, with the console commands of the server's own PC.
+To pause the game from Zenith, start the relay with `--rcon-port 34198` and give the server's RCON
+password (its `server/data/rcon-password.txt`) when connecting. Your PC still needs Factorio installed
+for its graphics and sounds, and the server's mods for theirs. Ctrl+F9 shows Factorio only if you
+joined the server with it on your PC. docs/RUNNING.md, "Server on another PC", has the details. Tried on
+one PC so far, not yet between two.
 
 ## When something goes wrong
 
 | Problem | What to try |
 |---|---|
 | "Waiting for Factorio on 127.0.0.1:34200" | Is Factorio running with `--enable-lua-udp 34200`, and the bridge mod enabled? In Factorio's console, `/f3d-status` says whether a client is connected |
+| "No relay answers at ..." (a server on another PC) | Is `python3 server/relay.py` running on that PC, its TCP port open in the firewall, and your PC on its local network (or in `--allow`)? The relay's window says when it refuses a PC, and why |
 | A game from the menu doesn't start | The message shows the lines of Factorio's log that matter. Check Settings → Factorio install, and that no other Factorio uses the same server data folder |
 | "Can't open UDP port 34201" | Other programs have it and 34202–34208, which the client tries by itself. Close other clients |
 | No item icons, flat-coloured ground, no sound | The client didn't find your Factorio install: set it in Settings → Factorio install |

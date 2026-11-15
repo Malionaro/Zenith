@@ -3,7 +3,7 @@
 These models come from **FUE5** (https://github.com/FUE5BASE/FUE5), a fan remake of Factorio in
 Unreal Engine 5 by **Hurricane and Nuke**, whose models and textures are licensed under
 **Creative Commons Attribution-NonCommercial-ShareAlike 3.0** (CC BY-NC-SA 3.0,
-https://creativecommons.org/licenses/by-nc-sa/3.0/). They are not under Zenith's MIT licence:
+https://creativecommons.org/licenses/by-nc-sa/3.0/). They are not under Zenith's GPL-3.0 licence:
 these files, and anything made from them, may be shared only under the same licence, with this
 credit, and not for commercial use.
 

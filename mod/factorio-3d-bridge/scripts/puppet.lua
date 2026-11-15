@@ -9,6 +9,7 @@ local world = require("scripts.world")
 local tracker = require("scripts.tracker")
 local takeover = require("scripts.takeover")
 local as_player = require("scripts.as_player")
+local perf = require("scripts.perf")
 
 local M = {}
 
@@ -25,7 +26,11 @@ local STARTER_KIT = {
 local HOLD_TICKS = 30      -- a walk, mine or pickup command lasts this long unless the client repeats it
 local REACH_SLACK = 1.5    -- reach is measured to the entity's edge in-game; we measure to its centre
 local PICKUP_SLACK = 0.5   -- the same for picking up items on the ground
-local PICKUPS_PER_TICK = 2
+local PICKUPS_PER_TICK = 2 -- (/f3d-perf belt_pickup off: the ground only, as before)
+-- F with belt_pickup (issue #18): every item in range a tick, as Factorio; this many at most (a bus's first tick).
+local PICKS_PER_TICK = 16
+-- The inventory and slots after a pick-up are sent at most this often (F held by a busy belt takes items every tick).
+local PICK_REPORT_TICKS = 6
 local STATE_INTERVAL = 2
 local INVENTORY_INTERVAL = 30
 local RECIPES_INTERVAL = 600
@@ -240,7 +245,7 @@ function M.on_died(e)
   if ok and platform then
     surface = game.get_surface(1)
   end
-  s.mining, s.walk, s.pickup = nil, nil, nil
+  s.mining, s.walk, s.pickup, s.mine_at = nil, nil, nil, nil
   local p = e.position
   s.death = { tick = game.tick, x = p.x, y = p.y, surface = e.surface.index }
   -- A connected player's character is respawned by the game; only the bridge's own waits here.
@@ -327,6 +332,7 @@ function M.reset()
   local s = storage.f3d
   s.walk = nil
   s.mining = nil
+  s.mine_at = nil
   s.pickup = nil
   s.inv_sig = nil
   s.recipes_sig = nil
@@ -425,19 +431,165 @@ local function can_hand_mine(c, e)
   return true
 end
 
+-- Ghosts are removed at once by a right click, as in Factorio (I6): no mining time to wait out. So
+-- is an item lying on the ground (J18: its mining time is 0.025 s, a tick or two).
+local INSTANT_TYPES = { ["entity-ghost"] = true, ["tile-ghost"] = true, ["item-entity"] = true }
+local finish_mining -- below
+
+-- The item lying on the ground the client right-clicked (`mine` with `gi`): item-entities have no
+-- unit number and no id in the registry, so it goes by where it lies (as `gi` sent it), the one
+-- nearest that point within its selection box (0.17 tiles) and a little.
+local function item_on_ground(surface, cmd)
+  local fx, fy = tonumber(cmd.x), tonumber(cmd.y)
+  if not fx or not fy then
+    return nil
+  end
+  local at = { x = fx / 256, y = fy / 256 }
+  local best, best_d
+  for _, e in pairs(surface.find_entities_filtered({
+    area = { { at.x - 0.25, at.y - 0.25 }, { at.x + 0.25, at.y + 0.25 } },
+    type = "item-entity",
+  })) do
+    local d = distance(e.position, at)
+    if not best_d or d < best_d then
+      best, best_d = e, d
+    end
+  end
+  return best
+end
+
+-- J26: a sweep. While the client holds the mining button it says where its cursor is from the
+-- character as it draws it (`ox`, `oy`, 1/256 tiles): the camera follows the character, so a still
+-- mouse is a fixed offset, and the point walks with the character, as Factorio's selection does.
+-- Each tick the target is what is under that point (sweep), as Factorio's mining follows the
+-- selected entity, measured in 2.1.24 with a player-less character's own mining (mining_state and
+-- update_selected_entity): a new target starts from nothing, no target keeps the progress but mines
+-- nothing (and lets the character walk), the same one again goes on from where it was; the
+-- character stands while it mines and walks on between, so walking with the button held along a
+-- line of belts mines every belt in turn. Vehicles, ghosts and items on the ground are left to the
+-- client's own `mine` (it finds them by their unit or place).
+local SWEEP_SKIP = {
+  ["entity-ghost"] = true, ["tile-ghost"] = true, ["item-entity"] = true, character = true,
+  ["character-corpse"] = true, car = true, ["spider-vehicle"] = true, locomotive = true,
+  ["cargo-wagon"] = true, ["fluid-wagon"] = true, ["artillery-wagon"] = true,
+}
+local MAX_OFFSET = 64 -- tiles: further than any reach, a bad packet's
+
+-- Selection priority by prototype name (resources under everything else, as the client picks).
+local priorities = {}
+local function priority_of(e)
+  local p = priorities[e.name]
+  if not p then
+    local ok, v = pcall(function() return e.prototype.selection_priority end)
+    p = (e.type == "resource") and -1 or (ok and v or 50)
+    priorities[e.name] = p
+  end
+  return p
+end
+
+local function contains(e, at)
+  local b = e.selection_box
+  return at.x >= b.left_top.x and at.x <= b.right_bottom.x and at.y >= b.left_top.y and at.y <= b.right_bottom.y
+end
+
+-- The point the client's cursor is over now, or nil when it isn't holding the button.
+local function sweep_point(c, s)
+  local h = s.mine_at
+  if not h then
+    return nil
+  end
+  if game.tick > h.until_tick then
+    s.mine_at = nil
+    return nil
+  end
+  local p = c.position
+  return { x = p.x + h.ox, y = p.y + h.oy }
+end
+
+-- What Factorio would select at `at` to mine: the highest selection priority there, then the
+-- smallest selection box.
+local function entity_at(c, at)
+  local best, best_pri, best_area
+  for _, e in pairs(c.surface.find_entities_filtered({ area = { { at.x - 0.6, at.y - 0.6 }, { at.x + 0.6, at.y + 0.6 } } })) do
+    if not SWEEP_SKIP[e.type] and e.minable and contains(e, at) then
+      local pri = priority_of(e)
+      local b = e.selection_box
+      local area = (b.right_bottom.x - b.left_top.x) * (b.right_bottom.y - b.left_top.y)
+      if not best or pri > best_pri or (pri == best_pri and area < best_area) then
+        best, best_pri, best_area = e, pri, area
+      end
+    end
+  end
+  return best
+end
+
+local function start_mining(s, e, until_tick)
+  s.mining = {
+    entity = e,
+    progress = 0,
+    time = math.max(e.prototype.mineable_properties.mining_time, 0.01),
+    until_tick = until_tick,
+  }
+end
+
+-- Each tick while the button is held: the target follows the point (see above).
+local function sweep(c, s)
+  local at = sweep_point(c, s)
+  if not at then
+    return
+  end
+  local m = s.mining
+  if m and m.entity.valid and (SWEEP_SKIP[m.entity.type] or contains(m.entity, at)) then
+    m.paused = nil
+    return
+  end
+  local e = entity_at(c, at)
+  if e and not INSTANT_TYPES[e.type] and can_hand_mine(c, e) then
+    start_mining(s, e, s.mine_at.until_tick)
+  elseif m and m.entity.valid then
+    m.paused = true -- off it: Factorio keeps the progress for when the cursor comes back
+  else
+    s.mining = nil
+  end
+end
+
 function M.mine(cmd)
   local s = storage.f3d
   local c = M.get()
   if not c then
     return
   end
-  local e = M.find_target(c.surface, cmd)
+  local ox, oy = tonumber(cmd.ox), tonumber(cmd.oy)
+  local swept = ox and oy and ox == ox and oy == oy and math.abs(ox) <= MAX_OFFSET * 256 and math.abs(oy) <= MAX_OFFSET * 256
+  if swept then
+    s.mine_at = { ox = ox / 256, oy = oy / 256, until_tick = game.tick + HOLD_TICKS }
+  end
+  local e
+  if cmd.gi == 1 then
+    e = item_on_ground(c.surface, cmd)
+  elseif cmd.n ~= 1 then
+    e = M.find_target(c.surface, cmd)
+  end
+  local m = s.mining
   if not e then
-    s.mining = nil
+    -- Nothing under the client's cursor (`n`), or what it saw is gone: in a sweep the point decides,
+    -- and what is being mined goes on while the button is held.
+    if swept and m and m.entity.valid then
+      m.until_tick = game.tick + HOLD_TICKS
+    elseif not swept then
+      s.mining = nil
+    end
     return
   end
-  if s.mining and s.mining.entity.valid and s.mining.entity == e then
-    s.mining.until_tick = game.tick + HOLD_TICKS
+  if m and m.entity.valid and m.entity == e then
+    m.until_tick = game.tick + HOLD_TICKS
+    return
+  end
+  -- The client's view is a few ticks behind: what it saw may be the belt before the one the point
+  -- has reached. The one under the point stays.
+  local at = swept and sweep_point(c, s)
+  if at and m and m.entity.valid and not SWEEP_SKIP[m.entity.type] and contains(m.entity, at) and not contains(e, at) then
+    m.until_tick = game.tick + HOLD_TICKS
     return
   end
   local ok, why = can_hand_mine(c, e)
@@ -446,19 +598,24 @@ function M.mine(cmd)
     message(why)
     return
   end
-  s.mining = {
-    entity = e,
-    progress = 0,
-    time = math.max(e.prototype.mineable_properties.mining_time, 0.01),
-    until_tick = game.tick + HOLD_TICKS,
-  }
+  if INSTANT_TYPES[e.type] then
+    s.mining = nil
+    local done, reason = finish_mining(c, e)
+    if not done then
+      message(reason)
+    end
+    return
+  end
+  start_mining(s, e, game.tick + HOLD_TICKS)
 end
 
 function M.mine_stop()
   storage.f3d.mining = nil
+  storage.f3d.mine_at = nil
 end
 
--- Like holding F: picks up items on the ground near the character while the client repeats it.
+-- Like holding F: picks up items on the ground and on belts near the character while the client repeats it
+-- (tick_pick_items).
 function M.pickup()
   local s = storage.f3d
   if s.pickup then
@@ -489,7 +646,90 @@ local function mine_resource(c, e)
   return true
 end
 
-local function finish_mining(c, e)
+-- What the character holds, by item (qualities summed): the main inventory, guns, ammo and trash, where
+-- mined things land.
+local HELD_INVENTORIES = { "character_main", "character_guns", "character_ammo", "character_trash" }
+local function held(c)
+  local out = {}
+  for _, name in ipairs(HELD_INVENTORIES) do
+    local ok, inv = pcall(function() return c.get_inventory(defines.inventory[name]) end)
+    if ok and inv then
+      for _, item in pairs(inv.get_contents()) do
+        out[item.name] = (out[item.name] or 0) + item.count
+      end
+    end
+  end
+  return out
+end
+
+-- Mined things a `mnd` lists, at most (the client flies six).
+local MINED_MAX = 8
+
+-- Listeners called after the character mined something (inventory.lua sends its slots then).
+M.mined_listeners = {}
+
+-- J20: what the character just mined, said at once (`mnd`, unreliable, so not behind the chunk snapshots
+-- in the reliable outbox the `del` waits in): where it was, whether it is gone, and the items it gave
+-- (what the character holds now less what it held before; its own products first), for the client to
+-- take it away and fly the items to the character in the frame it hears. The inventory is sent at once
+-- too, not at its next 30-tick report.
+local function say_mined(c, info, before)
+  local after = held(c)
+  local gained = {}
+  for name, n in pairs(after) do
+    local d = n - (before[name] or 0)
+    if d > 0 then
+      gained[#gained + 1] = { name, d }
+    end
+  end
+  table.sort(gained, function(a, b)
+    local pa, pb = info.products[a[1]] and 1 or 0, info.products[b[1]] and 1 or 0
+    if pa ~= pb then
+      return pa > pb
+    end
+    if a[2] ~= b[2] then
+      return a[2] > b[2]
+    end
+    return a[1] < b[1]
+  end)
+  local l = {}
+  for i = 1, math.min(#gained, MINED_MAX) do
+    l[i] = gained[i]
+  end
+  local msg = { t = "mnd", u = info.u, p = info.p, x = info.x, y = info.y, g = info.e.valid and 0 or 1, l = l }
+  if info.gi then
+    msg.gi = 1
+  end
+  transport.send_now(msg)
+  M.send_inventory_now()
+  for _, fn in ipairs(M.mined_listeners) do
+    fn(c)
+  end
+end
+
+-- What `mnd` says of the entity, read before it is mined; nil when the switch is off.
+local function mined_info(e)
+  if not perf.on("mined_now") then
+    return nil
+  end
+  local p = e.position
+  local item = e.type == "item-entity"
+  local products = {}
+  local ok, props = pcall(function() return e.prototype.mineable_properties end)
+  for _, product in pairs(ok and props and props.products or {}) do
+    products[product.name] = true
+  end
+  if item then
+    local okn, name = pcall(function() return e.stack.name end)
+    if okn and name then
+      products[name] = true
+    end
+  end
+  return { e = e, u = e.unit_number or 0, p = item and 0 or registry.entity_id(e.name), x = world.fixed(p.x),
+    y = world.fixed(p.y), gi = item, products = products }
+end
+
+local function finish_mining_now(c, e)
   if e.type == "resource" then
     return mine_resource(c, e)
   end
@@ -500,6 +740,9 @@ local function finish_mining(c, e)
     return mined, (not mined) and "Inventory full" or nil
   end
   local removal = tracker.removal_message(e)
+  if perf.on("mined_tell") then
+    tracker.removing(e)
+  end
   if not c.mine_entity(e) then
     return false, "Inventory full"
   end
@@ -507,6 +750,19 @@ local function finish_mining(c, e)
     transport.send_reliable(removal)
   end
   return true
+end
+
+function finish_mining(c, e)
+  local info = mined_info(e)
+  local before = info and held(c)
+  local done, reason = finish_mining_now(c, e)
+  if done and info then
+    local ok, err = pcall(say_mined, c, info, before)
+    if not ok then
+      log("[factorio-3d-bridge] mnd: " .. tostring(err))
+    end
+  end
+  return done, reason
 end
 
 function M.rotate(cmd)
@@ -518,7 +774,7 @@ function M.rotate(cmd)
   if e and e.rotatable and e.force == c.force then
     -- by_player raises on_player_rotated_entity for other mods (as_player.lua).
     e.rotate({ reverse = cmd.rev == 1 or cmd.rev == true, by_player = as_player.by(c) })
-    tracker.changed(e)
+    tracker.rotated(e) -- an underground's other end turns with it (J23)
   end
 end
 
@@ -612,6 +868,9 @@ local function pod_fields(c, s, msg)
   msg.gy = world.fixed(ground.y)
 end
 
+-- More of `me` from modules that need the puppet (repair.lua: `rp`), each f(c, s, msg); set at load.
+M.state_extras = {}
+
 -- In a vehicle the position is the vehicle's, which the camera follows.
 local function send_state(c, s)
   local v = M.vehicle(c)
@@ -660,11 +919,14 @@ local function send_state(c, s)
     msg.hub = hub.unit_number or 0
   end
   pod_fields(c, s, msg)
-  if s.mining and s.mining.entity.valid then
+  if s.mining and s.mining.entity.valid and not s.mining.paused then
     local mp = s.mining.entity.position
     msg.m = math.floor(s.mining.progress / s.mining.time * 100)
     msg.mx = world.fixed(mp.x)
     msg.my = world.fixed(mp.y)
+  end
+  for _, add in ipairs(M.state_extras) do
+    add(c, s, msg)
   end
   transport.send_now(msg)
 end
@@ -817,8 +1079,21 @@ local function angle_step(w, c)
   return pick * 2
 end
 
+-- While the character mines (an entity in reach, the client holding the button) it stands, as
+-- Factorio's does (J10): the walk is kept while the client repeats it and goes on once mining
+-- stops, or while the cursor is over nothing to mine (J26: a sweep walks to the next belt and
+-- stops there). Picking up with F doesn't hold it. The angled walk measures its line afresh after.
+local function mining_now(s)
+  return s.mining ~= nil and s.mining.entity.valid and not s.mining.paused
+end
+
 local function tick_walk(c, s)
   if not s.walk then
+    return
+  end
+  if game.tick <= s.walk.until_tick and mining_now(s) then
+    c.walking_state = { walking = false, direction = s.walk.dir }
+    s.walk.lx, s.walk.ly, s.walk.last, s.walk.moved = nil, nil, nil, nil
     return
   end
   if game.tick <= s.walk.until_tick then
@@ -839,6 +1114,9 @@ local function tick_mining(c, s)
   end
   if game.tick > m.until_tick or not m.entity.valid then
     s.mining = nil
+    return
+  end
+  if m.paused then
     return
   end
   local ok, why = can_hand_mine(c, m.entity)
@@ -863,9 +1141,252 @@ local function tick_mining(c, s)
   end
 end
 
+---------------------------------------------------------------------------------------------
+-- F, "Pick up items" (issue #18). Factorio's control takes the items lying on the ground and those on belts
+-- within the character's item_pickup_distance (1 tile for the base character, its bonus added), every item in
+-- range each tick (the wiki's history of the character: since 0.5.0 it "picks all items in range ... instead of
+-- 1 per tick"). The game does it for a player's picking_state; the bridge does it itself, for its player-less
+-- character and in hybrid mode alike, nearest first: an item on the ground by mining its item-entity (as
+-- before), an item on a belt by putting its stack in the character and taking it off its lane. What it took
+-- is said at once (`pku`): where each was, and on a belt its lane and unique id, so the client takes it off its
+-- simulated lane on the game's tick and flies it to the character; the lanes taken from are read in the next
+-- belt update too (ui_actions.lua, J21's put_lanes), so the client's lane ends as the game has it.
+
+local PICK_BELTS = { "transport-belt", "underground-belt", "splitter", "lane-splitter", "loader", "loader-1x1",
+  "linked-belt" }
+local LANE_KEYS = 8 -- belt_sim.lua's lane key: unit number * 8 + line index
+local PICKED_MAX = 32 -- records a `pku` lists, at most (PICKS_PER_TICK of them a tick)
+
+-- Listeners called with the belts F took items off this tick (ui_actions.lua reads their lanes again).
+M.belt_listeners = {}
+
+-- A line's items as read now: `list` in the game's order, `by` unique id -> {count, line position, name,
+-- quality, the DetailedItemOnLine}. (The read's stacks stay good only until the line changes: names are kept.)
+local function line_items(line)
+  local list, by = {}, {}
+  for _, item in pairs(line.get_detailed_contents()) do
+    local st = item.stack
+    local v = { st.count, item.position, st.name, st.quality.name, item }
+    list[#list + 1] = item.unique_id
+    by[item.unique_id] = v
+  end
+  return { list = list, by = by }
+end
+
+-- Whether a box (a belt's selection box) comes within r of pos.
+local function box_near(b, pos, r)
+  local dx = math.max(b.left_top.x - pos.x, 0, pos.x - b.right_bottom.x)
+  local dy = math.max(b.left_top.y - pos.y, 0, pos.y - b.right_bottom.y)
+  return dx * dx + dy * dy <= r * r
+end
+
+-- Everything F could take from where the character stands, nearest first: {d, e} for an item on the ground,
+-- {d, ln, uid} for one on a belt (ln: its line, {line, items, belt, key}, read once here).
+local function pick_candidates(c, pos, r)
+  local out = {}
+  local area = { { pos.x - r, pos.y - r }, { pos.x + r, pos.y + r } }
+  for _, e in pairs(c.surface.find_entities_filtered({ area = area, type = "item-entity" })) do
+    local p = e.position
+    local d = distance(pos, p)
+    if d <= r then
+      out[#out + 1] = { d = d, e = e, x = p.x, y = p.y, key = 0, uid = 0 }
+    end
+  end
+  -- (A tile wider: an area search goes by collision boxes, a little smaller than where a belt's items ride.)
+  local belt_area = { { pos.x - r - 1, pos.y - r - 1 }, { pos.x + r + 1, pos.y + r + 1 } }
+  for _, belt in pairs(c.surface.find_entities_filtered({ area = belt_area, type = PICK_BELTS })) do
+    local unit = belt.unit_number
+    local ok, n = pcall(function() return belt.get_max_transport_line_index() end)
+    if unit and ok and n and box_near(belt.selection_box, pos, r) then
+      -- An underground's lines 3 and 4 run under the ground (an entrance's tunnel), out of reach.
+      if belt.type == "underground-belt" then
+        n = math.min(n, 2)
+      end
+      for i = 1, n do
+        local line = belt.get_transport_line(i)
+        local items = line_items(line)
+        local ln
+        for _, uid in ipairs(items.list) do
+          local at = line.get_line_item_position(items.by[uid][2])
+          local d = distance(pos, at)
+          if d <= r then
+            ln = ln or { line = line, items = items, belt = belt, key = unit * LANE_KEYS + i }
+            out[#out + 1] = { d = d, ln = ln, uid = uid, x = at.x, y = at.y, key = ln.key }
+          end
+        end
+      end
+    end
+  end
+  -- (Ties by lane and id, then place: the same order on every peer.)
+  table.sort(out, function(a, b)
+    if a.d ~= b.d then
+      return a.d < b.d
+    end
+    if a.key ~= b.key then
+      return a.key < b.key
+    end
+    if a.uid ~= b.uid then
+      return a.uid < b.uid
+    end
+    if a.x ~= b.x then
+      return a.x < b.x
+    end
+    return a.y < b.y
+  end)
+  return out
+end
+
+-- One item on a belt into the character: its stack (quality, freshness and all) put in the character, then
+-- taken off its lane by that stack's reference, the lane read before and after so what is said is what the
+-- game did. Should the reference not take it, the lane gives up that many of the item by name instead; what it
+-- doesn't give up comes back out of the character (nothing is made). Returns the records {name, count, uid,
+-- left, pos}, or nil when the inventory takes none of it.
+local function take_from_belt(c, ln, uid)
+  local before = ln.items
+  local was = before.by[uid]
+  if not was then
+    return {} -- taken this tick already
+  end
+  local count, name, quality = was[1], was[3], was[4]
+  if not c.can_insert({ name = name, quality = quality, count = 1 }) then
+    return nil
+  end
+  local stack = was[5].stack
+  local got = c.insert(stack)
+  if got <= 0 then
+    return nil
+  end
+  pcall(function()
+    if got < count then
+      stack.count = count - got
+    else
+      stack.clear()
+    end
+  end)
+  local after = line_items(ln.line)
+  local function removed()
+    local n = 0
+    for _, id in ipairs(before.list) do
+      local now = after.by[id] and after.by[id][1] or 0
+      n = n + math.max(before.by[id][1] - now, 0)
+    end
+    return n
+  end
+  local n = removed()
+  if n == 0 then
+    pcall(ln.line.remove_item, { name = name, quality = quality, count = got })
+    after = line_items(ln.line)
+    n = removed()
+  end
+  if n < got then
+    c.remove_item({ name = name, quality = quality, count = got - n })
+  end
+  local out = {}
+  for _, id in ipairs(before.list) do
+    local v = before.by[id]
+    local now = after.by[id] and after.by[id][1] or 0
+    if now < v[1] then
+      out[#out + 1] = { name = v[3], count = v[1] - now, uid = id, left = now, pos = v[2] }
+    end
+  end
+  ln.items = after
+  return out
+end
+
+-- The inventory and slots now (at most every PICK_REPORT_TICKS; else when that is up).
+local function report_picks(c, p, now)
+  if not now and p.reported and game.tick - p.reported < PICK_REPORT_TICKS then
+    p.unreported = true
+    return
+  end
+  p.reported = game.tick
+  p.unreported = nil
+  M.send_inventory_now()
+  for _, fn in ipairs(M.mined_listeners) do
+    fn(c)
+  end
+end
+
+-- {t = "pku", k, l = [[item, count, x, y, lane key, unique id, left, item id], ...]}: what F took this tick.
+local function say_picked(c, p, picked, belts)
+  local l = {}
+  for i = 1, math.min(#picked, PICKED_MAX) do
+    local r = picked[i]
+    l[i] = { r.name, r.count, world.fixed(r.x), world.fixed(r.y), r.key, r.uid, r.left, registry.item_id(r.name) or 0 }
+  end
+  transport.send_now({ t = "pku", k = game.tick, l = l })
+  if #belts > 0 then
+    for _, fn in ipairs(M.belt_listeners) do
+      fn(belts)
+    end
+  end
+  report_picks(c, p, false)
+end
+
+local function tick_pick_items(c, p)
+  if p.unreported and game.tick - (p.reported or 0) >= PICK_REPORT_TICKS then
+    report_picks(c, p, true)
+  end
+  if p.full then
+    return
+  end
+  local pos = c.position
+  local r = c.item_pickup_distance + PICKUP_SLACK
+  local picked, belts, seen = {}, {}, {}
+  local taken = 0
+  for _, cand in ipairs(pick_candidates(c, pos, r)) do
+    if taken >= PICKS_PER_TICK then
+      break
+    end
+    if cand.e then
+      local e = cand.e
+      if e.valid then
+        local name, count = e.stack.name, e.stack.count
+        local ok = c.mine_entity(e)
+        local left = e.valid and e.stack.count or 0
+        if count - left > 0 then
+          picked[#picked + 1] = { name = name, count = count - left, x = cand.x, y = cand.y, key = 0, uid = 0, left = left }
+          taken = taken + 1
+        end
+        if not ok then
+          p.full = true
+          break
+        end
+      end
+    else
+      local got = take_from_belt(c, cand.ln, cand.uid)
+      if not got then
+        p.full = true
+        break
+      end
+      for _, g in ipairs(got) do
+        -- (Where the game had it this tick: the candidate's place, or for one the name took instead, its own.)
+        local at = g.uid == cand.uid and cand or cand.ln.line.get_line_item_position(g.pos)
+        picked[#picked + 1] = { name = g.name, count = g.count, x = at.x, y = at.y, key = cand.key, uid = g.uid,
+          left = g.left }
+      end
+      if #got > 0 then
+        taken = taken + 1
+        local belt = cand.ln.belt
+        if not seen[belt.unit_number] then
+          seen[belt.unit_number] = true
+          belts[#belts + 1] = belt
+        end
+      end
+    end
+  end
+  if #picked > 0 then
+    say_picked(c, p, picked, belts)
+  end
+  if p.full then
+    message("Inventory full")
+  end
+end
+
 -- Mining an item-entity puts its stack in the inventory, and mine_entity works without a
 -- player, so that is how a player-less character picks up. Once the inventory is full it stops
--- trying (and says so once) until the client lets go.
+-- trying (and says so once) until the client lets go. With belt_pickup off: the ground only, two a
+-- tick, nothing said but the next `gi`, as before.
 local function tick_pickup(c, s)
   local p = s.pickup
   if not p then
@@ -874,6 +1395,9 @@ local function tick_pickup(c, s)
   if game.tick > p.until_tick then
     s.pickup = nil
     return
+  end
+  if perf.on("belt_pickup") then
+    return tick_pick_items(c, p)
   end
   if p.full then
     return
@@ -910,6 +1434,8 @@ function M.tick()
     return
   end
   s.death = nil
+  -- The sweep first, so the tick its point reaches something to mine the character stands (J26).
+  sweep(c, s)
   tick_walk(c, s)
   tick_mining(c, s)
   tick_pickup(c, s)

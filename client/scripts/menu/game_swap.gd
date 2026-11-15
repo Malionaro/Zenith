@@ -57,16 +57,17 @@ static var _focus_then := Callable()  # exit code -> a line for the HUD ("" for 
 
 
 ## Brings Factorio's window forward, or starts Factorio joined to `game_port` (the server this
-## client started; 0 when the client connected to a game it didn't start). The answer comes from
-## poll() a moment later (the focusing script runs on its own); returns a line for the HUD's message
-## when there is one at once.
-static func show_factorio(game_port: int) -> String:
+## client started; 0 when the client connected to a game it didn't start). `remote_host`: the server
+## runs on that PC (through its relay), so a Factorio window here is one the player joined it with,
+## and there is none to start. The answer comes from poll() a moment later (the focusing script runs
+## on its own); returns a line for the HUD's message when there is one at once.
+static func show_factorio(game_port: int, remote_host := "") -> String:
 	if _focus_pid > 0:
 		return ""  # the last press is still being answered
 	var started := _game_pid > 0 and OS.is_process_running(_game_pid)
-	var then := func(code: int) -> String: return _after_focus(code, started, game_port)
+	var then := func(code: int) -> String: return _after_focus(code, started, game_port, remote_host)
 	if not _focus(_game_pid if started else 0, "factorio", then):
-		return _after_focus(1, started, game_port)
+		return _after_focus(1, started, game_port, remote_host)
 	return ""
 
 
@@ -94,11 +95,14 @@ static func focusing() -> bool:
 
 
 ## What a press does once the focusing script answered: nothing more when a window came forward.
-static func _after_focus(code: int, started: bool, game_port: int) -> String:
+static func _after_focus(code: int, started: bool, game_port: int, remote_host := "") -> String:
 	if code == 0:
 		return ""
 	if started:
 		return "Factorio is running: switch to its window"  # never a second one (no wmctrl off Windows)
+	if remote_host != "":
+		return ("The server runs on %s: to play it in Factorio, join it there (Multiplayer > Connect to address, %s and "
+			+ "the server's game port, 34197 unless it was changed); Ctrl+F9 in it comes back here") % [remote_host, remote_host]
 	if game_port <= 0:
 		return "No Factorio window to show: start Factorio and join this game (or play it in single-player with --enable-lua-udp)"
 	var exe := Paths.factorio_exe()

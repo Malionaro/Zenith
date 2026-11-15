@@ -1367,9 +1367,16 @@ def main(argv):
     names += [] if args.names else sorted(DONORS)
     done = {}
     fits = []
+    # Creatures whose skin creature_skin.py samples per vertex (client/data/creature_skins.json):
+    # left to it, or a run over every model would flatten them back to a colour per patch.
+    skins_path = os.path.join(REPO, "client", "data", "creature_skins.json")
+    skinned = list(json.load(open(skins_path, encoding="utf-8"))) if os.path.exists(skins_path) else []
     for name in names:
         path = os.path.join(MODELS, name + ".glb")
         if not os.path.exists(path):
+            continue
+        if any(name == f or name.startswith(f + "-") for f in skinned) and not args.check:
+            print("%-34s skinned by creature_skin.py, left as it is" % name)
             continue
         opts = overrides_for(name)
         corners = None

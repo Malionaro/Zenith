@@ -97,7 +97,7 @@ const ACTIONS := {
 	"camera_tilt_down": ["Camera", "Tilt camera down"],
 	"factorio_view": ["Camera", "Factorio's view"],
 	"first_person": ["Camera", "First person"],
-	"toggle_projection": ["Camera", "Perspective or orthographic, for the view in use (the map's or the normal one)"],
+	"toggle_projection": ["Camera", "Perspective or orthographic, for the view in use (first person, the map's or the normal one)"],
 	"show_factorio": ["Miscellaneous", "Show in Factorio (the same game, Ctrl+F9 there comes back)"],
 	"debug_menu": ["Miscellaneous", "Debug menu: the game's time, benchmarks and tests (Zenith's own)"],
 }

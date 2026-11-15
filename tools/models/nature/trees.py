@@ -14,7 +14,14 @@ sits on the origin; roots and anything hidden go a little below ground so nothin
 Trunks and their main limbs follow each trunk sprite (tree_trunks.py, measured by fit_trunks.py):
 `sprite_trunk` puts every point where the sprite shows it, flares the foot into buttresses and
 streaks the bark with grooves and ridges in the corner colours (`bark_profile`). The wood draws
-from its own random stream (`wood`), so the crowns stay as they were fitted.
+from its own random stream (`wood`).
+
+Crowns are clumps of leaf cards, as the sprites' are (tree_crowns.py, measured by fit_crowns.py):
+each a bunch of cards round a small dark core, placed where the sprite has leaves from its own side
+(its outline, holes and the gaps between clumps) and filled out in depth to its outline from
+behind, with limbs out into them and the clumps behind showing dark through the gaps
+(`clump_crown`). The spruce is whorls of drooping boughs instead (`tree_01`, `bough`). Build them
+with build_nature.py (Blender) or build_plain.py (plain Python), score them with score.py.
 """
 
 import contextlib
@@ -112,18 +119,6 @@ def wood(m):
         yield
     finally:
         m.rng = main
-
-
-def skip(m, n):
-    """Takes `n` draws from the model's stream: what the trunks before sprite_trunk took there, so
-    the crowns built after them stay the ones that were fitted and reviewed."""
-    for _ in range(n):
-        m.rng.random()
-
-
-def limb_draws(lumps, smallest, per):
-    """The draws the old crown limbs took: `per` for each lump of at least `smallest`."""
-    return per * sum(1 for _, r in lumps[1:] if min(r) >= smallest)
 
 
 def groove_depth(name):
@@ -304,7 +299,7 @@ def shade_tree(m, center, radii, ground=0.0, leaf_dark=0.5, bark_dark=0.55, bark
     c = Vector(center)
     rx, ry, rz = radii
     leaf_idx = {m.materials.index(x) for x in m.materials if x in LEAVES}
-    # Leaf cards and the shadow cores are shaded as they are made (leafy_crown).
+    # Leaf cards and the shadow cores are shaded as they are made (clump_crown, bough).
     own_idx = {m.materials.index(x) for x in m.materials if x.name.startswith(("leafcard", "leaf-shadow"))}
     top = bark_top if bark_top is not None else c.z
 
@@ -325,119 +320,243 @@ def shade_tree(m, center, radii, ground=0.0, leaf_dark=0.5, bark_dark=0.55, bark
     m.shade(fn)
 
 
-def crown_lumps(m, name, inset=0.95):
-    """The crown's lumps in 3D, from its sprite's disks (tree_crowns.DISKS). Factorio's camera is an
-    orthographic view 48 degrees down, so a sphere draws as a disk of its own radius: each disk
-    becomes a sphere where the sprite shows it, a little north or south of the trunk. Under them a
-    round body fills the crown out in depth (the client turns trees at random, so it has to look
-    as full from the side as from the front): as wide north-south as east-west, and as tall as
-    leaves the sprite's crown its height once its depth shows. Returns [(centre, radii)], the body
-    first."""
-    disks = tree_crowns.DISKS[name]
-    lo = min(x - r for x, _, r in disks)
-    hi = max(x + r for x, _, r in disks)
-    ulo = min(u - r for _, u, r in disks)
-    uhi = max(u + r for _, u, r in disks)
-    big = (hi - lo) / 2 * inset
-    seen = (uhi - ulo) / 2 * inset
-    tall = math.sqrt(max(0.35 ** 2, seen ** 2 - (big * 0.743) ** 2)) / 0.669
-    out = [(Vector(((lo + hi) / 2, 0.0, (ulo + uhi) / 2 / 0.669)), Vector((big, big, tall)))]
-    cx, cu = (lo + hi) / 2, (ulo + uhi) / 2
-    for x, up, r in disks:
-        # Lumps out at the crown's edge stay on the trunk's line, or they'd stand off it when seen
-        # from the side.
-        q = math.hypot((x - cx) / max(big, 0.1), (up - cu) / max(seen, 0.1))
-        y = m.rng.uniform(-0.3, 0.3) * big * max(0.0, 1.0 - q)
-        out.append((Vector((x, y, (up - y * 0.743) / 0.669)), Vector((r, r, r))))
+# --- crowns: clumps of leaf cards, as the sprites' ---------------------------------------------
+
+DIGITS = "0123456789abcdefghijklmnopqrstuv"
+# The sprite light the cards' shade leans to (Factorio's: from the west and above, a little south).
+SPRITE_LIGHT = Vector((-0.604, -0.22, 0.766)).normalized()
+
+
+def leaves_at(name, x, up, grid=None):
+    """How far (tiles) the sprite's leaves reach round screen point (x, up) before a gap or the
+    crown's edge (tree_crowns.GRID, the nearest 1/8-tile cell; `grid` OUTLINE: before the outline,
+    holes filled); 0 outside the leaves."""
+    x0, up0, rows = tree_crowns.GRID[name]
+    if grid is not None:
+        rows = grid[name]
+    r = int(round((up0 - up) * 8.0))
+    c = int(round((x - x0) * 8.0))
+    if r < 0 or r >= len(rows) or c < 0 or c >= len(rows[r]):
+        return 0.0
+    return DIGITS.index(rows[r][c]) / 32.0
+
+
+def body_ring(name, z):
+    """The crown's body at height z (tree_crowns.RINGS, interpolated): (centre x, radius), or None
+    above or below it."""
+    rings = tree_crowns.RINGS[name]
+    if z < rings[0][0] or z > rings[-1][0]:
+        return None
+    for a, b in zip(rings, rings[1:]):
+        if a[0] <= z <= b[0]:
+            t = (z - a[0]) / max(b[0] - a[0], 1e-6)
+            return a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t
+    return rings[-1][1], rings[-1][2]
+
+
+def seen_from(p, behind=False):
+    """Where point p shows on Factorio's screen (x, up), or seen from behind the tree with the
+    sprite mirrored (as a tree looks from its far side): the same x, its depth the other way."""
+    return p.x, (-0.743 if behind else 0.743) * p.y + 0.669 * p.z
+
+
+def clump_middles(m, name, rc, spacing=1.25, keep=0.45, shell=1.0, inner=2.2, inner_share=0.25):
+    """Where a crown's clumps go. The crown's room is what the sprite's outline allows from the
+    sprite's side and from behind (OUTLINE, mirrored): so each column of the crown is as deep as
+    the sprite's crown is tall there, a crown as round seen from above as the sprite's is wide, and
+    it keeps the sprite's lean and spread (the client turns trees at random: from the sides it
+    reads as the same tree). The clumps sit in its outer `shell` (clump radii deep), about `spacing`
+    radii apart, with a sparser layer further in (to `inner`, `inner_share` of them) that shows dark
+    through the gaps, as the sprites' crowns do. From the sprite's own side a clump's middle must
+    also show at least `keep` of a radius inside the leaves (GRID), so from there the crown has the
+    sprite's holes and gaps between its clumps. Returns [(middle, outer)]."""
+    rings = tree_crowns.RINGS[name]
+    x0, up0, rows = tree_crowns.GRID[name]
+    x1, up1 = x0 + len(rows[0]) / 8.0, up0 - len(rows) / 8.0
+    half = max(abs(x0), abs(x1))
+    lo_z, hi_z = (up1 - 0.743 * half) / 0.669, (up0 + 0.743 * half) / 0.669
+    step = rc * 0.45
+    cands = []
+    z = max(lo_z, rings[0][0] - rc)
+    while z <= hi_z:
+        y = -half
+        while y <= half:
+            x = x0
+            while x <= x1:
+                p = Vector((x + m.rng.uniform(-0.5, 0.5) * step, y + m.rng.uniform(-0.5, 0.5) * step,
+                            z + m.rng.uniform(-0.5, 0.5) * step))
+                depth = min(leaves_at(name, *seen_from(p, b), grid=tree_crowns.OUTLINE) for b in (False, True))
+                if depth >= keep * rc and leaves_at(name, *seen_from(p)) >= keep * rc:
+                    if depth <= shell * rc:
+                        cands.append((1, p))
+                    elif depth <= inner * rc and m.rng.random() < inner_share:
+                        cands.append((0, p))
+                x += step
+            y += step
+        z += step
+    m.rng.shuffle(cands)
+    cands.sort(key=lambda c: -c[0])  # the outer layer first: the inner one fills in behind it
+    out = []
+    for outer, p in cands:
+        gap = rc * spacing * (1.0 if outer else 1.4)
+        if any((p - q).length < gap for q, _ in out):
+            continue
+        out.append((p, bool(outer)))
     return out
 
 
-def _inside(p, c, radii, scale):
-    q = p - c
-    return (q.x / radii.x) ** 2 + (q.y / radii.y) ** 2 + (q.z / radii.z) ** 2 < scale * scale
+def core(m, centre, radius, mat, tint=(1.0, 1.0, 1.0)):
+    """A clump's dark inside: a lumpy octahedron (8 triangles), what shows between its cards."""
+    c = Vector(centre)
+    a = m.rng.uniform(0.0, math.tau)
+    axes = [Vector((math.cos(a), math.sin(a), 0.0)), Vector((-math.sin(a), math.cos(a), 0.0)), Vector((0.0, 0.0, 1.0))]
+    pts = []
+    for ax in axes:
+        for s in (1.0, -1.0):
+            pts.append(m.bm.verts.new(c + ax * (s * radius * m.rng.uniform(0.8, 1.15))))
+    x0, x1, y0, y1, z0, z1 = pts
+    for f in ((x0, y0, z0), (y0, x1, z0), (x1, y1, z0), (y1, x0, z0), (y0, x0, z1), (x1, y0, z1), (y1, x1, z1), (x0, y1, z1)):
+        m.bm.faces.new(f)
+    m._tag(pts, mat, True, tint)
 
 
-def leafy_crown(m, lumps, card_mat, core_mat, tints=(PLAIN,), cards=700, size=0.55, dark=0.18, core=0.62,
-                spread=0.32):
-    """A crown of leaf cards over dark cores, Factorio's look: ragged, see-through edges of small
-    leaves, lit on top and outside, deep shadow inside where the branches show.
+def clump_crown(m, name, card_mat, core_mat, tints=(PLAIN,), cards=650, size=0.55, rc=None, dark=0.16,
+                spacing=1.25, keep=0.45, shell=1.0, inner=2.2, inner_share=0.25):
+    """A crown of leaf clumps, Factorio's look: each a bunch of leaf cards round a small dark core,
+    with gaps between the clumps where the limbs, the clumps behind and the ground show through
+    (clump_middles), lit on its top and outer side, dark underneath and towards the crown's middle.
+    Each card carries a normal between its clump's outward direction and the crown's (geo.Model.card),
+    so the client's light shades every clump on its own. Returns the clumps [(middle, radius)]."""
+    rc = rc or tree_crowns.CLUMP[name] * 1.7
+    clumps = clump_middles(m, name, rc, spacing=spacing, keep=keep, shell=shell, inner=inner, inner_share=inner_share)
+    rings = tree_crowns.RINGS[name]
 
-    Each lump (centre, radii) gets a solid core (`core` of its size: the shadow seen through the
-    gaps) and cards spread through its outer shell, as many as its surface needs, `cards` in all.
-    Cards inside another lump's core never show and are skipped. Each card faces out of its lump,
-    tilted at random, and carries the crown's outward normal (geo.Model.card) for its light; its
-    shade darkens towards the crown's middle and underside like the sprites' painted shading
-    (`dark`: the deepest)."""
-    lo = Vector([min(c[i] - r[i] for c, r in lumps) for i in range(3)])
-    hi = Vector([max(c[i] + r[i] for c, r in lumps) for i in range(3)])
-    mid = (lo + hi) / 2
-    ext = Vector([max(0.3, (hi[i] - lo[i]) / 2) for i in range(3)])
-    for c, r in lumps:
-        m.blob(c, core, core_mat, scale=(r.x, r.y, r.z), jitter=0.22, subdiv=1, vary=0.25, smooth=True, tilt=0.2)
-
-    def surface(r):
-        return r.x * r.y + r.y * r.z + r.x * r.z
-    area = sum(surface(r) for _, r in lumps)
-    made = 0
-    for c, r in lumps:
-        n = max(8, int(round(cards * surface(r) / area)))
-        # The sprites' leaves grow in bunches with dark gaps between them: the cards gather round
-        # a few bunches per lump (more on the top than underneath).
-        bunches = [Vector((m.rng.gauss(0, 1), m.rng.gauss(0, 1), m.rng.gauss(0, 1) + 0.45)).normalized()
-                   for _ in range(max(3, int(round(5.0 * surface(r) / 1.0))))]
-        for _ in range(n * 3):
-            if n <= 0:
-                break
-            b = m.rng.choice(bunches)
-            d = (b + Vector((m.rng.gauss(0, 1), m.rng.gauss(0, 1), m.rng.gauss(0, 1))) * spread).normalized()
-            f = m.rng.uniform(0.5, 1.06)
-            p = c + Vector((d.x * r.x, d.y * r.y, d.z * r.z)) * f
-            if any(_inside(p, c2, r2, core * 0.95) for c2, r2 in lumps if c2 is not c):
-                continue
-            n -= 1
-            q = p - mid
-            whole = Vector((q.x / ext.x, q.y / ext.y, q.z / ext.z))
-            outer = min(1.0, whole.length)
-            normal = (d * 0.5 + whole.normalized() * 0.5 + Vector((0, 0, 0.25))).normalized()
-            facing = (d + Vector((m.rng.uniform(-0.6, 0.6), m.rng.uniform(-0.6, 0.6), m.rng.uniform(-0.4, 0.6)))).normalized()
-            height = min(1.0, max(0.0, 0.5 + 0.5 * whole.z))
-            # Deep inside a lump and low in the crown: in shadow; out on top: lit.
-            lit = min(1.0, 0.1 + 0.35 * outer + 0.35 * height + 0.2 * max(0.0, d.z))
-            lit *= 0.3 + 0.7 * min(1.0, max(0.0, (f - 0.5) / 0.45))
-            k = dark + (1.0 - dark) * lit ** 1.3
+    def axis_x(z):
+        return (body_ring(name, min(max(z, rings[0][0]), rings[-1][0])) or (0.0, 0.0))[0]
+    zs = [c.z for c, _ in clumps]
+    z0, z1 = min(zs), max(zs)
+    zc, hz = (z0 + z1) / 2, max((z1 - z0) / 2, 0.3)
+    reach = max([math.hypot(c.x - axis_x(c.z), c.y) for c, _ in clumps] + [0.3])
+    weights = [1.0 if outer else 0.4 for _, outer in clumps]
+    total = sum(weights)
+    out = []
+    for (c, outer), w in zip(clumps, weights):
+        side = Vector((c.x - axis_x(c.z), c.y, 0.0)) / reach
+        outward = (side + Vector((0.0, 0.0, (c.z - zc) / hz + 0.25))).normalized()
+        height = min(1.0, max(0.0, (c.z - z0) / max(z1 - z0, 0.1)))
+        r = rc * m.rng.uniform(0.85, 1.15) * (1.0 if outer else 0.85)
+        shell_ = 1.0 if outer else 0.5
+        core(m, c - outward * r * 0.15, r * 0.5, core_mat, tint=(0.8 + 0.2 * height,) * 3)
+        n = max(4, int(round(cards * w / total)))
+        for _ in range(n):
+            d = (Vector((m.rng.gauss(0, 1), m.rng.gauss(0, 1), m.rng.gauss(0, 1))) + outward * 0.9
+                 + Vector((0.0, 0.0, 0.45))).normalized()
+            f = m.rng.uniform(0.45, 1.2)
+            p = c + Vector((d.x, d.y, d.z * 0.8)) * (r * f)
+            facing = (d + Vector((m.rng.uniform(-0.6, 0.6), m.rng.uniform(-0.6, 0.6), m.rng.uniform(-0.3, 0.6)))).normalized()
+            normal = (d * 0.55 + outward * 0.3 + Vector((0.0, 0.0, 0.3))).normalized()
+            out_side = max(0.0, min(1.0, 0.5 + 0.6 * d.dot(outward)))
+            lit = 0.1 + 0.35 * out_side + 0.25 * max(0.0, d.z) + 0.15 * height + 0.15 * max(0.0, d.dot(SPRITE_LIGHT))
+            lit *= (0.35 + 0.65 * min(1.0, max(0.0, (f - 0.45) / 0.5))) * (1.0 if shell_ == 1.0 else 0.55)
+            k = dark + (1.0 - dark) * min(1.0, lit) ** 1.3
             t = leaf_tint(m, tints)
-            s = size * m.rng.uniform(0.8, 1.15) * min(1.0, 0.55 + 0.6 * min(r))
-            m.card(p, s, facing, card_mat, tint=(t[0] * k, t[1] * k, t[2] * k), normal=normal)
-            made += 1
-    return made
+            m.card(p, size * m.rng.uniform(0.8, 1.15), facing, card_mat, tint=(t[0] * k, t[1] * k, t[2] * k), normal=normal)
+        out.append((c, r))
+    return out
 
 
-def crown_limbs(m, fork, lumps, bark, r0=0.12, smallest=0.4, lo=1.0):
-    """Branches from the trunk's fork into the bigger lumps, ending inside their cores: what shows
-    through the gaps between the leaves. `fork` is one point, or the strands sprite_trunk made:
-    then each branch leaves the nearest of their points above `lo`."""
-    if isinstance(fork, Vector):
-        cands = [fork]
-    else:
-        cands = [p for s in fork for p in s[:-1] if p.z > lo] or [fork[0][-2]]
+def clump_limbs(m, strands, clumps, bark, r0=0.08, lo=1.0, most=14):
+    """Limbs from the trunk and its main limbs out into the clumps, ending in their cores: what the
+    sprites show between the clumps. One to each of the `most` clumps nearest the wood, spread up
+    the crown."""
+    cands = [p for s in strands for p in s[:-1] if p.z > lo] or [strands[0][-2]]
     with wood(m):
-        _crown_limbs(m, cands, lumps, bark, r0, smallest)
+        order = sorted(clumps, key=lambda cr: min((p - cr[0]).length for p in cands))
+        picked = []
+        for c, r in order:
+            if len(picked) >= most:
+                break
+            if any((c - q).length < r * 2.2 for q, _ in picked):
+                continue
+            picked.append((c, r))
+        for c, r in picked:
+            start = min(cands, key=lambda p: (p - c).length + 0.5 * max(0.0, p.z - c.z))
+            end = c + (start - c).normalized() * r * 0.25
+            mid = start.lerp(end, 0.5) + Vector((0.0, 0.0, 0.15 * (end - start).length))
+            rad = min(r0, 0.03 + 0.04 * (end - start).length)
+            m.tube(bend([start, mid, end, c], m.rng, 0.06), [rad, rad * 0.7, rad * 0.4, 0.0], bark, segments=4,
+                   profile=bark_profile(m, 4, groove=0.45))
 
 
-def _crown_limbs(m, cands, lumps, bark, r0, smallest):
-    for c, r in lumps[1:]:
-        if min(r) < smallest:
-            continue
-        start = min(cands, key=lambda p: (p - c).length)
-        end = c + (start - c).normalized() * min(r) * 0.3
-        mid = start.lerp(end, 0.5) + Vector((0, 0, 0.25 * (end - start).length))
-        tip = end + (c - start).normalized() * min(r) * 0.4
-        m.tube(bend([start, mid, end, tip], m.rng, 0.08), [r0, r0 * 0.7, r0 * 0.35, 0.0], bark, segments=5,
-               profile=bark_profile(m, 5, groove=0.4))
+def bough(m, z, angle, reach, droop, card_mat, lit, size, tints, sprays=4):
+    """One drooping spruce bough from the stem at height z out to `reach`, its tip `droop` lower:
+    sprays of needles along its top, facing up and out, lightest at the tip, and one hanging off the
+    tip, facing out: the skirt's edge the sprite shows on every whorl."""
+    out = Vector((math.cos(angle), math.sin(angle), 0.0))
+
+    def at(t):
+        return out * (reach * t) + Vector((0.0, 0.0, z - droop * t ** 1.6))
+    for i in range(sprays):
+        t = 0.45 + 0.55 * (i + m.rng.uniform(0.2, 0.8)) / sprays
+        p = at(t) + Vector((m.rng.uniform(-0.06, 0.06), m.rng.uniform(-0.06, 0.06), 0.02))
+        slope = 0.6 * droop * t ** 0.6 / max(reach, 0.1)
+        facing = (Vector((0.0, 0.0, 1.0)) + out * slope + Vector((m.rng.uniform(-0.2, 0.2), m.rng.uniform(-0.2, 0.2), 0.0))).normalized()
+        k = lit * (0.2 + 0.8 * t)
+        tint = leaf_tint(m, tints)
+        m.card(p, size * m.rng.uniform(0.85, 1.15) * (0.7 + 0.4 * min(1.0, reach)), facing, card_mat,
+               tint=(tint[0] * k, tint[1] * k, tint[2] * k), normal=(facing + out * 0.5).normalized(),
+               spin=angle + math.pi / 2, stretch=1.3)
+    # The hanging edge: a spray off the tip, facing out and a little down.
+    tip = at(1.0)
+    facing = (out * 0.7 + Vector((0.0, 0.0, 0.7))).normalized()
+    k = lit * 0.85
+    tint = leaf_tint(m, tints)
+    m.card(tip - Vector((0.0, 0.0, size * 0.1)), size * m.rng.uniform(0.85, 1.1), facing, card_mat,
+           tint=(tint[0] * k, tint[1] * k, tint[2] * k), normal=(out + Vector((0.0, 0.0, 0.6))).normalized(),
+           spin=m.rng.uniform(-0.3, 0.3), stretch=1.2)
+
+
+# --- living trees -----------------------------------------------------------------------------
+
+def tree_01(m):
+    """Spruce: a narrow seven-tile column of drooping whorls, tapering only near the top, over a
+    short dark trunk with a flared base. Each whorl a ring of boughs drooping from the stem, sprays
+    of needles along their tops and hanging off their tips, the darkness under each whorl between
+    them as the sprite's tiers; the outline from the sprite (RINGS), no cap on top (the trunk's tip
+    shows, as in the sprite)."""
+    strands = sprite_trunk(m, "tree-01", BARK_01, segments=10, flare=1.3, lobes=5, crook=0.03, step=0.7)
+    twigs_on(m, strands, BARK_01, count=8, lo=1.4, length=(0.3, 0.6), radius=0.025)
+    name, rc = "tree-01", tree_crowns.CLUMP["tree-01"] * 1.35
+    rings = tree_crowns.RINGS[name]
+    z0, z1 = rings[0][0] + 0.45, rings[-1][0] + 0.3
+    tints = (PLAIN, COOL, PLAIN)
+    whorls = max(6, int(round((z1 - z0) / 0.72)))
+    for i in range(whorls):
+        f = i / max(whorls - 1, 1)
+        z = z1 - f * (z1 - z0)
+        ring = body_ring(name, min(max(z - 0.3, rings[0][0]), rings[-1][0])) or (0.0, 0.2)
+        reach = max(0.25, ring[1] + rc * (0.3 + 0.9 * f))
+        droop = 0.1 + 0.18 * min(1.0, reach)
+        count = max(4, int(round(math.tau * reach / 0.5)))
+        a0 = m.rng.uniform(0.0, math.tau)
+        lit = 0.95 - 0.35 * f
+        # The shade under the whorl, round the stem: what shows dark between the tiers.
+        tier(m, z - 0.12, reach * 0.55, droop * 0.6, SHADOWS["01"], points=6 if reach > 0.5 else 4, inner=0.7, thick=0.25)
+        for k in range(count):
+            a = a0 + (k + m.rng.uniform(-0.25, 0.25)) / count * math.tau
+            bough(m, z + m.rng.uniform(-0.05, 0.05), a, reach * m.rng.uniform(0.8, 1.05), droop, CARDS["01"], lit,
+                  0.44, tints, sprays=4 if reach < 0.6 else 5)
+    # The tip: a tuft of upright sprays round the trunk's point.
+    for k in range(4):
+        a = k / 4 * math.tau + m.rng.uniform(-0.3, 0.3)
+        out = Vector((math.cos(a), math.sin(a), 0.0))
+        m.card(Vector((0.0, 0.0, z1 + 0.2)) + out * 0.06, 0.3, (out * 0.6 + Vector((0, 0, 0.4))).normalized(),
+               CARDS["01"], tint=(0.95, 1.0, 0.95), normal=(out + Vector((0, 0, 1.0))).normalized(), stretch=1.4)
+    shade_tree(m, (0, 0, 3.8), (1.4, 1.4, 2.6), leaf_dark=0.42, bark_dark=0.5, bark_top=1.9)
 
 
 def tier(m, z, radius, droop, leaf, points=9, tint=PLAIN, inner=0.62, thick=0.35):
-    """One whorl of a conifer: a star of drooping branch tips round the stem, as a closed
+    """The dark under a conifer's whorl: a star of drooping points round the stem, as a closed
     jagged umbrella (top and underside)."""
     rng = m.rng
     bm = m.bm
@@ -461,90 +580,43 @@ def tier(m, z, radius, droop, leaf, points=9, tint=PLAIN, inner=0.62, thick=0.35
     m._tag([top, bottom] + rim, leaf, False, leaf_tint(m, (tint,)), 0.4)
 
 
-# --- living trees -----------------------------------------------------------------------------
-
-def tree_01(m):
-    """Spruce: a narrow seven-tile column of drooping whorls, tapering only near the top, over
-    a short dark trunk with a flared base."""
-    strands = sprite_trunk(m, "tree-01", BARK_01, segments=10, flare=1.3, lobes=5, crook=0.03, step=0.7)
-    skip(m, 22)  # the draws the old trunk took: the crown stays as it was
-    twigs_on(m, strands, BARK_01, count=8, lo=1.4, length=(0.3, 0.6), radius=0.025)
-    # Whorls of drooping boughs: each a dark solid umbrella (the shadow under the needles) with
-    # sprays of needles (leaf cards) hanging off its rim and lying over its top.
-    whorls = 14
-    for i in range(whorls):
-        f = i / (whorls - 1)
-        z = 1.95 + f * 4.4
-        r = 0.22 + 1.2 * (1.0 - f) ** 0.6
-        droop = 0.4 + 0.3 * (1.0 - f)
-        tier(m, z, r * 0.8, droop=droop * 0.8, leaf=SHADOWS["01"], points=8 if r > 0.6 else 6, inner=0.74, thick=0.3)
-        a0 = m.rng.uniform(0.0, math.tau)
-        n = 4 + int(14 * r)
-        for k in range(n):
-            a = a0 + k / n * math.tau + m.rng.uniform(-0.2, 0.2)
-            out = Vector((math.cos(a), math.sin(a), 0.0))
-            reach = r * m.rng.uniform(0.55, 1.05)
-            p = out * reach + Vector((0, 0, z - droop * (0.25 + 0.6 * reach / r)))
-            facing = (out * 0.6 + Vector((0, 0, 1.0)) + Vector((m.rng.uniform(-0.3, 0.3), m.rng.uniform(-0.3, 0.3), 0))).normalized()
-            lit = min(1.0, 0.3 + 0.5 * reach / r + 0.3 * f)
-            k_ = 0.3 + 0.7 * lit ** 1.3
-            t = leaf_tint(m, (PLAIN, COOL, PLAIN))
-            m.card(p, (0.3 + 0.35 * min(1.0, r)) * m.rng.uniform(0.85, 1.15), facing, CARDS["01"],
-                   tint=(t[0] * k_, t[1] * k_, t[2] * k_), normal=(out + Vector((0, 0, 0.6))).normalized(),
-                   spin=a + math.pi / 2)
-    m.cone((0.0, 0.0, 6.2), 0.7, 0.14, LEAF_01, segments=5, tint=PLAIN)
-    shade_tree(m, (0, 0, 3.8), (1.4, 1.4, 2.6), leaf_dark=0.42, bark_dark=0.5, bark_top=1.9)
-
-
 def tree_02(m):
     """Columnar bush-tree: a tall lumpy pillar of yellow-olive foliage from just above the
     ground, on a short flared trunk."""
     strands = sprite_trunk(m, "tree-02", BARK_02, segments=10, flare=1.3, lobes=5, step=0.6)
-    skip(m, 22)  # the draws the old trunk took: the crown stays as it was
-    lumps = crown_lumps(m, "tree-02")
-    crown_limbs(m, strands, lumps, BARK_02, r0=0.09)
     twigs_on(m, strands, BARK_02, count=12, lo=1.8)
-    skip(m, limb_draws(lumps, 0.4, 3))
-    leafy_crown(m, lumps, CARDS["02"], SHADOWS["02"], (PLAIN, WARM, PLAIN, (0.9, 1.0, 0.85)))
+    clumps = clump_crown(m, "tree-02", CARDS["02"], SHADOWS["02"], (PLAIN, WARM, PLAIN, (0.9, 1.0, 0.85)), cards=680)
+    clump_limbs(m, strands, clumps, BARK_02, r0=0.07, most=10)
     shade_tree(m, (0, 0, 3.0), (1.4, 1.4, 2.5), leaf_dark=0.4, bark_top=1.2)
 
 
 def tree_03(m):
     """Old gnarled tree: a thick orange-brown trunk that forks into heavy crooked limbs under
-    a broad, open crown of olive-brown leaves."""
+    a broad, open crown of olive-brown leaves: clumps with wide gaps the limbs show through."""
     strands = sprite_trunk(m, "tree-03", BARK_03, flare=1.45, lobes=4, flute=0.09, roots_reach=0.18)
-    skip(m, 27)  # the draws the old trunk took: the crown stays as it was
-    # An open crown: crooked limbs out to every lump, fewer cards, so they show through.
-    lumps = crown_lumps(m, "tree-03")
-    crown_limbs(m, strands, lumps, BARK_03, r0=0.12, smallest=0.34, lo=1.3)
     twigs_on(m, strands, BARK_03, count=16, lo=1.3)
-    skip(m, limb_draws(lumps, 0.34, 5))
-    leafy_crown(m, lumps, CARDS["03"], SHADOWS["03"], (PLAIN, WARM, (0.9, 1.0, 0.82)), cards=560, core=0.5)
+    clumps = clump_crown(m, "tree-03", CARDS["03"], SHADOWS["03"], (PLAIN, WARM, (0.9, 1.0, 0.82)), cards=600,
+                         spacing=1.4)
+    clump_limbs(m, strands, clumps, BARK_03, r0=0.09, lo=1.3, most=16)
     shade_tree(m, (0, 0, 4.0), (2.0, 2.0, 1.6), leaf_dark=0.4, bark_top=3.2)
 
 
 def tree_04(m):
-    """Tall tree with a thick, light trunk running right up into a crown of blue-green
-    leaves."""
+    """Tall tree with a thick, light trunk running right up through a crown of blue-green leaf
+    clumps, the trunk showing between them."""
     strands = sprite_trunk(m, "tree-04", BARK_04, flare=1.4, lobes=4, roots_reach=0.15)
-    skip(m, 29)  # the draws the old trunk took: the crown stays as it was
-    lumps = crown_lumps(m, "tree-04")
-    crown_limbs(m, strands, lumps, BARK_04, r0=0.1, smallest=0.34, lo=1.8)
     twigs_on(m, strands, BARK_04, count=12, lo=1.6)
-    skip(m, limb_draws(lumps, 0.34, 3))
-    leafy_crown(m, lumps, CARDS["04"], SHADOWS["04"], (PLAIN, COOL, PLAIN), cards=600, core=0.55)
+    clumps = clump_crown(m, "tree-04", CARDS["04"], SHADOWS["04"], (PLAIN, COOL, PLAIN), cards=620, spacing=1.3)
+    clump_limbs(m, strands, clumps, BARK_04, r0=0.08, lo=1.8, most=14)
     shade_tree(m, (0, 0, 3.6), (1.5, 1.5, 1.8), leaf_dark=0.4, bark_top=4.5)
 
 
 def tree_05(m):
-    """Round, bright yellow-green crown on a short trunk with spreading roots."""
+    """Round, bright yellow-green crown of clumps on a short trunk with spreading roots."""
     strands = sprite_trunk(m, "tree-05", BARK_05, segments=10, flare=1.35, lobes=5, step=0.45, roots_reach=0.12)
-    skip(m, 26)  # the draws the old trunk took: the crown stays as it was
-    lumps = crown_lumps(m, "tree-05")
-    crown_limbs(m, strands, lumps, BARK_05, lo=1.3)
     twigs_on(m, strands, BARK_05, count=12, lo=1.4)
-    skip(m, limb_draws(lumps, 0.4, 3))
-    leafy_crown(m, lumps, CARDS["05"], SHADOWS["05"], (PLAIN, WARM, PLAIN))
+    clumps = clump_crown(m, "tree-05", CARDS["05"], SHADOWS["05"], (PLAIN, WARM, PLAIN), cards=680)
+    clump_limbs(m, strands, clumps, BARK_05, r0=0.08, lo=1.3, most=12)
     shade_tree(m, (0, 0, 3.0), (1.6, 1.6, 1.6), leaf_dark=0.4, bark_top=2.0)
 
 
@@ -608,46 +680,36 @@ def tree_06(m):
 
 
 def tree_07(m):
-    """Broad oak: a rounded crown of mustard and olive leaves, with a few lower clusters, on a
-    short trunk with big roots."""
+    """Broad oak: a rounded crown of mustard and olive leaf clumps, with a few lower clusters, on
+    a short trunk with big roots."""
     strands = sprite_trunk(m, "tree-07", BARK_07, flare=1.45, lobes=4, roots_reach=0.15)
-    skip(m, 26)  # the draws the old trunk took: the crown stays as it was
-    lumps = crown_lumps(m, "tree-07")
-    crown_limbs(m, strands, lumps, BARK_07, r0=0.12, smallest=0.3, lo=1.6)
     twigs_on(m, strands, BARK_07, count=14, lo=1.8)
-    skip(m, limb_draws(lumps, 0.3, 3))
-    leafy_crown(m, lumps, CARDS["07"], SHADOWS["07"], (PLAIN, (0.85, 1.0, 0.75), WARM))
+    clumps = clump_crown(m, "tree-07", CARDS["07"], SHADOWS["07"], (PLAIN, (0.85, 1.0, 0.75), WARM), cards=680)
+    clump_limbs(m, strands, clumps, BARK_07, r0=0.09, lo=1.6, most=14)
     shade_tree(m, (0, 0, 3.4), (1.8, 1.8, 2.0), leaf_dark=0.4, bark_top=2.2)
 
 
 def tree_08(m):
     """Bottle tree: a smooth, pale, bulging trunk that forks into spreading limbs holding a
-    wide, flat-bottomed green crown."""
+    wide, flat-bottomed crown of green clumps, the limbs showing between them."""
     # Smooth pale bark: shallow grooves.
     strands = sprite_trunk(m, "tree-08", BARK_08, segments=10, flare=1.2, lobes=5, flute=0.03, step=0.5)
-    skip(m, 22)  # the draws the old trunk took: the crown stays as it was
-    # Spreading limbs out to the crown's lumps, under a thin, open canopy they show through.
-    lumps = crown_lumps(m, "tree-08")
-    crown_limbs(m, strands, lumps, BARK_08, r0=0.11, smallest=0.3, lo=1.6)
     twigs_on(m, strands, BARK_08, count=14, lo=1.6)
-    skip(m, limb_draws(lumps, 0.3, 3))
-    leafy_crown(m, lumps, CARDS["08"], SHADOWS["08"], (PLAIN, WARM, PLAIN), cards=600, core=0.55)
+    clumps = clump_crown(m, "tree-08", CARDS["08"], SHADOWS["08"], (PLAIN, WARM, PLAIN), cards=620, spacing=1.4)
+    clump_limbs(m, strands, clumps, BARK_08, r0=0.08, lo=1.6, most=16)
     shade_tree(m, (0, 0, 4.0), (1.8, 1.8, 1.5), leaf_dark=0.42, bark_dark=0.45, bark_top=3.2)
 
 
 def tree_09(m):
     """Baobab: three massive trunks grown together on buttress roots, under a huge crown of
-    orange leaves five tiles across."""
+    orange leaf clumps five tiles across."""
     # The sprite's trunk is three grown together: three deep lobes all the way up.
     strands = sprite_trunk(m, "tree-09", BARK_09, segments=12, flare=1.2, lobes=3, lobe_depth=0.22, flute=0.06,
                            step=0.6, roots_reach=0.2)
-    skip(m, 58)  # the draws the old trunk took: the crown stays as it was
-    lumps = crown_lumps(m, "tree-09")
-    crown_limbs(m, strands, lumps, BARK_09, r0=0.16, smallest=0.4, lo=2.0)
     twigs_on(m, strands, BARK_09, count=10, lo=2.2)
-    skip(m, limb_draws(lumps, 0.4, 5))
-    leafy_crown(m, lumps, CARDS["09"], SHADOWS["09"], (PLAIN, WARM, (1.0, 0.88, 0.75)), cards=800, size=0.6,
-                core=0.55)
+    clumps = clump_crown(m, "tree-09", CARDS["09"], SHADOWS["09"], (PLAIN, WARM, (1.0, 0.88, 0.75)), cards=700,
+                         size=0.6, spacing=1.4)
+    clump_limbs(m, strands, clumps, BARK_09, r0=0.12, lo=2.0, most=14)
     shade_tree(m, (0, 0, 4.5), (2.5, 2.5, 2.0), leaf_dark=0.4, bark_dark=0.4, bark_top=3.6)
 
 

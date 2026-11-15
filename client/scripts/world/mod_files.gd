@@ -78,6 +78,20 @@ static func active_mods() -> Dictionary:
 	return _mods
 
 
+## The game's mods (the welcome's) found in no mods folder here, sorted; built-in ones and the bridge
+## (no graphics to draw) never count.
+## For a server on another PC, whose mods folder isn't this PC's (main.gd says so once a game).
+static func missing_mods() -> PackedStringArray:
+	var out := PackedStringArray()
+	_mutex.lock()
+	for name in _mods:
+		if not str(name) in BUILT_IN and str(name) != "factorio-3d-bridge" and not _found.has(name):
+			out.append(str(name))
+	_mutex.unlock()
+	out.sort()
+	return out
+
+
 ## Finds the data folder and every mod, so reads on worker threads only look things up.
 static func prepare() -> void:
 	if _task >= 0:

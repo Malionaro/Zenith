@@ -6,6 +6,7 @@ local world = require("scripts.world")
 local rate = require("scripts.rate")
 local alt_mode = require("scripts.alt_mode")
 local belt_switch = require("scripts.belt_switch")
+local perf = require("scripts.perf")
 
 local M = {}
 
@@ -16,6 +17,29 @@ local BELT_TYPES = registry.BELT_SET
 
 local function watched(entity)
   return entity and entity.valid and registry.is_static(entity.type) and world.is_subscribed(entity.surface, entity.position)
+end
+
+-- The wires the client was just sent with an entity's record, as the wire look's last look
+-- (s.wire_sigs): without it the strips' first look at a new pole (up to 4 s later) was taken as the
+-- start, so a wire a script, a blueprint or another player's hand changed in between was never sent
+-- (live_check's two poles, disconnected and wired again by script, passed only when their strip came
+-- round in time). Wired types from the prototypes alone (registry), the same on every peer.
+local wired_set
+local function note_wires(entity)
+  local s = storage.f3d
+  local unit = entity.unit_number
+  if not (s.wire_sigs and unit) then
+    return
+  end
+  if not wired_set then
+    wired_set = {}
+    for _, t in pairs(registry.wired_types()) do
+      wired_set[t] = true
+    end
+  end
+  if wired_set[entity.type] then
+    s.wire_sigs[unit] = world.wire_signature(entity)
+  end
 end
 
 local function refresh_neighbour_belts(entity)
@@ -93,6 +117,7 @@ function M.added(entity)
   end
   if watched(entity) then
     transport.send_reliable({ t = "add", e = world.record(entity) })
+    note_wires(entity)
     if BELT_TYPES[entity.type] then
       refresh_neighbour_belts(entity)
     end
@@ -107,9 +132,28 @@ function M.changed(entity)
   fluid_neighbours_changed(entity, false)
   if watched(entity) then
     transport.send_reliable({ t = "upd", e = world.record(entity) })
+    note_wires(entity)
     if BELT_TYPES[entity.type] then
       refresh_neighbour_belts(entity)
     end
+  end
+end
+
+-- An entity turned (the client's R, a player's in the game, undo): its record, and an underground
+-- belt's other end's too. LuaEntity.rotate turns a connected pair together, both swapping entrance
+-- and exit and facing the other way (measured in 2.1.24), and nothing tells of the other end (J23:
+-- the client drew only the one turned).
+function M.rotated(entity)
+  M.changed(entity)
+  if not (entity and entity.valid and entity.type == "underground-belt") then
+    return
+  end
+  local ok, other = pcall(function() return entity.underground_belt_neighbour end)
+  if not ok then
+    ok, other = pcall(function() return entity.neighbours end) -- 2.0's name for it
+  end
+  if ok and other and other.valid then
+    M.changed(other)
   end
 end
 
@@ -128,9 +172,26 @@ function M.removal_message(entity)
   }
 end
 
+-- (K22, /f3d-perf mined_tell) An entity the bridge itself is about to remove where Factorio raises nothing (a
+-- player-less character's mining): what listens hears of it now, as M.removed's listeners do (the belt simulation
+-- drops its lanes next tick). The removal message is the caller's, once it happened: should the mining fail, what
+-- listened only works the place out again.
+function M.removing(entity)
+  if entity and entity.valid then
+    tell(entity)
+  end
+end
+
 -- Called while the entity is still valid (before it is removed).
 function M.removed(entity)
   tell(entity)
+  local s = storage.f3d
+  if s.wire_sigs and entity.valid and entity.unit_number then
+    s.wire_sigs[entity.unit_number] = nil
+    if s.wire_at then
+      s.wire_at[entity.unit_number] = nil
+    end
+  end
   fluid_neighbours_changed(entity, true)
   local msg = M.removal_message(entity)
   if msg then
@@ -205,12 +266,69 @@ local function watch_wires(s)
     end
   end
   s.wire_sigs = seen
+  s.wire_at, s.wire_in = nil, nil
+end
+
+-- wire_strips (perf.lua): the focus square in WIRE_STRIPS strips of rows, one each run, so each wire is
+-- looked at every 4 s (8 x 30 ticks) instead of every half second; the whole square cost 13.5 ms (up to
+-- 49) on one tick twice a second on the owner's base. The client's own wire tools send their change at
+-- once (wiring.lua) and built or mined entities carry their wires in their records: what is left for
+-- this look is another player's hand, a blueprint pasted over poles and scripts, now up to 4 s late.
+-- An entity belongs to the strip its centre is in. Each strip's signatures are merged into
+-- s.wire_sigs (unit -> signature); s.wire_at (unit -> strip) and s.wire_in (strip -> {unit = true})
+-- forget the ones a strip no longer finds. All in storage, from on_tick.
+local WIRE_STRIPS = 8
+
+local function watch_wire_strip(s)
+  local types = registry.wired_types()
+  if #types == 0 then
+    return
+  end
+  local strip = (s.wire_strip or 0) % WIRE_STRIPS + 1
+  s.wire_strip = strip
+  s.wire_at = s.wire_at or {}
+  s.wire_in = s.wire_in or {}
+  local f = s.focus
+  local h = 2 * f.r / WIRE_STRIPS
+  local ya = f.y - f.r + (strip - 1) * h
+  local yb = strip == WIRE_STRIPS and f.y + f.r or ya + h
+  local found = world.surface().find_entities_filtered({
+    area = { { f.x - f.r, ya }, { f.x + f.r, yb } },
+    type = types,
+  })
+  rate.read("wires", #found)
+  local sigs, at = s.wire_sigs, s.wire_at
+  local mine = {}
+  for _, e in pairs(found) do
+    local unit = e.unit_number
+    local y = unit and e.position.y
+    if unit and y >= ya and (y < yb or strip == WIRE_STRIPS) then
+      local sig = world.wire_signature(e)
+      local before = sigs[unit]
+      sigs[unit], at[unit], mine[unit] = sig, strip, true
+      if before and before ~= sig and watched(e) then
+        transport.send_reliable({ t = "upd", e = world.record(e) })
+        pcall(belt_switch.rewired, e)
+      end
+    end
+  end
+  -- Gone from this strip, and not found in another since: forgotten (as the whole look's replace did).
+  for unit in pairs(s.wire_in[strip] or {}) do
+    if not mine[unit] and at[unit] == strip then
+      sigs[unit], at[unit] = nil, nil
+    end
+  end
+  s.wire_in[strip] = mine
 end
 
 function M.tick()
   local s = storage.f3d
   if rate.due("wires", WIRE_INTERVAL) then
-    watch_wires(s)
+    if perf.on("wire_strips") then
+      watch_wire_strip(s)
+    else
+      watch_wires(s)
+    end
   end
   if #s.pipe_refresh > 0 then
     local pending = s.pipe_refresh
@@ -306,9 +424,12 @@ function M.register()
     end
   end)
 
+  -- A player's R in the game: an underground pair turns together (M.rotated).
+  script.on_event(defines.events.on_player_rotated_entity, function(event)
+    M.rotated(event.entity)
+  end)
   -- Marks for deconstruction and upgrade show in the record (extra.d, extra.up).
   script.on_event({
-    defines.events.on_player_rotated_entity,
     defines.events.on_player_flipped_entity,
     defines.events.on_marked_for_deconstruction,
     defines.events.on_cancelled_deconstruction,

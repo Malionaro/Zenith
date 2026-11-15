@@ -33,9 +33,10 @@ const DEFAULTS := {
 		"vsync": true,
 		"fps_cap": 0,  # 0: unlimited
 		"render_scale": 1.0,
-		# off, fxaa, smaa, taa, msaa2, msaa4, msaa8. SMAA: sharper than FXAA and on the owner's desktop
-		# cheaper (10.7 against 11.4 ms of GPU standing), and it works under every look, where MSAA
-		# doesn't under a look with its own passes (MSAA_UNDER_LOOK).
+		# off, fxaa, smaa, taa, msaa2, msaa4, msaa8. SMAA: sharper than FXAA for about 0.3 ms more GPU
+		# at 4K on the owner's desktop (a run with the PC in use had it cheaper, 10.7 against 11.4 ms
+		# standing), and it works under every look, where MSAA doesn't under a look with its own passes
+		# (MSAA_UNDER_LOOK). Under TAA it is left out (screen_space_aa_for).
 		"antialiasing": "smaa",
 		# How the world is lit and graded (looks.gd): "factorio" (matched to Factorio's pictures),
 		# "classic" (Zenith's look before 0.1.4), or an add-on's look
@@ -57,7 +58,9 @@ const DEFAULTS := {
 		# it makes Godot's depth pre-pass write every pixel's normal and roughness: 6-7 ms of GPU on the
 		# laptop before the weathering left that pass (PERFORMANCE-AUDIT.md, item 2), about 0.7 ms on
 		# the desktop since. Only drawn zoomed in: ao_zoom.gd fades it out with the zoom and switches it
-		# off past that, so a zoomed-out view pays nothing for it.
+		# off past that, about 140 tiles off at 1080p (185 at 1440p, 280 at 4K). Godot's own fade
+		# (SSAO_FADE) has hidden it by 140 tiles from the camera, so between there and the switch, at
+		# 1440p and 4K, it is still paid for where none of it shows.
 		"ssao": true,
 		# The dark rim on the ground round each building's foot that Factorio's sprites have
 		# (contact_shade.gd): one MultiMesh per chunk, on in every preset.
@@ -87,6 +90,7 @@ const DEFAULTS := {
 		"decoratives": true,  # grass, flowers and small rocks from Factorio (scripts/world/decoratives.gd)
 		"decorative_density": 1.0,  # the share of them drawn, 0.1 to 1
 		"grass_3d": "normal",  # grass and low plants near the character in 3D: off, short, normal, far (decoratives.gd)
+		"smog": 0.5,  # how thick the haze over polluted ground is, 0 (none) to 1 (pollution.gd, shaders/smog.gdshader)
 		"brightness": 1.0,  # 0.5 to 1.5, as Factorio's sliders
 		"contrast": 1.0,
 		"saturation": 1.0,
@@ -120,15 +124,20 @@ const DEFAULTS := {
 		"research_progress": true,  # the research in progress, top right
 		"alerts": true,  # alert icons over the shortcut bar
 		"smart_belt_building": true,  # Factorio's: dragged belts jump obstacles with undergrounds
-		"lock_belt_straight": false,  # Factorio's "Lock belt building to straight line"
+		# Factorio's "Lock belt building to straight line": on, belts drag along the held belt's line as
+		# Factorio 2.x always does (it dropped the setting); off, Zenith's own drag round corners
+		"lock_belt_straight": true,
 	},
 	"camera": {
 		"default_view": "angled",  # angled, factorio, first_person
-		"follow_hills": false,  # the camera rises and falls with an add-on's hills (api.terrain); off: stays level (owner)
+		# Gone from Settings (issue #17: the camera is always on the character, hills too); read only by
+		# --camera-focus=off's old camera, which rose and fell with an add-on's hills when it was on
+		"follow_hills": false,
 		"look_sensitivity": 1.0,
 		"invert_y": false,
 		"orthographic": false,  # the angled view's projection; Factorio's view (F6) is always orthographic
 		"map_orthographic": true,  # the remote view's, from the map (F7 switches the view in use)
+		"first_person_orthographic": false,  # first person's (owner's I19: each view keeps its own; F7 switches)
 		"max_zoom": 140,  # how far the wheel zooms out, in tiles from the focus
 		"map_zoom_out": 240,  # the map's remote view: how far out before the map comes back (tiles)
 	},
@@ -146,6 +155,8 @@ const DEFAULTS := {
 		"use_factorio_settings": true,
 		# Ctrl+F9 swapping: Factorio's window minimised while Zenith is in front (game_swap.gd)
 		"minimize_factorio": true,
+		# the main menu's Connect to address: what was typed last (a server on another PC's relay)
+		"last_address": "",
 	},
 	# action -> "<primary>,<alternative>" key names (OS.get_keycode_string, with modifiers such as
 	# "Shift+R"; an empty slot is unbound). Only rebound actions are written.
@@ -178,8 +189,8 @@ static func write_engine_overrides() -> void:
 ## dearest. High is the defaults; every setting stays its own, and the preset shows "Custom" once
 ## any of these differs from all of them (preset_now()). High and Ultra have SSAO since its tuned form
 ## (apply_ssao) measured about 0.7 ms of GPU at the mock's busy base on a desktop card
-## (PERFORMANCE-AUDIT.md), and ao_zoom.gd switches it off zoomed out. Anti-aliasing isn't a preset's:
-## SMAA (the default) costs about what FXAA does.
+## (PERFORMANCE-AUDIT.md), and ao_zoom.gd fades it out zoomed out. Anti-aliasing isn't a preset's:
+## SMAA (the default) costs a little more than FXAA (about 0.3 ms at 4K on the owner's desktop).
 const PRESETS := {
 	"low": {"shadows": "low", "ssao": false, "lod_quality": "low", "view_radius": 5, "entity_radius": 96,
 		"belt_updates": 2000, "belt_distance": 64, "decorative_distance": 96, "decorative_density": 0.5, "grass_3d": "off",
@@ -846,8 +857,8 @@ static func settle_antialiasing(root: Window) -> void:
 	apply_antialiasing(root)
 
 
-## MSAA, screen-space anti-aliasing and TAA on the window from the settings. TAA (the setting's or
-## the look's) goes with SMAA as it does with any screen-space choice: Godot runs both.
+## MSAA, screen-space anti-aliasing and TAA on the window from the settings. The look's TAA over the
+## setting's SMAA drops SMAA (screen_space_aa_for); FXAA stays with it.
 static func apply_antialiasing(root: Window) -> void:
 	if root == null or DisplayServer.get_name() == "headless":
 		return
@@ -855,10 +866,40 @@ static func apply_antialiasing(root: Window) -> void:
 	var msaa: int = MSAA.get(aa, Viewport.MSAA_DISABLED)
 	if root.msaa_3d != msaa:
 		root.msaa_3d = msaa as Viewport.MSAA
-	var ss: int = SCREEN_SPACE_AA.get(aa, Viewport.SCREEN_SPACE_AA_DISABLED)
+	var ss := screen_space_aa_for(aa, taa_on())
+	_smaa_held = aa == "smaa" and ss != Viewport.SCREEN_SPACE_AA_SMAA
 	if root.screen_space_aa != ss:
 		root.screen_space_aa = ss as Viewport.ScreenSpaceAA
 	root.use_taa = taa_on()
+
+
+## The screen-space anti-aliasing drawn for an anti-aliasing choice: none under TAA in place of SMAA.
+## TAA already resolves the edges, and SMAA's three full-screen passes kept running over it: 0.37-0.40 ms
+## of GPU at 4K under the Cinematic look with its TAA on (measured on the owner's desktop) for nothing.
+static func screen_space_aa_for(aa: String, taa: bool) -> int:
+	if aa == "smaa" and taa:
+		return Viewport.SCREEN_SPACE_AA_DISABLED
+	return int(SCREEN_SPACE_AA.get(aa, Viewport.SCREEN_SPACE_AA_DISABLED))
+
+
+## SMAA left out because TAA is on, to come back when TAA goes.
+static var _smaa_held := false
+
+
+## A look's TAA turned on or off in a running game (looks.gd): SMAA goes with it and comes back after,
+## and nothing else changes until apply_antialiasing (a saved MSAA under a look waits for the next
+## start: settle_antialiasing).
+static func follow_taa(vp: Viewport) -> void:
+	if vp == null:
+		return
+	vp.use_taa = taa_on()
+	if vp.use_taa and vp.screen_space_aa == Viewport.SCREEN_SPACE_AA_SMAA:
+		vp.screen_space_aa = Viewport.SCREEN_SPACE_AA_DISABLED
+		_smaa_held = true
+	elif not vp.use_taa and _smaa_held:
+		_smaa_held = false
+		if vp.screen_space_aa == Viewport.SCREEN_SPACE_AA_DISABLED:
+			vp.screen_space_aa = Viewport.SCREEN_SPACE_AA_SMAA
 
 
 ## A Resolution setting ("1920x1080") as a size; (0, 0) for none or one too small to use.

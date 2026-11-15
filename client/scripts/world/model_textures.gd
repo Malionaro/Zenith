@@ -8,19 +8,45 @@ extends RefCounted
 ## (Blender's Image Texture node set to Closest, which its exporter writes so) is marked
 ## NEAREST_META, and the model shader draws it crisp, texel by texel, still mipmapped far away
 ## (modeller's request: hand-painted low-resolution textures read better unblended).
+##
+## Pictures are shared between models (share): a modeller's files each carry their own copy of the
+## pictures they use (Vasillo's 39 models bring 188 textures of 48 different pictures, about 1.7 GB of
+## video memory mipmapped against 0.5 GB shared), so each is made once, found by a hash of its bytes
+## as stored in the file, or failing that of its pixels once decoded.
+##
+## A material marked Alpha Blend whose base colour is fully opaque, colour and picture alike (no alpha
+## channel, or every pixel's alpha 255), is drawn as the solid thing it is (opaque_blend): Vasillo's
+## belt surface is marked BLEND with a picture that has no alpha, and the see-through shader put the
+## top of every belt, splitter and underground in the transparent pass (sorted, blended, left out of
+## the depth pre-pass and so of SSAO and contact shading).
 
 ## Meta on a Texture2D: a SMALL x SMALL Image of it (RGBA8, sRGB as stored).
 const SMALL_META := &"f3d_small"
 const SMALL := 64
 ## Meta on a Texture2D: true when its glTF sampler filters NEAREST.
 const NEAREST_META := &"f3d_nearest"
+## Meta on a Texture2D: true when every pixel of its picture is opaque (no alpha channel, or all 255).
+const OPAQUE_META := &"f3d_opaque"
 const GL_NEAREST := 9728
 const GL_NEAREST_MIPMAP_NEAREST := 9984
 const GL_NEAREST_MIPMAP_LINEAR := 9986
 
+## --share-textures=off: every model's pictures its own, as before 0.2.1 (for comparing).
+static var share := not ("--share-textures=off" in OS.get_cmdline_user_args())
+## --opaque-blend=off: Alpha Blend materials stay see-through whatever their picture (for comparing).
+static var opaque_blend := not ("--opaque-blend=off" in OS.get_cmdline_user_args())
+## Shared pictures: "<md5 of the file's bytes> <crisp>" or "px <hash of the pixels> <size> <crisp>" ->
+## the mipmapped texture. Read and written by the workers that load models, under _lock.
+static var _shared := {}
+static var _lock := Mutex.new()
+## Pictures made, and those found already made (for tests and probes).
+static var made_count := 0
+static var shared_count := 0
+
 
 ## Mipmapped copies of the base colour and roughness textures of every material in `state`, read
-## from the .glb at `path`. Worker-thread safe (Image and ImageTexture work).
+## from the .glb at `path`; Alpha Blend materials whose base colour is opaque turned solid.
+## Worker-thread safe (Image and ImageTexture work; the shared table is locked).
 static func prepare(path: String, state: GLTFState) -> void:
 	var materials := state.get_materials()
 	if materials.is_empty():
@@ -48,10 +74,27 @@ static func prepare(path: String, state: GLTFState) -> void:
 			if not done.has(tex):
 				done[tex] = _mipmapped(tex, state, images, nearest)
 			base.set_texture(param, done[tex])
+		if opaque_blend and solid_blend(base):
+			base.transparency = BaseMaterial3D.TRANSPARENCY_DISABLED
 
 
-## Image index -> the picture's bytes decoded, from the .glb's JSON and binary chunk; `nearest` gets
-## the image indices a NEAREST sampler draws.
+## True for an Alpha Blend material (glTF BLEND) that can't be see-through anywhere: its base colour's
+## alpha is 1 and its picture is opaque (OPAQUE_META, set when the picture is decoded). Emissive ones
+## stay see-through: a glowing plume fades out with its machine (factorio_material's glow_fades).
+static func solid_blend(base: BaseMaterial3D) -> bool:
+	if base == null or base.emission_enabled:
+		return false
+	# Godot's glTF reader makes BLEND alpha with a depth pre-pass.
+	if base.transparency != BaseMaterial3D.TRANSPARENCY_ALPHA and base.transparency != BaseMaterial3D.TRANSPARENCY_ALPHA_DEPTH_PRE_PASS:
+		return false
+	if base.albedo_color.a < 0.999 or base.albedo_texture == null:
+		return false
+	return bool(base.albedo_texture.get_meta(OPAQUE_META, false))
+
+
+## Image index -> [the picture's bytes as stored, its mime type], from the .glb's JSON and binary
+## chunk; `nearest` gets the image indices a NEAREST sampler draws. Decoded only when no model made
+## the same picture before (_mipmapped).
 static func _images(path: String, nearest: Dictionary) -> Dictionary:
 	var out := {}
 	var f := FileAccess.open(path, FileAccess.READ)
@@ -86,34 +129,87 @@ static func _images(path: String, nearest: Dictionary) -> Dictionary:
 			continue
 		var view: Dictionary = views[int(pic["bufferView"])]
 		var start := int(view.get("byteOffset", 0))
-		var bytes := bin.slice(start, start + int(view["byteLength"]))
-		var img := Image.new()
-		var mime := str(pic.get("mimeType", ""))
-		var err := img.load_jpg_from_buffer(bytes) if mime == "image/jpeg" else img.load_png_from_buffer(bytes)
-		if err == OK:
-			out[src] = img
+		out[src] = [bin.slice(start, start + int(view["byteLength"])), str(pic.get("mimeType", ""))]
 	return out
+
+
+static func _decode(pic: Array) -> Image:
+	var img := Image.new()
+	var bytes: PackedByteArray = pic[0]
+	var err := img.load_jpg_from_buffer(bytes) if str(pic[1]) == "image/jpeg" else img.load_png_from_buffer(bytes)
+	return img if err == OK else null
 
 
 static func _mipmapped(tex: Texture2D, state: GLTFState, images: Dictionary, nearest: Dictionary) -> Texture2D:
 	# GLTFState keeps the file's images in its order: this texture's index there is the file's.
-	var img: Image = null
-	var crisp := false
+	var src := -1
 	var made := state.get_images()
 	for i in made.size():
 		if made[i] == tex and images.has(i):
-			img = images[i]
-			crisp = nearest.has(i)
+			src = i
+	if src < 0:
+		return tex
+	var crisp := nearest.has(src)
+	var pic: Array = images[src]
+	var bytes: PackedByteArray = pic[0]
+	var file_key := ""
+	if share:
+		var ctx := HashingContext.new()
+		ctx.start(HashingContext.HASH_MD5)
+		ctx.update(bytes)
+		file_key = "%s %d %s" % [ctx.finish().hex_encode(), bytes.size(), crisp]
+		var known := _find(file_key)
+		if known != null:
+			return known
+	var img := _decode(pic)
 	if img == null:
 		return tex
 	if img.get_format() != Image.FORMAT_RGBA8 and img.get_format() != Image.FORMAT_RGB8:
 		img.convert(Image.FORMAT_RGBA8)
+	var pixel_key := ""
+	if share:
+		# The same picture written to another file with other bytes (another exporter's PNG settings).
+		pixel_key = "px %d %d %dx%d %d %s" % [hash(img.get_data()), img.get_data().size(), img.get_width(), img.get_height(),
+			img.get_format(), crisp]
+		var known := _find(pixel_key)
+		if known != null:
+			_keep(file_key, known)
+			return known
+	var opaque := img.detect_alpha() == Image.ALPHA_NONE
 	var small := img.duplicate() as Image
 	small.convert(Image.FORMAT_RGBA8)
 	small.resize(SMALL, SMALL, Image.INTERPOLATE_BILINEAR)
 	img.generate_mipmaps()
 	var out := ImageTexture.create_from_image(img)
 	out.set_meta(SMALL_META, small)
+	out.set_meta(OPAQUE_META, opaque)
 	if crisp:
 		out.set_meta(NEAREST_META, true)
+	if share:
+		# Another worker may have made the same picture meanwhile: the first one kept is everyone's.
+		_lock.lock()
+		var first: Variant = _shared.get(pixel_key)
+		if first == null:
+			_shared[pixel_key] = out
+			made_count += 1
+		else:
+			out = first
+			shared_count += 1
+		_shared[file_key] = out
+		_lock.unlock()
 	return out
+
+
+static func _find(key: String) -> Texture2D:
+	_lock.lock()
+	var known: Texture2D = _shared.get(key)
+	if known != null:
+		shared_count += 1
+	_lock.unlock()
+	return known
+
+
+static func _keep(key: String, tex: Texture2D) -> void:
+	_lock.lock()
+	_shared[key] = tex
+	_lock.unlock()

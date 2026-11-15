@@ -14,6 +14,7 @@ const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
 const InterfaceState := preload("res://scripts/ui/interface_state.gd")
 const LocaleNames := preload("res://scripts/world/locale_names.gd")
+const GroundHeight := preload("res://scripts/world/ground_height.gd")
 ## The red no-power alert, depth tested like alert_icons.gd's (no flicker, hidden behind buildings).
 const IconShader := preload("res://shaders/billboard_icon_cut.gdshader")
 
@@ -208,7 +209,8 @@ func _update_windows() -> void:
 		var face := _south_face(rec, proto)
 		var middle := top * WINDOW_MIDDLE
 		var size := Vector2(WINDOW_SIZE.x, minf(WINDOW_SIZE.y, top * 0.6))
-		var at := Vector3(rec.pos.x, middle, face)
+		# Over an add-on's hills (ground_height.gd), as the tank's model is lifted in its shader.
+		var at := Vector3(rec.pos.x, middle + GroundHeight.at(rec.pos.x, face), face)
 		xforms.append(Transform3D(Basis.from_scale(Vector3(size.x + 0.08, size.y + 0.08, 0.03)), at))
 		colors.append(Color(0.08, 0.09, 0.1))
 		if fill > 0.0:

@@ -11,6 +11,7 @@ extends Node
 
 const Settings := preload("res://scripts/menu/settings.gd")
 const Probing := preload("res://scripts/debug/probing.gd")
+const NatureLooks := preload("res://scripts/world/nature_looks.gd")
 const WARMUP := 15.0
 ## --probe-warmup=<s>: a longer warm-up (a big save at long distances takes a while to load); with
 ## --probe-variants the variants also wait until no chunk is left to build (or 3 minutes).
@@ -143,6 +144,14 @@ var _pre_usec := 0
 var _post_usec := 0
 var _world_prof := {}
 var _cards_prof := {}
+## Godot's five pipeline counters last frame, apart (the frame's `pipelines` adds them up): `pl_draw`
+## are the ones a draw waited for, `pl_surface` those an instance's first surface cache started
+## (pipeline_warm.gd's, out of view), `pl_spec` the specialised ones made in the background.
+const PIPELINE_MONITORS := {"pl_canvas": Performance.PIPELINE_COMPILATIONS_CANVAS, "pl_mesh": Performance.PIPELINE_COMPILATIONS_MESH,
+	"pl_surface": Performance.PIPELINE_COMPILATIONS_SURFACE, "pl_draw": Performance.PIPELINE_COMPILATIONS_DRAW,
+	"pl_spec": Performance.PIPELINE_COMPILATIONS_SPECIALIZATION}
+var _pipelines_before := {}
+var _probing_prof := {}
 var _shots := 0
 var _nodes := 0
 var _merged: Array = []
@@ -222,8 +231,16 @@ func _counters() -> Dictionary:
 	for m in [Performance.PIPELINE_COMPILATIONS_CANVAS, Performance.PIPELINE_COMPILATIONS_MESH, Performance.PIPELINE_COMPILATIONS_SURFACE,
 			Performance.PIPELINE_COMPILATIONS_DRAW, Performance.PIPELINE_COMPILATIONS_SPECIALIZATION]:
 		pipelines += int(Performance.get_monitor(m))
+	# Of those, the ones compiled at draw time (the renderer waits for them) and ahead of it (when a mesh
+	# or surface is made, and the specialized ones in the background), and the GPU memory textures and
+	# buffers take: a frame's uploads (render thread) show as a step.
 	return {"pipelines": pipelines, "model": ModelLibrary.load_usec, "lods": ModelLods.main_usec, "rebuild": world.entity_build_usec,
-		"terrain": world.terrain_build_usec, "handle": int(Bridge.stats.get("handle_usec", 0)), "loads": ModelLibrary.loads}
+		"terrain": world.terrain_build_usec, "handle": int(Bridge.stats.get("handle_usec", 0)), "loads": ModelLibrary.loads,
+		"pipes_draw": int(Performance.get_monitor(Performance.PIPELINE_COMPILATIONS_DRAW)),
+		"pipes_spec": int(Performance.get_monitor(Performance.PIPELINE_COMPILATIONS_SPECIALIZATION)),
+		"pipes_mesh": int(Performance.get_monitor(Performance.PIPELINE_COMPILATIONS_MESH)) + int(Performance.get_monitor(Performance.PIPELINE_COMPILATIONS_SURFACE)),
+		"tex_mem": int(Performance.get_monitor(Performance.RENDER_TEXTURE_MEM_USED)),
+		"buf_mem": int(Performance.get_monitor(Performance.RENDER_BUFFER_MEM_USED))}
 
 
 func _process(delta: float) -> void:
@@ -264,6 +281,13 @@ func _process(delta: float) -> void:
 		_step_variant(delta)
 	var vp := get_viewport().get_viewport_rid()
 	var f: Vector2 = world.focus()
+	var phases := _phases()
+	for k in ["pipes_draw", "pipes_spec", "pipes_mesh"]:
+		if c[k] != _before[k]:
+			phases[k] = c[k] - _before[k]
+	for k in ["tex_mem", "buf_mem"]:
+		if absi(c[k] - _before[k]) >= 1 << 20:  # 1 MB
+			phases[k] = snappedf((c[k] - _before[k]) / 1048576.0, 0.1)
 	(_frames if walking else _load_frames).append([(now - _last_usec) / 1000.0, (c["model"] - _before["model"]) / 1000.0,
 		(c["lods"] - _before["lods"]) / 1000.0, (c["rebuild"] - _before["rebuild"]) / 1000.0,
 		(c["terrain"] - _before["terrain"]) / 1000.0, (c["handle"] - _before["handle"]) / 1000.0,
@@ -271,7 +295,7 @@ func _process(delta: float) -> void:
 		c["loads"] - _before["loads"], snappedf(f.x, 0.1), snappedf(f.y, 0.1), Bridge.server_tick,
 		(now - _start.at) / 1000.0, Performance.get_monitor(Performance.TIME_PHYSICS_PROCESS) * 1000.0, _segments(),
 		c["pipelines"] - _before["pipelines"], int(Performance.get_monitor(Performance.RENDER_TOTAL_DRAW_CALLS_IN_FRAME)),
-		int(Performance.get_monitor(Performance.RENDER_TOTAL_PRIMITIVES_IN_FRAME)), _alive(), _phases(), _passes(vp)] + _pass_times())
+		int(Performance.get_monitor(Performance.RENDER_TOTAL_PRIMITIVES_IN_FRAME)), _alive(), phases, _passes(vp)] + _pass_times())
 	_last_usec = now
 	_before = c
 	_end_usec = Time.get_ticks_usec()
@@ -348,6 +372,14 @@ func _phases() -> Dictionary:
 		if ms > 0.05:
 			out["w_" + str(k)] = snappedf(ms, 0.01)
 	_world_prof = world.prof.duplicate()
+	for k: String in PIPELINE_MONITORS:
+		var n := int(Performance.get_monitor(PIPELINE_MONITORS[k]))
+		if _pipelines_before.has(k) and n > int(_pipelines_before[k]):
+			out[k] = n - int(_pipelines_before[k])
+		_pipelines_before[k] = n
+	const PipelineWarm := preload("res://scripts/world/pipeline_warm.gd")
+	if PipelineWarm.pending_count() > 0:
+		out["warming"] = PipelineWarm.pending_count()
 	# The item kinds' (belt and ground items) main-thread parts (item_cards.gd prof): w_ic_<key>.
 	const ItemCards := preload("res://scripts/world/item_cards.gd")
 	for k in ItemCards.prof:
@@ -355,6 +387,13 @@ func _phases() -> Dictionary:
 		if ms > 0.05:
 			out["w_ic_" + str(k)] = snappedf(ms, 0.01)
 	_cards_prof = ItemCards.prof.duplicate()
+	# The once-a-join work spread over frames (probing.gd prof: movers' mv_*, decoratives' dc_*, ground
+	# items' gi_*, terrain textures' tt_*): w_<key>.
+	for k in Probing.prof:
+		var ms := (int(Probing.prof[k]) - int(_probing_prof.get(k, 0))) / 1000.0
+		if ms > 0.05:
+			out["w_" + str(k)] = snappedf(ms, 0.01)
+	_probing_prof = Probing.prof.duplicate()
 	# What waits: chunks to build, chunks with MultiMeshes still to add (and how many), terrain.
 	out["q_dirty"] = world._dirty.size()
 	out["q_pending"] = world._pending.size()
@@ -379,10 +418,14 @@ func _phases() -> Dictionary:
 		_shots = Main.screenshots
 		out["shot"] = 1
 	out["q_messages"] = Bridge.waiting_count()
+	out["q_messages_ms"] = Bridge.waiting_msec()  # how long the oldest of them has waited
 	out["q_undrawn"] = world.undrawn()
 	out["q_near_undrawn"] = world.near_undrawn
 	# The sliced systems' books this frame (frame_budget.gd): {system: [µs used, µs granted, waiting]}.
 	out["fb"] = preload("res://scripts/world/frame_budget.gd").snapshot()
+	# The frame's other scripts as the budget measured them (µs), and Godot's TIME_PROCESS beside it.
+	out["fb_other"] = preload("res://scripts/world/frame_budget.gd").other_usec
+	out["time_process"] = snappedf(Performance.get_monitor(Performance.TIME_PROCESS) * 1000.0, 0.01)
 	var nodes := int(Performance.get_monitor(Performance.OBJECT_NODE_COUNT))
 	out["nodes_delta"] = nodes - _nodes
 	_nodes = nodes
@@ -536,7 +579,9 @@ func _atlas_now() -> int:
 	var fitter: Node = world.get_parent().get_node_or_null("SunShadows")
 	if fitter == null:
 		return Settings.shadow_size()
-	return int(fitter.LEGACY_ATLAS[fitter.quality]) if fitter.legacy else int(fitter.spec["atlas"])
+	if fitter.legacy:
+		return int(fitter.LEGACY_ATLAS[fitter.quality])
+	return int(fitter.atlas) if int(fitter.atlas) > 0 else int(fitter.spec["atlas"])
 
 
 func _soft_now() -> int:
@@ -610,8 +655,29 @@ func _set_variant(name: String, on: bool) -> void:
 			_base["bias"] = ModelLods.lod_bias
 		ModelLods.lod_bias = float(name.get_slice(" ", 2)) if on else float(_base["bias"])
 		return
+	# "lod lines 0": levels of detail, shadow stand-ins and SSAO counted in every real line, as before
+	# 0.2.1; "lod lines 1080" on 1080 (model_lods.gd max_lines).
+	if name.begins_with("lod lines "):
+		const ModelLods := preload("res://scripts/world/model_lods.gd")
+		if not _base.has("lines"):
+			_base["lines"] = ModelLods.max_lines
+		ModelLods.max_lines = float(name.get_slice(" ", 2)) if on else float(_base["lines"])
+		ModelLods.fit_lines(get_viewport())
+		return
 	if name.begins_with("shadow distance "):
 		sun.directional_shadow_max_distance = float(name.get_slice(" ", 2)) if on else float(_base["distance"])
+		return
+	# sun_shadows.gd's --soft-shadow-atlas for this step ("soft shadow atlas 0": the quality's own map,
+	# as before it was on by default; 4096: at most 4096) while the sun has an angular size (a look's soft
+	# shadows); nothing changes without one.
+	if name.begins_with("soft shadow atlas "):
+		if fitter != null:
+			const SunShadows := preload("res://scripts/world/sun_shadows.gd")
+			if not _base.has("soft_cap"):
+				_base["soft_cap"] = SunShadows.soft_atlas_cap
+			SunShadows.soft_atlas_cap = maxi(int(name.get_slice(" ", 3)), 0) if on else int(_base["soft_cap"])
+			fitter.apply_atlas(true)
+			print("VARIANT %s: atlas %d" % [name, fitter.atlas])
 		return
 	if name.begins_with("shadow atlas "):
 		RenderingServer.directional_shadow_atlas_set_size(int(name.get_slice(" ", 2)) if on else int(_base["atlas"]), true)
@@ -661,6 +727,8 @@ func _set_variant(name: String, on: bool) -> void:
 		print("VARIANT %s: %d nodes stop casting" % [name, _uncast.size()])
 		return
 	match name:
+		"leaf atlas off":  # the shader's own leaves on every tree (nature_looks.gd), the atlas's cost
+			NatureLooks.show_atlas(not on)
 		"ssao off":
 			env.ssao_enabled = not on
 		"ssao low":
@@ -722,6 +790,12 @@ func _set_variant(name: String, on: bool) -> void:
 			Settings.set_value("graphics", "lod_quality", "low" if on else str(_base["lod"]), false)
 		"decoratives off":
 			Settings.set_value("graphics", "decoratives", not on, false)
+		"relief off":  # the ground's bumps and crevices (terrain.gdshader ground_relief)
+			const Visuals := preload("res://scripts/world/visuals.gd")
+			if on:
+				Visuals.terrain_material().set_shader_parameter("ground_relief", false)
+			else:
+				Visuals.set_ground_relief(str(_base["lod"]) != "low")
 		"tree shadows off":
 			const ModelLibrary := preload("res://scripts/world/model_library.gd")
 			var tree_meshes := {}
@@ -897,6 +971,19 @@ func _finish() -> void:
 	print("STUTTER chunks drawn while walking %d: wanted to drawn p50 %.0f p99 %.0f worst %.0f ms; came within 2 chunks of the focus still not drawn %d, from then: p50 %.0f p99 %.0f worst %.0f ms; still not drawn at the end %d; overruns %s" % [
 		lat_ms.size(), pct(lat_ms, 0.5), pct(lat_ms, 0.99), pct(lat_ms, 1.0), near_ms.size(), pct(near_ms, 0.5), pct(near_ms, 0.99), pct(near_ms, 1.0),
 		world.undrawn(), JSON.stringify(preload("res://scripts/world/frame_budget.gd").overruns)])
+	# The bridge's queue (bridge.gd _drain): messages read but not handled yet, and how long the oldest
+	# of them had waited, each frame; and the frames whose slice was raised for it (--message-catchup).
+	for phase in ["load", "walk"]:
+		var counts: Array = []
+		var ages: Array = []
+		for r: Array in (_load_frames if phase == "load" else _frames):
+			if r.size() > 19 and r[19] is Dictionary:
+				counts.append(float((r[19] as Dictionary).get("q_messages", 0)))
+				ages.append(float((r[19] as Dictionary).get("q_messages_ms", 0)))
+		print("STUTTER messages waiting %s: p50 %.0f p99 %.0f most %.0f; the oldest had waited p50 %.0f p99 %.0f most %.0f ms" % [
+			phase, pct(counts, 0.5), pct(counts, 0.99), pct(counts, 1.0), pct(ages, 0.5), pct(ages, 0.99), pct(ages, 1.0)])
+	print("STUTTER messages caught up (their whole slice for having waited over %d ms) in %d frames (--message-catchup %s)" % [
+		Bridge.catchup_usec / 1000, int(preload("res://scripts/world/frame_budget.gd").catchups.get(&"messages", 0)), "on" if Bridge.message_catchup else "off"])
 	var bi: Node = world.get_parent().get_node_or_null("BeltItems")
 	var join := {"settled_s": snappedf(_settled_at, 0.01), "belt_load_done_s": snappedf(_belt_done_at, 0.01), "drawn_s": snappedf(_drawn_at, 0.01),
 		"elapsed_s": snappedf(_elapsed, 0.01), "belt_stats": bi.stats.duplicate() if bi != null else {}, "belt_flags": bi.flags_text() if bi != null else ""}

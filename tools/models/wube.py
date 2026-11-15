@@ -797,6 +797,11 @@ def main(argv):
             try:
                 import part_colors
                 part_colors.main(list(built))
+                # The creatures' skins (per vertex, creature_skin.py), which part_colors leaves to it.
+                import creature_skin
+                families = [f for f in creature_skin.FAMILIES if any(n == f or n.startswith(f + "-") for n in built)]
+                if families:
+                    creature_skin.main(families)
             except Exception as e:  # no Factorio install, no scipy: say so, the models still work
                 print("part colours not sampled (%s): run tools/models/part_colors.py %s" % (e, " ".join(built)))
     if not built and not skipped:

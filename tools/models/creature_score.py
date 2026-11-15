@@ -159,6 +159,12 @@ def space_references(raw):
         "big-strafer-pentapod": ({"layers": [strafer["base_animation"], strafer["animation"]]}, 0,
                                  "torso (legs left out)", legs),
         "big-wriggler-pentapod": (u["big-wriggler-pentapod"]["run_animation"], 0, "run, frame 0", {}),
+        # Its strike and corpse poses (creature_pose.py), as the biters' are scored.
+        "big-wriggler-pentapod-attack": (u["big-wriggler-pentapod"]["attack_parameters"]["animation"], 3,
+                                         "attack, frame 3", {}),
+        "big-wriggler-pentapod-corpse": (c["big-wriggler-pentapod-corpse"]["animation"],
+                                         frame_count(c["big-wriggler-pentapod-corpse"]["animation"]) - 1,
+                                         "corpse, last dying frame", {}),
         "gleba-spawner": (s["gleba-spawner"]["graphics_set"]["animations"], 0, "idle, frame 0", {}),
         "gleba-spawner-small": (s["gleba-spawner-small"]["graphics_set"]["animations"], 0, "idle, frame 0", {}),
         "gleba-spawner-corpse": (c["gleba-spawner-corpse"]["animation"], 0, "corpse", {}),

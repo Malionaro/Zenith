@@ -1,8 +1,8 @@
 extends Node3D
 ## Factorio's alert pictures over the entities they are about (a turret out of ammo, a machine out
-## of fuel or out of reach of poles, a ghost missing its material or robots, a train out of fuel...),
-## blinking like the game's, on the character's surface. One MultiMesh per kind. "No power" isn't
-## drawn here: fluids_power.gd draws it from `pw`.
+## of fuel or out of reach of poles, a drill with nothing left to mine, a ghost missing its material or
+## robots, a train out of fuel...), blinking like the game's, on the character's surface. One MultiMesh
+## per kind. "No power" isn't drawn here: fluids_power.gd draws it from `pw`.
 ##
 ## alerts.gd makes this and feeds it the mod's alert lists (the nearest of each kind).
 
@@ -20,6 +20,8 @@ const DRAWN := {
 	"train_fuel": ["fuel-icon-red.png", true], "train_path": ["no-path-icon.png", true],
 	"collector": ["asteroid-collector-path-blocked-icon.png", true], "launch": ["destination-full-icon.png", true],
 	"platform_storage": ["no-platform-storage-space-icon.png", true],
+	# J27: a mining drill whose status is no_minable_resources, Factorio's utility sprite resources_depleted_icon.
+	"depleted": ["resources-depleted-icon.png", true],
 }
 const SIZE := 1.0
 const BLINK := 1.0

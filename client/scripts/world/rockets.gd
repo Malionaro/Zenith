@@ -19,6 +19,7 @@ extends Node3D
 
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
+const GroundHeight := preload("res://scripts/world/ground_height.gd")
 
 const SoundBank := preload("res://scripts/fx/sound_bank.gd")
 const FxSettings := preload("res://scripts/fx/fx_settings.gd")
@@ -49,6 +50,8 @@ const SMOKE_FROM := 4.5
 const SMOKE_FULL := 7.5
 const SMOKE_TINT := Color(0.8, 0.8, 1.0, 0.8)
 const SMOKE_FPS := 30.0         # animation_speed 0.5
+## How far above the rocket's base (its nozzle) the smoke columns start, wrapping its tail.
+const SMOKE_TOP := 1.5
 const JET_FPS := 30.0
 ## Round the hatch: x, the column's width, z (rocket_smoke_top1-3 and bottom1-2's places).
 const SMOKE_COLUMNS := [Vector3(-2.1, 3.6, -1.3), Vector3(0.5, 3.6, -2.0), Vector3(1.5, 3.6, -1.5), Vector3(-2.2, 3.6, 1.2), Vector3(1.9, 3.6, 1.3)]
@@ -132,16 +135,21 @@ func launch_positions() -> Array:
 
 
 ## The ridden rocket at `at` (silo, tiles): `height` above the silo (tiles) and how far its engine
-## has lit (0 to 1), from the game's flight (ride.gd). Starts the launch if `rk` hasn't yet.
-func drive(at: Vector2, height: float, ignition: float) -> void:
+## has lit (0 to 1), from the game's flight (ride.gd). Starts the launch if `rk` hasn't yet. False
+## while there is no silo there to start it from: a save loading mid-ride sends the ride before the
+## silo's chunk (the last launch in the list was read, an index error with none, or another silo's
+## launch driven); ride.gd asks again each frame, and the rocket comes once the silo has.
+func drive(at: Vector2, height: float, ignition: float) -> bool:
 	var l := _launch_at(at)
 	if l.is_empty():
-		_on_launch(0, at, "")
-		l = _launches[-1]
+		l = _start_launch(at, "")
+		if l.is_empty():
+			return false
 	l["driven"] = true
 	l["h"] = height
 	l["ign"] = ignition
 	l["seen"] = 0.0
+	return true
 
 
 func _launch_at(at: Vector2) -> Dictionary:
@@ -173,11 +181,16 @@ func in_shaft(at: Vector2) -> bool:
 
 
 func _on_launch(_silo: int, at: Vector2, launch_surface: String) -> void:
+	_start_launch(at, launch_surface)
+
+
+## A launch out of the silo at `at`, or {} when it isn't drawn here.
+func _start_launch(at: Vector2, launch_surface: String) -> Dictionary:
 	if surface != "" and launch_surface != "" and launch_surface != surface:
-		return
+		return {}
 	# Only out of a silo the world has: `rk` comes for every silo the force has, wherever it stands.
 	if movers != null and movers.world != null and not movers.world.has_near("rocket-silo", at, SILO_REACH):
-		return
+		return {}
 	var root := Node3D.new()
 	root.position = Vector3(at.x, -Visuals.ROCKET_SINK, at.y)
 	var body := MeshInstance3D.new()
@@ -188,7 +201,8 @@ func _on_launch(_silo: int, at: Vector2, launch_surface: String) -> void:
 		c.bottom_radius = 1.0
 		c.height = 12.0
 		body.mesh = c
-		body.position.y = 6.0
+		# Its plain material isn't lifted onto an add-on's hills, as the model's is: lifted here.
+		body.position.y = 6.0 + GroundHeight.at(at.x, at.y)
 	root.add_child(body)
 	var light := OmniLight3D.new()
 	light.light_color = Color(1.0, 0.65, 0.3)
@@ -196,8 +210,22 @@ func _on_launch(_silo: int, at: Vector2, launch_surface: String) -> void:
 	light.light_energy = 0.0
 	add_child(root)
 	add_child(light)
-	_launches.append({"node": root, "light": light, "at": at, "t": 0.0, "cards": {}, "steam": 0.0, "billow": 0.0, "trail": 0.0})
+	var l := {"node": root, "light": light, "at": at, "t": 0.0, "cards": {}, "steam": 0.0, "billow": 0.0, "trail": 0.0,
+		"ground": 0.0, "hills": -1}
+	_launches.append(l)
 	_sound("base/sound/silo-clamps-off", at, 0.8)
+	return l
+
+
+## The add-on's hills under a launch's silo (ground_height.gd): the rocket's model and the launch's
+## cards are lifted onto them in their shaders, the engines' light is placed here. Read when the
+## launch starts and again only when the hills change.
+func _ground(l: Dictionary) -> float:
+	if int(l["hills"]) != GroundHeight.version():
+		var at: Vector2 = l["at"]
+		l["hills"] = GroundHeight.version()
+		l["ground"] = GroundHeight.at(at.x, at.y)
+	return float(l["ground"])
 
 
 ## A card held in place by its launch or silo: it lives until kill(), moved and faded here each frame.
@@ -264,13 +292,13 @@ func _update_launches(delta: float) -> void:
 		(root.get_child(0) as MeshInstance3D).set_instance_shader_parameter("f3d_glow", ignition)  # rocket-static-emission
 		# Until the engines are out of the shaft their light comes up through the hatch.
 		var glow_y := maxf(y, HATCH_GLOW_HEIGHT)
-		light.position = Vector3(at.x, glow_y, at.y)
+		light.position = Vector3(at.x, glow_y + _ground(l), at.y)
 		light.light_energy = 6.0 * ignition * flicker
 		var far := 1.0 - clampf((climbed - 120.0) / 120.0, 0.0, 1.0)
 		var cards: Dictionary = l["cards"]
 		_held(cards, "jet", "rocket-jet", Vector3(at.x, y - 2.6, at.y), 6.5 + clampf(climbed / 20.0, 0.0, 2.5), ignition * flicker, Color.WHITE, JET_FPS)
 		_held(cards, "glare", "rocket-glare", Vector3(at.x, glow_y, at.y), 15.0, 0.75 * ignition * far * flicker)
-		_smoke_columns(cards, at, climbed)
+		_smoke_columns(cards, at, y, climbed)
 		_exhaust(l, delta, at, y, ignition, climbed)
 		var silo := _silo_at(at)
 		if not silo.is_empty():
@@ -290,16 +318,20 @@ func _update_launches(delta: float) -> void:
 		_launches.erase(l)
 
 
-## Factorio's smoke columns round the hatch (rocket_smoke_top1-3, bottom1-2), which come in once the
-## rocket is 4.5 to 7.5 tiles on its way and thin out as it goes.
-func _smoke_columns(cards: Dictionary, at: Vector2, climbed: float) -> void:
+## Factorio's smoke columns (rocket_smoke_top1-3, bottom1-2), which come in once the rocket is 4.5 to
+## 7.5 tiles on its way and thin out as it goes. I24: Factorio shifts them from the rocket's own
+## position, so they ride up with it round its tail; standing on the ground (as before) they hung
+## beside the middle of the rising rocket. Each hangs from just above the nozzle (`y`, the rocket's
+## base) down; the ground's clouds are _exhaust()'s billow, which stays at the silo.
+func _smoke_columns(cards: Dictionary, at: Vector2, y: float, climbed: float) -> void:
 	var alpha := clampf((climbed - SMOKE_FROM) / (SMOKE_FULL - SMOKE_FROM), 0.0, 1.0) * (1.0 - clampf((climbed - 90.0) / 110.0, 0.0, 1.0))
 	if alpha <= 0.0 and cards.is_empty():
 		return
 	for i in SMOKE_COLUMNS.size():
 		var spot: Vector3 = SMOKE_COLUMNS[i]
 		var width: float = spot.y
-		_held(cards, "smoke%d" % i, "rocket-smoke", Vector3(at.x + spot.x, width * 1.79 - 0.5, at.y + spot.z), width, alpha, SMOKE_TINT, SMOKE_FPS)
+		# The sheet's frames are 3.58 times as tall as wide: the card's middle is 1.79 widths down.
+		_held(cards, "smoke%d" % i, "rocket-smoke", Vector3(at.x + spot.x, y + SMOKE_TOP - width * 1.79, at.y + spot.z), width, alpha, SMOKE_TINT, SMOKE_FPS)
 
 
 ## Steam out of the hatch while the engines start, a billow across the ground as the exhaust comes

@@ -165,8 +165,20 @@ function M.tick()
       local cx, cy, radius = catch(e)
       now[u] = chunks_near(platform, cx, cy, radius)
       if before[u] then
+        -- Only chunks its filters take (none: all): one they leave alone also leaves the circle by
+        -- hitting the platform, and was counted as caught (a metallic chunk by a promethium-only
+        -- collector, live_check on 2.1.24).
+        local takes = nil
+        if #r[5] > 0 then
+          takes = {}
+          for _, name in ipairs(r[5]) do
+            takes[name] = true
+          end
+        end
         for _, g in ipairs(caught(before[u], now[u], cx, cy, radius)) do
-          grabs[#grabs + 1] = { u, g[1], world.fixed(g[2]), world.fixed(g[3]) }
+          if not takes or takes[g[1]] then
+            grabs[#grabs + 1] = { u, g[1], world.fixed(g[2]), world.fixed(g[3]) }
+          end
         end
       end
     end

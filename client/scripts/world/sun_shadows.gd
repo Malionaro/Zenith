@@ -27,12 +27,12 @@ extends Node
 ## (Light3D.shadow_blur, in texels). High's map has about half the texels a tile the old nearest
 ## split had, which blurred thin shadows such as a pole's lattice: blurring 0.6 texels keeps their
 ## edges as before. "items": how far the camera may be from the belt items round the character for
-## their models to cast shadows (belt_items.gd shadows_within).
+## their models to cast shadows (belt_items.gd shadows_within; 0 none: Low).
 const QUALITY := {
-	"low": {"splits": 1, "horizon_splits": 2, "atlas": 2048, "cap": 80.0, "fade": 0.8, "blend": false, "filter": RenderingServer.SHADOW_QUALITY_SOFT_VERY_LOW, "blur": 1.0, "items": 30.0},
-	"medium": {"splits": 1, "horizon_splits": 2, "atlas": 4096, "cap": 110.0, "fade": 0.8, "blend": false, "filter": RenderingServer.SHADOW_QUALITY_SOFT_LOW, "blur": 1.0, "items": 45.0},
-	"high": {"splits": 1, "horizon_splits": 4, "atlas": 4096, "cap": 150.0, "fade": 0.8, "blend": false, "filter": RenderingServer.SHADOW_QUALITY_SOFT_LOW, "blur": 0.6, "items": 60.0},
-	"ultra": {"splits": 1, "horizon_splits": 4, "atlas": 8192, "cap": 200.0, "fade": 0.8, "blend": true, "filter": RenderingServer.SHADOW_QUALITY_SOFT_LOW, "blur": 1.0, "items": 80.0},
+	"low": {"splits": 1, "horizon_splits": 2, "atlas": 2048, "cap": 80.0, "fade": 0.8, "blend": false, "filter": RenderingServer.SHADOW_QUALITY_SOFT_VERY_LOW, "blur": 1.0, "items": 0.0},
+	"medium": {"splits": 1, "horizon_splits": 2, "atlas": 4096, "cap": 110.0, "fade": 0.8, "blend": false, "filter": RenderingServer.SHADOW_QUALITY_SOFT_LOW, "blur": 1.0, "items": 30.0},
+	"high": {"splits": 1, "horizon_splits": 4, "atlas": 4096, "cap": 150.0, "fade": 0.8, "blend": false, "filter": RenderingServer.SHADOW_QUALITY_SOFT_LOW, "blur": 0.6, "items": 45.0},
+	"ultra": {"splits": 1, "horizon_splits": 4, "atlas": 8192, "cap": 200.0, "fade": 0.8, "blend": true, "filter": RenderingServer.SHADOW_QUALITY_SOFT_LOW, "blur": 1.0, "items": 60.0},
 }
 ## The view reaches "far" (cascades, horizon_splits) once the shadows' distance is this many times
 ## the nearest ground in view; back to one map below the second figure.
@@ -50,6 +50,23 @@ const MODES := {1: DirectionalLight3D.SHADOW_ORTHOGONAL, 2: DirectionalLight3D.S
 ## and model_lods.gd's levels of detail), for comparisons.
 const LEGACY_ATLAS := {"low": 2048, "medium": 4096, "high": 8192, "ultra": 8192}
 static var legacy := "--legacy-render" in OS.get_cmdline_user_args()
+## --soft-shadow-atlas=<size> (off by default: the quality's own map; 4096 measured): while the sun has an angular
+## size (a look's soft shadows, the Cinematic look's) its shadow map is at most this big. The penumbra
+## blurs away what Ultra's 8192 map adds, and on it the soft filter's blocker search and taps (8 + 8 a
+## lit pixel, on every layer of blended ground clutter) land twice as many texels apart, which the GPU's
+## texture cache handles worse. Measured at 4K on the owner's desktop under the Cinematic look at Ultra:
+## 1.5 ms less, a still the same (art-src/perf-plans/after.md 5); nothing at Low and High, whose maps
+## are 4096 or less. Off by default again (owner): close up on the character the soft shadows' edges came
+## out stair-stepped at 4096. The stutter probe's "soft shadow atlas <size>" sets it for one step.
+const SOFT_ATLAS_DEFAULT := 0
+static var soft_atlas_cap := _soft_atlas_arg()
+
+
+static func _soft_atlas_arg() -> int:
+	for arg in OS.get_cmdline_user_args():
+		if arg.begins_with("--soft-shadow-atlas="):
+			return maxi(int(arg.get_slice("=", 1)), 0)  # ("off" reads as 0)
+	return SOFT_ATLAS_DEFAULT
 
 var sun: DirectionalLight3D
 var quality := "high"
@@ -63,6 +80,8 @@ var distance_cap := 0.0
 var view_depths := Vector2.ZERO
 ## Whether the view reaches far now (Godot's cascades rather than one map).
 var far_view := false
+## The shadow atlas set now (atlas_for), 0 before the first.
+var atlas := 0
 
 
 func _ready() -> void:
@@ -99,10 +118,10 @@ func apply_legacy() -> void:
 ## Sets the shadows from a QUALITY entry (or one like it: --probe-variants' "fit ...").
 func apply_spec(s: Dictionary) -> void:
 	spec = s
-	BeltItems.shadows_within = float(spec.get("items", 60.0))
+	BeltItems.shadows_within = float(spec.get("items", 45.0))
 	if sun == null:
 		return
-	RenderingServer.directional_shadow_atlas_set_size(int(spec["atlas"]), true)
+	apply_atlas(true)
 	sun.directional_shadow_blend_splits = bool(spec["blend"])
 	sun.directional_shadow_fade_start = float(spec["fade"])
 	sun.shadow_blur = float(spec.get("blur", 1.0))
@@ -111,7 +130,29 @@ func apply_spec(s: Dictionary) -> void:
 
 
 func _process(_delta: float) -> void:
+	# A look's soft shadows come and go with the look (looks.gd sets the sun's angular size).
+	if soft_atlas_cap > 0:
+		apply_atlas(false)
 	_fit(false)
+
+
+## The atlas for the spec and the sun now, set when it changed (or `force`).
+func apply_atlas(force: bool) -> void:
+	if sun == null:
+		return
+	var want := atlas_for(spec, sun.light_angular_distance)
+	if force or want != atlas:
+		atlas = want
+		RenderingServer.directional_shadow_atlas_set_size(want, true)
+
+
+## The shadow atlas for a QUALITY entry: its own, or at most soft_atlas_cap while the sun has an
+## angular size (soft shadows).
+static func atlas_for(s: Dictionary, angular_distance: float) -> int:
+	var size := int(s["atlas"])
+	if soft_atlas_cap > 0 and angular_distance > 0.0:
+		return mini(size, soft_atlas_cap)
+	return size
 
 
 func _fit(force: bool) -> void:

@@ -24,10 +24,13 @@
 #include <godot_cpp/variant/vector3i.hpp>
 #include <godot_cpp/variant/vector4.hpp>
 
+#include <climits>
 #include <cmath>
 #include <cstdint>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
+#include <map>
 #include <vector>
 
 namespace godot {
@@ -57,16 +60,22 @@ public:
 	static constexpr double CAM_TURN = 0.996;
 	static constexpr double CAM_MARGIN = 3.0;
 	static constexpr i64 ASK_AGAIN_MSEC = 3000;
+	// (--belt-sim-ask=view) A lattice lane whose count is wrong, at most this often; one out of the
+	// planned view this often at first, doubling to the most while it keeps failing.
+	static constexpr i64 ASK_LATTICE_MSEC = 30000;
+	static constexpr i64 ASK_OUT_MSEC = 12000;
+	static constexpr i64 ASK_OUT_MAX_MSEC = 60000;
+	// (park_lat) How far lattice lanes go on past a ring of them (no end ahead).
+	static constexpr i64 LAT_FAR = (i64)1 << 40;
+	// The counters that walk every slot (slots, slots_hidden, parked by why) are taken every this many jobs.
+	static constexpr int GAUGE_EVERY = 16;
 	static constexpr double VIEW_MARGIN = 4.0;
 	static constexpr double VIEW_KEEP = 10.0;
 	static constexpr double MAX_YAW = 0.35;  // item_cards.gd
-	// belt_records.gd
+	// belt_records.gd (a page's size: records.per_page)
 	static constexpr int TEXELS = 4;
 	static constexpr int ROW = 1024;
-	static constexpr int PAGE_ROWS = 16;
 	static constexpr int FLOATS = TEXELS * 4;
-	static constexpr int PER_PAGE = ROW * PAGE_ROWS / TEXELS;
-	static constexpr int PAGE_FLOATS = PER_PAGE * FLOATS;
 	static constexpr int MIN_RUN = 64;
 	static constexpr float HIDDEN = -1.0f;
 	// belt_sim.gd's lane kinds
@@ -104,6 +113,11 @@ private:
 		double renew = -1.0;
 		int kept = 0;
 		bool parked = false;
+		bool lat = false;  // (park_lat) parked because its motion lies on lanes the lattice draws
+		bool waits = false;  // (later_tick) changes of it wait in `waiting`
+		i64 ver = 0;  // (later_tick) changed whenever anything _apply_early reads of it may have
+		double hide_at = -1.0;  // (--inserter-handoff) the tick a hand took it: texel 3 w (belt_items.gd Item.hide_at)
+		double show_at = -1.0;  // the tick a hand put it on its belt: texel 3 w, negative (Item.show_at)
 	};
 
 	struct Kind {
@@ -136,6 +150,15 @@ private:
 		int what;  // 0 a change, 1 gone
 		i64 uid, tick, item, stack, key, pos, speed, reach, run;
 	};
+	// (later_tick) One item's waiting changes in order (from `head`), and when the first was last tried
+	// early: an item's held changes are taken in its own order, as the list does.
+	struct Waiting {
+		std::vector<Later> q;
+		size_t head = 0;
+		i64 tried = -2;  // the item's ver at the first's last failed try (-1: no item then; -2: not tried)
+		i64 retry_at = INT64_MAX;  // (a start waiting for the item's t0) tried again once the drawn tick is there
+		i64 filed = INT64_MIN;  // the tick it was last filed under in `due`
+	};
 
 	// belt_native_common.h: the records' pages and a map in GDScript's insertion order.
 	template <class K, class V>
@@ -163,6 +186,21 @@ private:
 	bool path_dirty = false;
 	Ordered<Item *, bool> renewing;
 	std::vector<Later> later;
+	// (later_tick, --belt-draw-later-tick) `later` kept by item and by tick instead: a job takes only the
+	// items whose first waiting change is due, whose item changed since its last early try, or (the lanes'
+	// links moved) all of them, where the list walked every waiting change every job.
+	std::unordered_map<i64, Waiting> waiting;
+	std::map<i64, std::vector<i64>> due;  // tick -> uids whose first change takes effect (or is tried again) then
+	std::vector<i64> retry;  // uids whose item changed while changes of it wait
+	i64 ver_seq = 0;
+	i64 later_n = 0;  // changes waiting (either way)
+	bool lanes_moved = true;  // set_lane changed a lane, or drop_lane, since the last job
+	i64 links_seen = -1;
+	bool graph_now = true;  // this job: the lanes' links may have moved since the last
+
+	std::unordered_map<i64, i64> last_i;  // (coalesce) kept between jobs for its buckets
+	std::unordered_map<i64, i64> puts;  // (--inserter-handoff) belt_items.gd Job._puts
+	std::map<std::pair<i64, i64>, std::vector<i64>> peeks;  // (inserter, tick) -> uids: belt_items.gd State.peeks
 	Ordered<Item *, Vector2i> kept;
 	std::unordered_set<i64> held_chunks;  // packed chunk coordinates
 	std::unordered_map<i64, i64> asked;
@@ -175,6 +213,25 @@ private:
 	Rect2 planned_view;
 	bool planned_any = false;
 	int writes = 0;
+	// The lanes the lattice draws (its update's lanes added and removed, given each job), and for each how
+	// far lattice lanes go on past its exit (1/256): an item whose motion ends within that is hidden by the
+	// lattice's mask all along (park_lat parks it; the counters count it).
+	std::unordered_set<i64> lat;
+	std::unordered_map<i64, i64> lat_ahead;
+	bool lat_ahead_dirty = false;
+	// (park_lat) Items parked for the lattice, in GDScript's order (the order they are planned again in hands
+	// out slots: both twins alike, so a kind is compacted in the same job in each).
+	Ordered<Item *, bool> lat_items;
+	// Lanes dropped in this job's messages, as they were (an item parked on one stands where it is for the
+	// far icons' hand-over).
+	std::unordered_map<i64, Meta> dropped_meta;
+	std::unordered_map<i64, Arc> dropped_arcs;
+	// (ask view) Lattice lanes whose checks failed in places or ids alone since last asked (asked the moment
+	// they leave the lattice), and out-of-view lanes' intervals now (ms).
+	std::unordered_set<i64> lat_pend;
+	std::unordered_map<i64, i64> out_every;
+	int jobs_n = 0;
+	i64 g_slots = 0, g_hidden = 0, g_parked_view = 0, g_parked_lat = 0;  // the counters last taken
 
 	// --- the job (belt_items.gd Job)
 	double fold_tick = 0.0;
@@ -198,6 +255,11 @@ private:
 	bool lead_on = true;
 	bool gone_order = true;
 	bool pile_one = true;  // --belt-draw-pile: a copy's record points at its item's (else its own, as before)
+	bool dump_parks = true;  // --belt-draw-dump-parks: a park dumped as the record's going (belt_items.gd)
+	bool later_tick = true;  // --belt-draw-later-tick
+	bool park_lat = false;  // --belt-draw-park-lattice
+	int ask_mode = 0;  // --belt-sim-ask: 0 all (every failing lane every 3 s, as before), 1 view
+	bool ask_near = true;  // --belt-sim-ask-near: a job's asks nearest the view first
 	bool dumping = false;
 	std::unordered_set<i64> dropped;  // lanes dropped in this job's messages
 	int plan_depth = 0;
@@ -205,6 +267,7 @@ private:
 	Array written;
 	Array unknown;
 	i64 records_written = 0, changes = 0, coalesced = 0, early_n = 0, renewed = 0, gone_n = 0, parked = 0, unparked = 0;
+	i64 early_tries = 0, ask_view = 0, ask_lat = 0, ask_out = 0, ask_held = 0, lat_parks = 0, lat_unparks = 0, drained = 0;
 	std::vector<i64> resend;
 	Ref<Image> paths;
 	std::vector<i64> dump_ids;
@@ -215,20 +278,36 @@ private:
 	static double _yaw_for(i64 seed);
 	static Arc _arc(const int32_t *m);
 	Vector4 _point(i64 key, double pos) const;
+	static Vector4 _point_m(const int32_t *m, const Arc *arc, double pos, double height);
 	Vector2i _advance(i64 key, i64 pos, i64 d);
 	bool _straight_kind(i64 key) const;
 	Vector2 _dir(i64 key) const;
 	Vector3 _at(const Item *it, double t) const;
 	bool _set_view();
 	bool _in_view(i64 key, i64 pos, i64 reach) const;
+	bool _on_lat(i64 key, i64 pos, i64 reach) const;
+	int _hide_why(i64 key, i64 pos, i64 reach, i64 v) const;
+	void _set_lat(Item *it, bool on);
 	void _park(Item *it);
 	void _unpark(Item *it);
 	void _replan_parked();
+	void _relattice(const PackedInt64Array &add, const PackedInt64Array &del, bool graph);
+	void _lat_ahead();
+	bool _stand_dropped(Item *it, i64 now);
+	void _touch(Item *it);
 	void _apply_changes(const Dictionary &ch);
+	bool _held(i64 uid, const std::unordered_set<i64> &held) const;
+	void _hold(const Later &e, std::unordered_set<i64> &held, bool tried, i64 retry_at);
+	void _file(i64 uid, Waiting &w);
+	void _drain_due(i64 now);
+	void _drain(i64 uid, i64 now, bool all);
+	void _ask_mismatches(const Dictionary &ch);
+	void _gauges();
 	void _go_or_hold(i64 uid, i64 t, i64 now, std::unordered_set<i64> &held);
 	void _go(i64 uid);
 	void _apply_one(i64 uid, i64 item, i64 stack, i64 key, i64 pos, i64 t0, i64 v, i64 reach, i64 run);
-	bool _apply_early(i64 uid, i64 item, i64 stack, i64 key, i64 pos, i64 t0, i64 v, i64 reach, i64 run, i64 now);
+	bool _apply_early(i64 uid, i64 item, i64 stack, i64 key, i64 pos, i64 t0, i64 v, i64 reach, i64 run, i64 now,
+			i64 *retry_at = nullptr);
 	void _plan(Item *it);
 	void _plan_path(Item *it, i64 dist);
 	void _renew();
@@ -253,6 +332,7 @@ protected:
 
 public:
 	void set_sim(Object *p_sim);
+	void set_small_pages(bool on) { records.set_small(on); }
 	void set_lane(i64 key, const PackedInt32Array &meta);
 	void drop_lane(i64 key);
 	Dictionary run_job(const Dictionary &changes, const Dictionary &params);

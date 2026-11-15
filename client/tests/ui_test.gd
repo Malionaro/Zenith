@@ -31,6 +31,8 @@ const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const MachineScreen := preload("res://scripts/ui/factorio/machine_screen.gd")
 const UiSettings := preload("res://scripts/ui/ui_settings.gd")
 const PLANNER_UI := preload("res://scripts/ui/factorio/planner_ui.gd")
+const PlannerSlot := preload("res://scripts/ui/factorio/planner_slot.gd")
+const GhostShader := preload("res://shaders/ghost.gdshader")
 const Controls := preload("res://scripts/player/controls.gd")
 const ControlsInfo := preload("res://scripts/menu/controls_info.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
@@ -40,6 +42,9 @@ const FxSettings := preload("res://scripts/fx/fx_settings.gd")
 const FxScript := preload("res://scripts/fx/fx.gd")
 const ColorFilter := preload("res://scripts/menu/color_filter.gd")
 const PlayerInput := preload("res://scripts/player/player_input.gd")
+const DragBuildScript := preload("res://scripts/player/drag_build.gd")
+const PoleCoverageScript := preload("res://scripts/player/pole_coverage.gd")
+const GroundItemsScript := preload("res://scripts/world/ground_items.gd")
 const BeltLanesScript := preload("res://scripts/world/belt_lanes.gd")
 const QualityMarksScript := preload("res://scripts/world/quality_marks.gd")
 const AlertIconsScript := preload("res://scripts/ui/factorio/alert_icons.gd")
@@ -48,6 +53,7 @@ const FluidsPowerScript := preload("res://scripts/world/fluids_power.gd")
 const InterfaceStateScript := preload("res://scripts/ui/interface_state.gd")
 const RoboportLinksScript := preload("res://scripts/world/roboport_links.gd")
 const BeltItemsScript := preload("res://scripts/world/belt_items.gd")
+const PickUpScript := preload("res://scripts/world/pick_up.gd")
 const BeltSimScript := preload("res://scripts/world/belt_sim.gd")
 const BeltSimTwins := preload("res://tests/belt_sim_native_test.gd")
 const BeltRecordsScript := preload("res://scripts/world/belt_records.gd")
@@ -60,8 +66,10 @@ const PerfTestScript := preload("res://scripts/menu/perf_test.gd")
 const BugReport := preload("res://scripts/menu/bug_report.gd")
 const CreatureModels := preload("res://scripts/world/creature_models.gd")
 const Paths := preload("res://scripts/menu/paths.gd")
+const Saves := preload("res://scripts/menu/saves.gd")
 const ServerLauncher := preload("res://scripts/menu/server_launcher.gd")
 const WorldMirror := preload("res://scripts/world/world.gd")
+const UpdateOverlayScript := preload("res://scripts/debug/update_overlay.gd")
 const ChunkView := preload("res://scripts/world/chunk_view.gd")
 const Probing := preload("res://scripts/debug/probing.gd")
 const Predicted := preload("res://scripts/world/predicted.gd")
@@ -72,6 +80,8 @@ const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const TurretLayer := preload("res://scripts/world/turrets.gd")
 const CollectorLayer := preload("res://scripts/world/collectors.gd")
 const CursorOverlay := preload("res://scripts/player/cursor_overlay.gd")
+const UndergroundPairs := preload("res://scripts/world/underground_pairs.gd")
+const VisualTurns := preload("res://scripts/world/visual_turns.gd")
 const ProtoDB := preload("res://scripts/world/protos.gd")
 const PlayerTags := preload("res://scripts/world/player_tags.gd")
 const BpString := preload("res://scripts/ui/factorio/bp_string.gd")
@@ -268,6 +278,7 @@ func _ready() -> void:
 	await get_tree().process_frame
 	var ui = hud.ui
 	ui.player = player
+	ui.auto_sort = false  # J12's `sort`s would land among the commands the sections count (_ninth_list turns it on)
 	hud.set_inventory([["iron-plate", 60], ["transport-belt", 50]])
 	hud.set_recipes(["iron-gear-wheel", "transport-belt"])
 	check(hud.count_of("iron-plate") == 60, "count_of")
@@ -281,7 +292,10 @@ func _ready() -> void:
 	player.cursor_item = "transport-belt"
 	key(KEY_3)
 	await get_tree().process_frame
-	check(ui.model.quickbar[2] == "transport-belt", "number key pins the held item")
+	check(ui.model.quickbar[2] == "" and player.cursor_item == "transport-belt",
+		"K18: a number key on an empty slot doesn't pin the held item (in Factorio only a click does)")
+	ui._on_quickbar_clicked(2, MOUSE_BUTTON_LEFT)
+	check(ui.model.quickbar[2] == "transport-belt" and player.cursor_item == "transport-belt", "a click on an empty slot pins the held item")
 	ui.window.hovered_item = "iron-plate"
 	key(KEY_0)
 	await get_tree().process_frame
@@ -347,6 +361,7 @@ func _ready() -> void:
 	m.handle({"t": "tags", "l": [[3, 1280, -512, "base", "item", "iron-plate"]]})
 	check(m.map_tags.size() == 1 and m.map_tags[0]["position"] == Vector2(5, -2) and m.map_tags[0]["icon_name"] == "iron-plate", "tags message")
 	var only := _only_sections()
+	_controls_before = Settings.bindable_actions().duplicate()
 	if not only.is_empty():
 		await _run_only(only, {"hud": hud, "player": player, "ui": ui})
 		return
@@ -392,6 +407,7 @@ func _ready() -> void:
 	await _modded_planets(hud)
 	await _world_marks(hud)
 	await _predictions(hud)
+	await _turned_previews(hud)
 	_pipe_fluid_icons()
 	await _craft_pie(hud)
 	_craft_predicted(hud)
@@ -401,17 +417,22 @@ func _ready() -> void:
 	await _window_bounds(hud)
 	await _wires(hud)
 	await _build_tools(hud)
+	await _blueprint_preview(hud)
+	_repair_pack(hud)
 	await _menus()
 	await _antialiasing_look()
 	await _perf_test()
 	await _layout(hud)
+	await _map_title(hud)
 	await _help(hud)
 	await _icons(hud)
+	_alt_sequences()
 	_turrets()
 	_turrets_far()
 	_turret_lights()
 	_collectors()
 	_asteroid_chunks()
+	_ride_before_silo()
 	_belt_end_rules()
 	_belt_line_ends()
 	_fx_movers()
@@ -421,34 +442,438 @@ func _ready() -> void:
 	await _debug_menu(hud)
 	await _debug_menu_over_camera(hud)
 	await _dev_tools(hud)
+	await _update_overlays(hud)
 	_view_priority()
 	await _performance()
 	_resolution_scaling()
 	await _streaming()
 	await _frame_budget()
+	await _hotfix_021()
+	await _pipeline_warm()
 	await _bridge_parsing()
+	await _bridge_relay()
 	_working_near()
 	await _stream_spread()
 	await _far_chunks()
 	_belt_stand_ins()
 	_belt_stand_ins_at_4k()
 	_belt_item_shadows()
+	_lod_lines()
 	_belts_always_run()
 	_belt_blur()
 	_ups_governor()
 	_terrain()
 	await _hill_culling()
+	_lamps()
+	_hill_lights()
+	_camera_focus()
 	_contact_shade()
 	await _ao_zoom()
+	_post_hotfix()
 	_surface_change()
 	_gpu_anim()
+	await _creature_motion()
+	await _space_creatures()
+	_tree_crowns()
 	_belt_sim()
 	_belt_self_side()
 	_belt_unison()
+	_belt_lattice_turns()
+	await _ninth_list(hud, player)
+	await _mining_feedback(hud)
+	await _research_done(hud)
+	await _first_person_aim(hud)
+	_pick_up(hud)
+	_belt_take()
+	_belt_line_end()
+	await _quickbar_hand(hud, player)
+	_belt_removed()
 	if DisplayServer.get_name() != "headless" and OS.get_cmdline_user_args().size() > 0 and OS.get_cmdline_user_args()[-1].ends_with(".png"):
 		await _picture(hud, player)
+	_nothing_left_behind()
 	print("FAILS: %d" % fails)
 	get_tree().quit(1 if fails else 0)
+
+
+## The controls when the sections started (Settings.bindable_actions), for _nothing_left_behind.
+var _controls_before: Array = []
+
+
+## Sections run one after another in one tree: one that leaves a control of its own bound broke a
+## later one (_parity's test binding made _help fail on 0.1.3's and 0.2.0's CI). Checked at the end of
+## the whole run and of each --only run, so the section that leaves one is found running it alone.
+func _nothing_left_behind() -> void:
+	# Zenith's own controls (the Controls tab's list) may be defined on the way; anything else is a test's.
+	var stray := func(a) -> bool:
+		return not _controls_before.has(a) and not ControlsInfo.ACTIONS.has(a)
+	var left: Array = Settings.bindable_actions().filter(stray)
+	check(left.is_empty(), "no section leaves a control of its own bound (left: %s)" % [left])
+
+
+## The tenth play-test list's quickbar, as Factorio 2.1's (its wiki's Quickbar page, the changelog, its
+## interface settings, where "Set quickbar filter by clicking with item" is off by default): K17 a
+## slot's key, or a click on it, with its item already in the hand puts the hand back, however the item
+## came there, a ghost cursor too; K18 neither a key nor a click on a pinned slot changes what it
+## holds, the inventory open or not: only a click on an empty slot pins the held item.
+func _quickbar_hand(hud: Hud, player: Node) -> void:
+	var ui = hud.ui
+	var m = ui.model
+	hud.screen.close()
+	ui.close_all()
+	ui.hand = {}
+	player.cursor_item = ""
+	ui.window.hovered_item = ""
+	var sorting: bool = ui.auto_sort
+	ui.auto_sort = false
+	m.quickbar_upper = 0
+	# The bridge keeps the quickbar: a pin goes to it as `qb_set` and comes back in its next `qb`.
+	var qb: Array = []
+	qb.resize(100)
+	qb.fill("")
+	qb[1] = "wooden-chest"  # slot 2
+	qb[2] = "transport-belt"  # slot 3
+	qb[4] = "iron-plate"  # slot 5
+	qb[6] = "stone-furnace"  # slot 7: none in the inventory
+	qb[10] = "copper-plate"  # page 2, the second row's first slot
+	m.handle({"t": "qb", "p": 1, "sel": 0, "held": "", "l": qb})
+	m.handle({"t": "slots", "l": {"main": [["transport-belt", 50], ["wooden-chest", 10], ["iron-plate", 60], ["copper-plate", 20],
+		0, 0, 0, 0, 0, 0]}})
+	await get_tree().process_frame
+	sent()
+	var before: Array = m.quickbar.duplicate()
+	# What would change the quickbar or move a stack: none of it may be sent.
+	var touched := func() -> Array:
+		return sent().filter(func(c: Dictionary) -> bool: return ["qb_set", "drop", "move", "xfer", "put"].has(str(c.get("t", ""))))
+	var press := func(k: Key) -> void:
+		key(k)
+		await get_tree().process_frame
+	for open in [false, true]:
+		var where := " (inventory open)" if open else ""
+		if open:
+			ui.toggle_inventory()
+			await get_tree().process_frame
+			get_viewport().gui_release_focus()
+		await press.call(KEY_3)
+		check(player.cursor_item == "transport-belt" and ui.hand.is_empty(), "K17: 3 puts slot 3's belts in the hand" + where)
+		await press.call(KEY_3)
+		var moved: Array = touched.call()
+		check(player.cursor_item == "" and ui.hand.is_empty() and m.count_of("transport-belt") == 50 and moved.is_empty() and m.quickbar == before,
+			"K17: 3 again empties the hand: the belts stay in the inventory, nothing dropped or moved, the quickbar as it was%s: %s" % [where, moved])
+		await press.call(KEY_2)
+		await press.call(KEY_3)
+		check(player.cursor_item == "transport-belt" and touched.call().is_empty() and m.quickbar == before,
+			"K17: 3 with slot 2's chest in the hand takes slot 3's belts instead, as before" + where)
+		await press.call(KEY_3)
+		check(player.cursor_item == "", "K17: and 3 puts them back" + where)
+		await press.call(KEY_7)
+		check(player.cursor_item == "stone-furnace", "K17: 7 with no furnaces in the inventory: a ghost cursor" + where)
+		await press.call(KEY_7)
+		check(player.cursor_item == "", "K17: 7 again puts the ghost cursor away too" + where)
+		# K18: slot 2 holds the chest; picking it and then slot 5 leaves both slots as they were.
+		await press.call(KEY_2)
+		await press.call(KEY_5)
+		moved = touched.call()
+		check(player.cursor_item == "iron-plate" and moved.is_empty() and m.quickbar == before,
+			"K18: 2 then 5: the plates in the hand, slot 2 still the chest and slot 5 still the plates%s: %s %s" % [where, moved, m.quickbar])
+		ui._on_quickbar_clicked(1, MOUSE_BUTTON_LEFT)
+		check(player.cursor_item == "wooden-chest", "K18: a click on slot 2 with the plates in the hand picks the chest" + where)
+		ui._on_quickbar_clicked(4, MOUSE_BUTTON_LEFT)
+		moved = touched.call()
+		check(player.cursor_item == "iron-plate" and moved.is_empty() and m.quickbar == before,
+			"K18: then a click on slot 5 picks the plates, neither slot changed%s: %s" % [where, moved])
+		ui._on_quickbar_clicked(4, MOUSE_BUTTON_LEFT)
+		check(player.cursor_item == "" and touched.call().is_empty(), "K17: a click on the slot of what the hand holds puts it back" + where)
+		ui._on_second_quickbar_clicked(0, MOUSE_BUTTON_LEFT)
+		check(player.cursor_item == "copper-plate" and touched.call().is_empty(), "K18: the second row's slot picks its item, not pinned over" + where)
+		ui._on_quickbar_clicked(1, MOUSE_BUTTON_LEFT)
+		ui._on_second_quickbar_clicked(0, MOUSE_BUTTON_LEFT)
+		check(player.cursor_item == "copper-plate" and touched.call().is_empty() and m.quickbar == before,
+			"K18: a click on the second row with the chest in the hand picks the copper, slot 2 kept" + where)
+		ui._on_second_quickbar_clicked(0, MOUSE_BUTTON_LEFT)
+		check(player.cursor_item == "", "K17: and on it again puts the hand back" + where)
+	# The item in the hand from an inventory slot, not the quickbar: its key puts it back the same way.
+	click_main(ui, 1)
+	await get_tree().process_frame
+	check(player.cursor_item == "transport-belt" and ui.held_slot() == 1, "K17: belts picked up from inventory slot 1")
+	await press.call(KEY_3)
+	await get_tree().process_frame
+	check(player.cursor_item == "" and ui.hand.is_empty() and ui.window.hand_slot.is_empty() and touched.call().is_empty(),
+		"K17: 3 puts belts picked up from a slot back into it (the hand's mark gone, nothing sent)")
+	# Over a pinned slot the hovered item doesn't pin either; over an empty one it does (quick pipette).
+	ui.window.hovered_item = "copper-plate"
+	await press.call(KEY_2)
+	check(player.cursor_item == "wooden-chest" and touched.call().is_empty() and m.quickbar == before,
+		"K18: 2 with the copper hovered picks slot 2's chest, the slot kept")
+	await press.call(KEY_4)
+	var pins: Array = sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "qb_set" and c.get("item") == "copper-plate")
+	check(pins.any(func(c: Dictionary) -> bool: return int(c.get("i", 0)) == 4) and player.cursor_item == "wooden-chest",
+		"an empty slot's key pins the hovered item (Factorio's quick pipette): %s" % [pins])
+	ui.window.hovered_item = ""
+	m.handle({"t": "qb", "p": 1, "sel": 0, "held": "", "l": qb})
+	await press.call(KEY_4)
+	check(player.cursor_item == "wooden-chest" and touched.call().is_empty() and m.quickbar == before,
+		"K18: an empty slot's key with the chest in the hand pins nothing")
+	ui._on_quickbar_clicked(3, MOUSE_BUTTON_LEFT)
+	pins = sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "qb_set" and c.get("item") == "wooden-chest")
+	check(pins.any(func(c: Dictionary) -> bool: return int(c.get("i", 0)) == 4), "a click on an empty slot pins the held item: %s" % [pins])
+	m.handle({"t": "qb", "p": 1, "sel": 0, "held": "", "l": qb})
+	ui.close_all()
+	ui.hand = {}
+	player.cursor_item = ""
+	ui.auto_sort = sorting
+	await get_tree().process_frame
+	sent()
+
+
+## The owner's ninth play-test list: the hand refilled after a Ctrl+click (J3), the character
+## window's Crafting and Logistics tabs, Logistics only once researched (J7, J8), the inventory
+## sorting itself (J12), a long crafting queue's "+N" (J13), the recipe tooltip in an assembler's
+## chooser and its red lines (J14, J16), and the technology screen opening on its technology (J17).
+func _ninth_list(hud: Hud, player: Node) -> void:
+	var ui = hud.ui
+	var m = ui.model
+	var screen: MachineScreen = hud.screen
+	screen.close()
+	ui.close_all()
+	ui.hand = {}
+	player.cursor_item = ""
+	await get_tree().process_frame
+	sent()
+	var row10 := func(first: Array) -> Array:
+		var out: Array = first.duplicate()
+		while out.size() < 10:
+			out.append(0)
+		return out
+
+	# --- J3: a Ctrl+click that empties the hand takes the next stack into it ------------------------
+	m.handle({"t": "slots", "l": {"main": row10.call([["coal", 50], ["iron-plate", 100], ["coal", 30]])}})
+	ui.toggle_inventory()
+	click_main(ui, 1)
+	await get_tree().process_frame
+	ui.close_all()
+	check(player.cursor_item == "coal" and ui.hand.get("index") == 1 and ui.held_slot() == 1, "J3: a stack of coal in the hand, from slot 1")
+	ui.fast_transfer_sent("coal", Vector3.ZERO)
+	m.handle({"t": "slots", "l": {"main": row10.call([0, ["iron-plate", 100], ["coal", 30]])}})
+	await get_tree().process_frame
+	check(player.cursor_item == "coal" and ui.hand.get("index") == 3 and ui.hand_count() == 30 and ui.held_slot() == 3,
+		"J3: the Ctrl+click emptied it: the next stack of coal comes into the hand (%s, %d)" % [ui.hand, ui.hand_count()])
+	ui.fast_transfer_sent("coal", Vector3.ZERO)
+	m.handle({"t": "slots", "l": {"main": row10.call([0, ["iron-plate", 100], 0])}})
+	await get_tree().process_frame
+	check(player.cursor_item == "" and ui.hand.is_empty(), "J3: with no coal left the hand empties (no ghost cursor, I1)")
+
+	# --- J7, J8: Crafting and Logistics tabs, Logistics once researched -----------------------------
+	var w = ui.window
+	m.char_logistics = false
+	m.logistics_changed.emit()
+	w.show_tab("Crafting")
+	ui.toggle_inventory()
+	await get_tree().process_frame
+	check(not w._tabs_row.visible and w._crafting_caption.visible and w._crafting_caption.text == "Crafting"
+		and w._crafting.is_visible_in_tree(), "J8: before the research the right half is Crafting alone, under its title")
+	w.show_tab("Logistics")
+	check(w.current_tab() == "Crafting" and not w._logistics.is_visible_in_tree(), "J8: and has no Logistics tab to open")
+	m.handle({"t": "clog", "on": 1, "trash": 0, "l": [["iron-plate", 100, -1]]})
+	await get_tree().process_frame
+	check(m.char_logistics and w._tabs_row.is_visible_in_tree() and not w._crafting_caption.visible
+		and (w._tab_buttons["Crafting"] as Button).button_pressed and not (w._tab_buttons["Logistics"] as Button).button_pressed,
+		"J7: once researched (the bridge's first clog) the title is Factorio's Crafting and Logistics tabs, Crafting chosen")
+	var crafting_size: Vector2 = w._crafting_frame.get_combined_minimum_size()
+	(w._tab_buttons["Logistics"] as Button).pressed.emit()
+	await get_tree().process_frame
+	check(is_equal_approx(w._crafting_frame.get_combined_minimum_size().x, crafting_size.x),
+		"J7: both tabs as wide, so switching doesn't move the window (%s, %s)" % [crafting_size, w._crafting_frame.get_combined_minimum_size()])
+	check(w.current_tab() == "Logistics" and w._logistics.is_visible_in_tree() and not w._crafting.is_visible_in_tree()
+		and (w._tab_buttons["Logistics"] as Button).button_pressed and _find_checkbox(w._logistics, "Personal logistics") != null,
+		"J7: the Logistics tab shows the character's logistics in Crafting's place")
+	check(w._crafting_frame.is_ancestor_of(w._logistics) and w.get("_logistics_frame") == null,
+		"J7: on the right half, not a part of its own between the inventory and crafting")
+	w.focus_search()
+	check(w.current_tab() == "Crafting" and w._crafting.is_visible_in_tree(), "J7: Ctrl+F goes back to Crafting for its search")
+	w._crafting.search.text = ""
+	w._crafting.search.visible = false
+	w._crafting.search.release_focus()
+	ui.close_all()
+
+	# --- J12: the main inventory sorts itself -----------------------------------------------------
+	ui.auto_sort = true
+	ui._sort_due = false
+	ui._sort_pending = false
+	var sorts := func() -> Array: return sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "sort")
+	sent()
+	m.handle({"t": "slots", "l": {"main": row10.call([["iron-plate", 10], 0, ["coal", 5]])}})
+	ui._sort_sent_ms = -100000
+	await get_tree().process_frame
+	var asked: Array = sorts.call()
+	check(asked.size() == 1 and asked[0].get("inv") == "main", "J12: the inventory changed with no window open: the bridge is asked to sort it")
+	m.handle({"t": "slots", "l": {"main": row10.call([["coal", 5], ["iron-plate", 10]])}})  # its answer
+	ui._sort_sent_ms = -100000
+	await get_tree().process_frame
+	check(sorts.call().is_empty(), "J12: the sorted answer asks for nothing more")
+	ui.toggle_inventory()
+	m.handle({"t": "slots", "l": {"main": row10.call([0, ["iron-plate", 10], 0, 0, ["coal", 5]])}})
+	ui._sort_sent_ms = -100000
+	await get_tree().process_frame
+	check(sorts.call().is_empty(), "J12: not while the window shows it (stacks put where the player wants stay there)")
+	ui.close_all()
+	await get_tree().process_frame
+	check(sorts.call().size() == 1, "J12: closing the window sorts it")
+	m.handle({"t": "slots", "l": {"main": row10.call([["coal", 5], ["iron-plate", 10]])}})
+	ui.toggle_inventory()
+	click_main(ui, 1)
+	ui.close_all()
+	m.handle({"t": "slots", "l": {"main": row10.call([["coal", 5], ["iron-plate", 10], 0, ["wood", 4]])}})
+	ui._sort_sent_ms = -100000
+	await get_tree().process_frame
+	check(player.cursor_item == "coal" and sorts.call().is_empty(), "J12: not while the hand holds one of its stacks (sorting would move it)")
+	ui.clear_cursor()
+	ui._sort_sent_ms = -100000
+	await get_tree().process_frame
+	check(sorts.call().size() == 1, "J12: and once the hand is empty again")
+	ui.auto_sort = false
+
+	# --- J13: a crafting queue longer than its row ------------------------------------------------
+	var q = ui.craft_queue
+	var root: Control = hud.get_child(0)  # laid out at 1280x720, as _layout does
+	root.anchor_right = 0.0
+	root.anchor_bottom = 0.0
+	root.size = Vector2(1280, 720)
+	var many: Array = []
+	for i in 30:
+		many.append([i + 1, "iron-gear-wheel", 1, 0])
+	m.handle({"t": "cq", "pr": 0, "l": many})
+	await get_tree().process_frame
+	await get_tree().process_frame
+	var fit: int = q._fit
+	var shown: int = q._slots.filter(func(s: Slot) -> bool: return s.visible).size()
+	var rest := 30 - (fit - 1)
+	check(fit >= 2 and fit < 30 and shown == fit - 1 and q.more_button.visible and q.more_button.text == "+%d" % rest,
+		"J13: the row holds what fits (%d), ending in \"+%d\": %d shown, %s" % [fit, rest, shown, q.more_button.text])
+	check(q.get_global_rect().end.x <= ui.quickbar.frame.get_global_rect().position.x + 0.5, "J13: the row stays clear of the quickbar")
+	check(not q.more_panel.visible, "J13: the rest stays shut until asked for")
+	# The headless window is too small to move the mouse there: the button is told it is entered, as
+	# the viewport does.
+	q.more_button.notification(Control.NOTIFICATION_MOUSE_ENTER)
+	await get_tree().process_frame
+	check(q.more_panel.visible, "J13: the mouse on \"+N\" opens the rest")
+	q.more_button.notification(Control.NOTIFICATION_MOUSE_EXIT)
+	await get_tree().process_frame
+	check(not q.more_panel.visible, "J13: and moving away shuts it")
+	q.more_button.button_pressed = true
+	await get_tree().process_frame
+	var panel_rect: Rect2 = q.more_panel.get_global_rect()
+	var rows: int = ceili(rest / float(fit))
+	var lowest: Control = q.more_panel.get_child(rows - 1)
+	var first_rest: Slot = lowest.get_child(0)
+	check(q.pinned and q.more_panel.visible and absf(panel_rect.end.y - q.get_global_rect().position.y) <= 1.0
+		and q._more_slots.filter(func(s: Slot) -> bool: return s.visible).size() == rest and int(first_rest.get_meta("index", 0)) == fit,
+		"J13: a click holds the rest open upwards over the row, the next entry (%d) nearest it: %s over %s" % [fit, panel_rect, q.get_global_rect()])
+	first_rest.clicked.emit(MOUSE_BUTTON_LEFT, false)
+	var cancel := sent_one("cancel_craft")
+	check(int(cancel.get("i", 0)) == fit and int(cancel.get("n", 0)) == 1, "J13: a craft held open there is cancelled by a click: %s" % cancel)
+	m.handle({"t": "cq", "pr": 0, "l": [[1, "iron-gear-wheel", 1, 0]]})
+	await get_tree().process_frame
+	check(not q.more_button.visible and not q.more_panel.visible and not q.pinned, "J13: a queue that fits its row has no \"+N\" and nothing held open")
+	m.handle({"t": "cq", "pr": 0, "l": []})
+	root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+
+	# --- J16: which lines of a recipe's tooltip are red ---------------------------------------------
+	m.set_recipe_details([
+		{"name": "iron-gear-wheel", "energy": 0.5, "ingredients": [["iron-plate", 2]], "products": [["iron-gear-wheel", 1]]},
+		{"name": "copper-cable", "energy": 0.5, "ingredients": [["copper-plate", 1]], "products": [["copper-cable", 2]]},
+		{"name": "electronic-circuit", "energy": 0.5, "ingredients": [["iron-plate", 1], ["copper-cable", 3]], "products": [["electronic-circuit", 1]]},
+		{"name": "inserter", "energy": 0.5, "ingredients": [["electronic-circuit", 1], ["iron-gear-wheel", 1], ["iron-plate", 1]],
+			"products": [["inserter", 1]]}])
+	var red := func(lines: Array) -> Array:
+		return lines.filter(func(l: Array) -> bool: return l.size() > 2 and l[2] is Color and (l[2] as Color).is_equal_approx(Kit.RED_TEXT)).map(
+			func(l: Array) -> String: return str(l[0]))
+	m.set_inventory_slots([["iron-plate", 4], ["copper-plate", 2]], 10)
+	var tip: Array = CraftingPanel.recipe_tip_lines(m, m.recipe("inserter"))
+	var texts: Array = tip.map(func(l: Array) -> String: return str(l[0]))
+	check(red.call(tip).is_empty() and texts.has("1 × Electronic circuit") and texts.has("1 × Iron gear wheel") and texts.has("4 × Iron plate"),
+		"J16: ingredients craftable from the plates held aren't red; Total raw has all it needs: %s" % [texts])
+	m.set_inventory_slots([["iron-plate", 3], ["copper-plate", 2]], 10)
+	tip = CraftingPanel.recipe_tip_lines(m, m.recipe("inserter"))
+	check(red.call(tip) == ["0/1 × Iron plate", "3/4 × Iron plate"],
+		"J16: the plates go to the circuit and the gear first: the plate itself is red (have/need), and Total raw's plates: %s" % [red.call(tip)])
+	m.set_inventory_slots([["copper-plate", 2]], 10)
+	tip = CraftingPanel.recipe_tip_lines(m, m.recipe("electronic-circuit"))
+	check(red.call(tip) == ["0/1 × Iron plate", "0/1 × Iron plate"],
+		"J16: cable made from the copper held isn't red; the missing plate is, and in Total raw: %s" % [red.call(tip)])
+
+	# --- J14: an assembler's recipe chooser has Factorio's recipe tooltip ---------------------------
+	m.handle({"t": "pedia", "kind": "recipe", "name": "plastic-bar", "found": 1,
+		"d": {"ing": [["fluid", "petroleum-gas", 20], ["item", "coal", 1]], "prod": [["item", "plastic-bar", 2]], "time": 1}})
+	screen.request(606, {"t": "open", "u": 606, "p": 0, "x": 0, "y": 0})
+	sent()
+	screen.handle({"t": "gui", "u": 606, "p": 0, "kind": "crafter", "inv": {}, "recipe": "", "rl": ["plastic-bar", "inserter", "sulfur"]})
+	screen._picking = true
+	screen._rebuild_now()
+	await get_tree().process_frame
+	var plastic: Slot = _find_slot_tip(screen, Kit.recipe_name("plastic-bar") + " (Recipe)")
+	var plastic_lines: Array = plastic.tip_fn.call() if plastic != null and plastic.tip_fn.is_valid() else []
+	var ptexts: Array = plastic_lines.map(func(l: Array) -> String: return str(l[0]))
+	check(ptexts.has("Ingredients:") and ptexts.has("20 × Petroleum gas") and ptexts.has("1 × Coal") and ptexts.has("Products:")
+		and ptexts.has("2 × Plastic bar") and ptexts.any(func(t: String) -> bool: return t.ends_with("Crafting time"))
+		and red.call(plastic_lines).is_empty() and plastic._make_custom_tooltip("") != null,
+		"J14: a recipe in the chooser has Factorio's recipe tooltip from its Factoriopedia page: %s" % [ptexts])
+	var ins: Slot = _find_slot_tip(screen, Kit.recipe_name("inserter") + " (Recipe)")
+	var itexts: Array = (ins.tip_fn.call() as Array).map(func(l: Array) -> String: return str(l[0])) if ins != null else []
+	check(itexts.has("Total raw:") and itexts.has("1 × Electronic circuit") and not itexts.any(func(t: String) -> bool: return t.contains("/")),
+		"J14: a hand recipe's from its details, with Total raw, nothing red (an assembler doesn't craft from the inventory): %s" % [itexts])
+	var sulfur: Slot = _find_slot_tip(screen, Kit.recipe_name("sulfur") + " (Recipe)")
+	if sulfur != null:
+		sulfur.mouse_entered.emit()
+	var pages := sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "pedia" and c.get("kind") == "recipe")
+	var asked_page: Dictionary = pages[0] if pages.size() == 1 else {}
+	check(asked_page.get("name") == "sulfur",
+		"J14: a recipe not known yet: its page is asked for as the mouse comes on it: %s" % asked_page)
+	screen.close()
+	sent()
+
+	# --- J17: the technology screen opens on its technology, scrolled to it -------------------------
+	var chain: Array = []
+	for i in 12:
+		chain.append(["t%d" % i, "a%02d" % i, [] if i == 0 else ["t%d" % (i - 1)], [["automation-science-pack", 1]], 10, 10,
+			2 if i < 11 else 1, ""])
+	m.handle({"t": "techs", "part": 1, "parts": 1, "l": chain})
+	m.handle({"t": "rs", "cur": "t11", "pr": 100, "q": []})
+	var r = ui.research
+	r.selected = "t3"
+	var shown_at := func(tech: String) -> bool:
+		var s: Control = r._tree_slots.get(tech)
+		var view := Rect2(Vector2(r._tree_scroll.scroll_horizontal, r._tree_scroll.scroll_vertical), r._tree_scroll.size)
+		return s != null and view.encloses(Rect2(s.position, s.size))
+	ui.close_all()
+	key(KEY_T)
+	for i in 4:
+		await get_tree().process_frame
+	check(r.is_open() and r.selected == "t11" and r._tree_scroll.scroll_vertical > 0 and shown_at.call("t11"),
+		"J17: T opens on the research in progress, the tree scrolled to it, not at its top (%d)" % r._tree_scroll.scroll_vertical)
+	m.handle({"t": "rs", "cur": "", "pr": 0, "q": []})
+	r.select("t8")
+	ui.close_all()
+	await get_tree().process_frame
+	key(KEY_T)
+	for i in 4:
+		await get_tree().process_frame
+	check(r.selected == "t8" and r._tree_scroll.scroll_vertical > 0 and shown_at.call("t8"),
+		"J17: with nothing researched, on the technology looked at last, scrolled to it")
+	ui.close_all()
+	await get_tree().process_frame
+	ui.pedia.open_technology.emit("t6")
+	for i in 4:
+		await get_tree().process_frame
+	check(r.is_open() and r.selected == "t6" and shown_at.call("t6"), "J17: a Factoriopedia link opens it on that technology")
+	r.select("t1")
+	for i in 3:
+		await get_tree().process_frame
+	r.select("t11")
+	for i in 4:
+		await get_tree().process_frame
+	check(shown_at.call("t11"), "J17: from a short tree to a technology deep in a tall one: scrolled to it (the old scroll range clamped it)")
+	ui.close_all()
+	await get_tree().process_frame
 
 
 ## P49: a recipe's tooltip breaks its intermediates down to what can't be crafted by hand.
@@ -469,7 +894,7 @@ func _total_raw() -> void:
 	for i in lines.size():
 		if str(lines[i][0]) == "Total raw:":
 			at = i
-	check(at >= 0 and str(lines[at + 1][0]).contains("1.75") and str(lines[at + 2][0]).begins_with("1.5 ×"), "the tooltip lists it after the products: %s" % [lines])
+	check(at >= 0 and str(lines[at + 1][0]).contains("1.75") and str(lines[at + 2][0]).ends_with("1.5 × Copper plate"), "the tooltip lists it after the products: %s" % [lines])
 	check(not m.total_raw("gear")["expanded"] and not CraftingPanel.recipe_tip_lines(m, m.recipe("gear")).any(func(l): return str(l[0]) == "Total raw:"),
 		"a recipe of raw items only has no Total raw")
 	check(m.total_raw("loop-a")["too_complex"], "a loop of recipes is too complex to calculate")
@@ -594,6 +1019,576 @@ func _pipe_fluid_icons() -> void:
 		if overlay.pipe_shows_icon(Vector2i(i / 2 + i % 2, i / 2)):
 			stairs += 1
 	check(stairs >= 4, "a staircase of pipes shows icons too: %d of 40" % stairs)
+
+
+## K13: a repair pack (`iuse` "h") held, the left button on a building sends `repair` for it (its unit, the
+## item, the held stack's slot), again only every REPEAT while it stays on it and at once on another; letting
+## go sends `repair` without a target, once. Nothing goes without a repair tool. A worn pack's slot (its fifth
+## value, durability in thousandths) shows Factorio's green durability bar; me's `rp` swings the character.
+func _repair_pack(hud: Hud) -> void:
+	PlayerInput.define_actions()
+	var m: UiModel = hud.ui.model
+	m.handle({"t": "iuse", "part": 1, "parts": 1, "l": [["repair-pack", "h", 2, 300], ["grenade", "c", "throw", 15, 6.5]]})
+	check(m.is_repair_tool("repair-pack") and not m.is_repair_tool("grenade") and not m.is_repair_tool("")
+		and m.item_uses["repair-pack"]["h"] == [2.0, 300.0], "K13: iuse's \"h\" marks a repair tool, with its speed and durability")
+	var holder := Node3D.new()
+	add_child(holder)
+	var world := WorldMirror.new()
+	holder.add_child(world)
+	world.pick_build_usec = 1 << 40  # the whole pick index at once (see _predictions)
+	world.protos.add_entities([[6, "wooden-chest", "container", -0.5, -0.5, 0.5, 0.5, 150, 110, 60, 1, 1]])
+	world.chunks[Vector2i.ZERO] = ChunkView.new()
+	world._add([7701, 6, 3 * 256 + 128, 2 * 256 + 128, 0])
+	world._add([7702, 6, 5 * 256 + 128, 2 * 256 + 128, 0])
+	var input := PlayerInput.new()
+	input.world = world
+	input.hud = hud
+	input.has_ground = true
+	sent()
+	input.cursor_item = "repair-pack"
+	input.cursor_quality = "normal"
+	input._lmb_down = true
+	input.ground = Vector2(3.5, 2.5)
+	input._update_repair(0.016)
+	var first := sent_one("repair")
+	input._update_repair(0.016)
+	var again := sent_one("repair")
+	input._update_repair(PlayerInput.REPEAT)
+	var repeated := sent_one("repair")
+	input.ground = Vector2(5.5, 2.5)
+	input._update_repair(0.016)
+	var other := sent_one("repair")
+	check(int(first.get("u", 0)) == 7701 and first.get("item") == "repair-pack" and int(first.get("x", 0)) == 3 * 256 + 128
+		and again.is_empty() and int(repeated.get("u", 0)) == 7701 and int(other.get("u", 0)) == 7702,
+		"K13: the left button held with a repair pack sends `repair` for the building under it, repeated, at once on another: %s %s %s %s"
+		% [first, again, repeated, other])
+	input._lmb_down = false
+	input._update_repair(0.016)
+	var stop := sent_one("repair")
+	input._update_repair(0.016)
+	var after := sent_one("repair")
+	check(not stop.is_empty() and not stop.has("u") and after.is_empty() and input.repair_unit == 0,
+		"K13: letting go sends one `repair` without a target: %s %s" % [stop, after])
+	input.ground = Vector2(9.5, 9.5)
+	input._lmb_down = true
+	input._update_repair(0.016)
+	var over_nothing := sent_one("repair")
+	input.cursor_item = "grenade"
+	input.ground = Vector2(3.5, 2.5)
+	input._update_repair(0.016)
+	var no_tool := sent_one("repair")
+	input._lmb_down = false
+	check(over_nothing.is_empty() and no_tool.is_empty(), "K13: nothing goes over empty ground, nor without a repair tool held")
+	# The worn pack's slot: the bar, and freshness -1 (it doesn't spoil) read as none.
+	var d: Array = UiModel._slot_dicts([["repair-pack", 4, "normal", -1, 650], ["yumako", 5, "normal", 640]])
+	var slot := Slot.new()
+	slot.set_extra(d[0])
+	check(is_equal_approx(float(d[0].get("durability", -1.0)), 0.65) and not d[0].has("freshness")
+		and is_equal_approx(float(d[1].get("freshness", -1.0)), 0.64) and not d[1].has("durability")
+		and is_equal_approx(slot.durability, 0.65) and slot.freshness < 0.0,
+		"K13: a worn tool's slot carries its durability (the green bar), -1 freshness is none: %s" % [d])
+	slot.free()
+	input.free()
+	holder.queue_free()
+
+
+## Lamps at night (lamp_lights.gd): a lamp the bridge reports working (`st` 1; a real lamp is 0 by
+## day, turned_off_during_daytime) gets a glow and a light once it is dark, a lamp it reports off
+## none. J19: on an add-on's hills (ground_height.gd) the lamp's model is lifted in its shader, and
+## the bulb and light at their flat height sat inside the raised ground, so no lamp on a hill lit up.
+## K5: the bulb, a white ball 0.8 tiles up, floated over the model's 0.6-tile head, which stayed dark:
+## the glass glows instead (Factorio's lit lamp's picture on a card over it) and the light is just over
+## the head.
+func _lamps() -> void:
+	const LampLights := preload("res://scripts/world/lamp_lights.gd")
+	const G := preload("res://scripts/world/ground_height.gd")
+	G.clear()
+	var holder := Node3D.new()
+	add_child(holder)
+	var w := WorldMirror.new()
+	holder.add_child(w)
+	w.protos.add_entities([[4, "small-lamp", "lamp", -0.5, -0.5, 0.5, 0.5, 200, 200, 160, 1, 1]])
+	w.chunks[Vector2i.ZERO] = ChunkView.new()
+	w._add([961, 4, 5 * 256 + 128, 6 * 256 + 128, 0])
+	w._add([962, 4, 9 * 256 + 128, 6 * 256 + 128, 0])
+	var lamps := LampLights.new()
+	lamps.protos = w.protos
+	lamps.world = w
+	holder.add_child(lamps)
+	lamps._on_entities_changed(Vector2i.ZERO)  # world.gd says so once the chunk is built
+	w.handle({"t": "st", "l": [961, 1, 962, 0]})
+	lamps.darkness = 0.0
+	lamps._process(LampLights.REFRESH)
+	var by_day: int = lamps.lit_count()
+	lamps.darkness = 0.85
+	lamps._process(LampLights.REFRESH)
+	# (The glows' MultiMesh keeps no transforms under the headless dummy renderer: where they were put is read.)
+	var mm: MultiMesh = lamps._bulbs.multimesh
+	var lights: Array = lamps._lights
+	var light: OmniLight3D = lights[0]
+	var flat_glow: Vector3 = lamps._spots[0] if lamps._spots.size() == 1 else Vector3.ZERO
+	check(by_day == 0 and lamps.lit_count() == 1 and mm.visible_instance_count == 1
+		and flat_glow.is_equal_approx(Vector3(5.5, LampLights.GLASS_HEIGHT, 6.5)) and light.visible and not (lights[1] as OmniLight3D).visible
+		and is_equal_approx(light.position.y, LampLights.LIGHT_HEIGHT),
+		"lamps: the working one lit at night with a glow and a light, the one reported off dark, none by day: %d %d %s" % [by_day, lamps.lit_count(), flat_glow])
+	# K5: no ball over the lamp: Factorio's lit-lamp picture, added over the lamp facing the camera and
+	# drawn in front of its head, centred on the glass inside the model's 0.6-tile head; the light just
+	# over the head, so the head's top and the ground round it are lit. (Fails on the old bulb.)
+	var glow_mat := lamps._bulbs.material_override as StandardMaterial3D
+	var head_top := 0.6
+	check(mm.mesh is QuadMesh and glow_mat != null and glow_mat.blend_mode == BaseMaterial3D.BLEND_MODE_ADD
+		and glow_mat.billboard_mode == BaseMaterial3D.BILLBOARD_ENABLED and glow_mat.grow and glow_mat.albedo_texture != null
+		and flat_glow.y < head_top and flat_glow.y > 0.25 and light.position.y > head_top and light.position.y < head_top + 0.5
+		and light.omni_range > 4.0,
+		"K5: the lamp's glass glows (Factorio's picture over it, centred %.2f up, under its head's top) and its light is just over the head (%.2f)" % [flat_glow.y, light.position.y])
+	# K10: a lamp its circuit network (or its window) colours, `st` `lc`: its glow and light take the colour, a
+	# white one keeps the warm look. The glow's albedo multiplies its instance colour in linear light, so the
+	# drawn glow is the lamp's colour (in linear light) at the white glow's brightest channel.
+	var white_tint: Color = lamps._tints[0]
+	var white_light := light.light_color
+	w.handle({"t": "st", "l": [961, 1], "lc": [961, 0x2060FF]})
+	lamps._process(LampLights.REFRESH)
+	var want := Color8(0x20, 0x60, 0xFF)
+	var g_lin := LampLights.GLOW_COLOR.srgb_to_linear()
+	var tint: Color = lamps._tints[0]
+	var drawn := Vector3(g_lin.r * tint.r, g_lin.g * tint.g, g_lin.b * tint.b)
+	var w_lin := want.srgb_to_linear()
+	var expect := Vector3(w_lin.r, w_lin.g, w_lin.b) * g_lin.r
+	check(white_tint == Color.WHITE and white_light == LampLights.LIGHT_COLOR and lamps.lit_count() == 1
+		and drawn.is_equal_approx(expect) and light.light_color.is_equal_approx(want)
+		and is_equal_approx(light.omni_range, LampLights.COLORED_RANGE),
+		"K10: a coloured lamp's glow and light take its colour (%s, light %s), a white one is warm (%s)" % [drawn, light.light_color, white_light])
+	# A state for it without `lc`: the bridge sends the colour with every state of a coloured lamp, so none is white.
+	w.handle({"t": "st", "l": [961, 1]})
+	lamps._process(LampLights.REFRESH)
+	var back_white: bool = lamps._tints[0] == Color.WHITE and light.light_color == LampLights.LIGHT_COLOR \
+		and is_equal_approx(light.omni_range, LampLights.LIGHT_RANGE)
+	w.handle({"t": "st", "l": [], "lc": [961, 0xFF0000]})
+	lamps._process(LampLights.REFRESH)
+	var red: bool = light.light_color.is_equal_approx(Color(1, 0, 0))
+	w.handle({"t": "st", "l": [], "lc": [961, -1]})
+	lamps._process(LampLights.REFRESH)
+	var minus_one: bool = lamps._tints[0] == Color.WHITE and light.light_color == LampLights.LIGHT_COLOR
+	w.handle({"t": "st", "l": [], "lc": [961, 0]})
+	lamps._process(LampLights.REFRESH)
+	var black_dark: bool = lamps.lit_count() == 0 and not light.visible
+	w.handle({"t": "st", "l": [961, 1]})
+	lamps._process(LampLights.REFRESH)
+	check(back_white and red and minus_one and black_dark and lamps.lit_count() == 1,
+		"K10: a state without a colour, and -1, are white; a colour alone changes it; black lights nothing: %s %s %s %s"
+		% [back_white, red, minus_one, black_dark])
+	# Hills 3 tiles high under both: the glow and its light go up with the lamp's model, once.
+	var hill := Image.create(16, 16, false, Image.FORMAT_RF)
+	hill.fill(Color(3.0, 0.0, 0.0))
+	G.set_field(hill, Vector2(-8, -8), 2.0)
+	lamps._process(LampLights.REFRESH)
+	var ground := G.at(5.5, 6.5)
+	var hill_glow: Vector3 = lamps._spots[0]
+	var hill_light := light.position
+	G.clear()
+	check(is_equal_approx(ground, 3.0) and is_equal_approx(hill_glow.y, ground + LampLights.GLASS_HEIGHT)
+		and is_equal_approx(hill_light.y, ground + LampLights.LIGHT_HEIGHT) and light.visible,
+		"J19: on a hill %.1f tiles high a lit lamp's glow (%.2f) and light (%.2f) stand on its lifted model, not inside the hill"
+		% [ground, hill_glow.y, hill_light.y])
+	# Flat again: back down.
+	lamps._process(LampLights.REFRESH)
+	check(is_equal_approx(lamps._spots[0].y, LampLights.GLASS_HEIGHT) and is_equal_approx(light.position.y, LampLights.LIGHT_HEIGHT),
+		"lamps: back on flat ground, the glow and light are back down")
+	# K20: a lamp set to Always on (`st` `ao`, with its state) shines by day as well: its glow dimmer, added
+	# over the sunlit lamp, its light faint. A plain one the bridge says works (a state from the night it no
+	# longer hears, or the mock's) waits for the dark. (Fails on the old code: by day nothing was lit.)
+	w.handle({"t": "st", "l": [961, 1, 962, 1], "ao": [962, 1]})
+	lamps.darkness = 0.0
+	lamps._process(LampLights.REFRESH)
+	var noon_lit: int = lamps.lit_count()
+	var noon_spot: Vector3 = lamps._spots[0] if lamps._spots.size() == 1 else Vector3.ZERO
+	var noon_tint: Color = lamps._tints[0] if lamps._tints.size() == 1 else Color.BLACK
+	check(noon_lit == 1 and noon_spot.is_equal_approx(Vector3(9.5, LampLights.GLASS_HEIGHT, 6.5)) and light.visible
+		and is_equal_approx(noon_tint.r, LampLights.DAY_GLOW) and is_equal_approx(noon_tint.b, LampLights.DAY_GLOW)
+		and is_equal_approx(noon_tint.a, 1.0) and is_equal_approx(light.light_energy, 1.6 * LampLights.DAY_LIGHT)
+		and light.position.is_equal_approx(noon_spot + Vector3(0.0, LampLights.LIGHT_HEIGHT - LampLights.GLASS_HEIGHT, 0.0)),
+		"K20: at noon the always-on lamp is lit (glow %.2f of the night's, light %.2f), the plain one reported working isn't: %d lit"
+		% [noon_tint.r, light.light_energy, noon_lit])
+	# Dusk: the always-on one's glow and light grow with the darkness, full once the plain lamps come on.
+	lamps.darkness = LampLights.ON_DARKNESS * 0.5
+	lamps._process(LampLights.REFRESH)
+	var dusk_tint: Color = lamps._tints[0] if lamps._tints.size() == 1 else Color.BLACK
+	var dusk_ok: bool = lamps.lit_count() == 1 and dusk_tint.r > LampLights.DAY_GLOW and dusk_tint.r < 1.0 \
+		and light.light_energy > 1.6 * LampLights.DAY_LIGHT and light.light_energy < 1.6
+	lamps.darkness = 0.85
+	lamps._process(LampLights.REFRESH)
+	var night_both: bool = lamps.lit_count() == 2 and lamps._tints[0] == Color.WHITE and lamps._tints[1] == Color.WHITE \
+		and is_equal_approx(light.light_energy, 1.6)
+	# Always on turned off (ao 0), or a state without `ao` (the bridge sends it with every state of such a lamp):
+	# a plain lamp again, dark by day.
+	w.handle({"t": "st", "l": [], "ao": [962, 0]})
+	lamps.darkness = 0.0
+	lamps._process(LampLights.REFRESH)
+	var off_again: bool = lamps.lit_count() == 0 and not light.visible
+	w.handle({"t": "st", "l": [962, 1], "ao": [962, 1]})
+	lamps._process(LampLights.REFRESH)
+	var on_again: bool = lamps.lit_count() == 1
+	w.handle({"t": "st", "l": [962, 1]})
+	lamps._process(LampLights.REFRESH)
+	var plain_again: bool = lamps.lit_count() == 0
+	w.handle({"t": "st", "l": [962, 1], "ao": [962, 1]})
+	w._remove(962)
+	check(dusk_ok and night_both and off_again and on_again and plain_again and not w.lamp_always.has(962),
+		"K20: at dusk it brightens (glow %.2f), at night both lit as before; ao 0, or a state without it, is a plain lamp again (dark by day); a removed lamp is forgotten: %s %s %s %s %s"
+		% [dusk_tint.r, dusk_ok, night_both, off_again, on_again, plain_again])
+	holder.queue_free()
+
+
+## J19's follow-up: the rest of what is placed on the CPU at the flat height, which sat inside an
+## add-on's raised ground (ground_height.gd) while the models, cards and ground round it were lifted
+## in their shaders: the character's lantern, flashlight and thrusters, locomotives' headlights,
+## furnaces' fires' and labs' lights, a turret's flash, flame and beam, a launch's engine light, the
+## ridden pod's flame, explosions', fires' and rockets' lights, lightning, corpses' puddles, and the
+## plain-material marks (territory borders, modded robots' shadows, the throw and wire rings, the tile
+## brush), which now ride the hills in their shader. Each check fails on the old code.
+func _hill_lights() -> void:
+	const G := preload("res://scripts/world/ground_height.gd")
+	const WorkingGlow := preload("res://scripts/world/working_glow.gd")
+	const MarkShader := preload("res://shaders/ground_mark.gdshader")
+	const CapsuleAim := preload("res://scripts/player/capsule_aim.gd")
+	const LightningScript := preload("res://scripts/fx/lightning.gd")
+	G.clear()
+	var holder := Node3D.new()
+	add_child(holder)
+	# Hills 3 tiles high from -64 to 64 both ways.
+	const HILL := 3.0
+	var hill := Image.create(32, 32, false, Image.FORMAT_RF)
+	hill.fill(Color(HILL, 0.0, 0.0))
+	var version_flat := G.version()
+	G.set_field(hill, Vector2(-64, -64), 4.0)
+	check(G.version() != version_flat and is_equal_approx(G.at(5.5, 6.5), HILL), "hills: a new field counts as a new version (%d -> %d)" % [version_flat, G.version()])
+	# The character's lantern and flashlight.
+	var me := Avatar.new()
+	holder.add_child(me)
+	me.snap_to(Vector2(5.5, 6.5))
+	me._process(1.0 / 60.0)
+	check(is_equal_approx(me._lantern.position.y, Avatar.LANTERN_HEIGHT + HILL) and is_equal_approx(me._flashlight.position.y, Avatar.flashlight_height() + HILL),
+		"hills: the character's lantern (%.2f) and flashlight (%.2f) stand over the hill, not inside it" % [me._lantern.position.y, me._flashlight.position.y])
+	if me._rig != null:
+		me._anim.thrust = 1.0
+		me._update_jets()
+		var smoke: CPUParticles3D = me._jets[0]["smoke"]
+		var flame: MeshInstance3D = me._jets[0]["flame"]
+		check(smoke.global_position.y > HILL - 0.5 and flame.global_position.y > HILL - 1.0,
+			"hills: the thrusters' smoke (%.2f) and flames (%.2f) come from the feet on the hill" % [smoke.global_position.y, flame.global_position.y])
+	# A locomotive's headlights.
+	var trains := MoverLayer.new()
+	var train_protos := ProtoDB.new()
+	train_protos.add_entities([[6, "locomotive", "locomotive", -1.0, -3.0, 1.0, 3.0, 1, 1, 1, 2, 6]])
+	trains.protos = train_protos
+	holder.add_child(trains)
+	trains.handle({"t": "mv", "k": 1, "l": [[903, 6, 0, 10 * 256, 0]]})
+	trains.set_night(1.0)
+	trains._process(1.0 / 60.0)
+	var loco = trains._movers[903]
+	var head: SpotLight3D = loco.headlights[0]
+	check(head.visible and is_equal_approx(head.position.y, MoverLayer.HEADLIGHT_HEIGHT + HILL),
+		"hills: a locomotive's headlights (%.2f) shine from its nose on the hill" % head.position.y)
+	# A stone furnace's fire light.
+	var w := WorldMirror.new()
+	holder.add_child(w)
+	w.protos.add_entities([[5, "stone-furnace", "furnace", -1.0, -1.0, 1.0, 1.0, 200, 120, 60, 2, 2]])
+	w.chunks[Vector2i.ZERO] = ChunkView.new()
+	w._add([971, 5, 6 * 256, 6 * 256, 0])
+	w.handle({"t": "st", "l": [971, 1]})
+	var glow := WorkingGlow.new()
+	glow.world = w
+	holder.add_child(glow)
+	glow._process(WorkingGlow.REFRESH)
+	var fire: OmniLight3D = glow._lights[0]
+	var fire_flat: float = (WorkingGlow.MACHINES["stone-furnace"][1] as Vector3).y + 0.3
+	check(glow.count() == 1 and fire.visible and is_equal_approx(fire.position.y, fire_flat + HILL),
+		"hills: a furnace's fire light (%.2f) is in its mouth on the hill" % fire.position.y)
+	# A turret's flash, flame and beam.
+	var turrets := TurretLayer.new()
+	holder.add_child(turrets)
+	var st = turrets._state(7202)
+	st.cfg = TurretLayer.TURRETS["flamethrower-turret"]
+	st.muzzle = Vector3(4.0, 1.0, 4.0)
+	st.target = Vector3(20.0, 0.45, 10.0)
+	st.target_seen = turrets._clock
+	st.flame_left = 0.2
+	turrets._update_effects(st, 1.0 / 60.0)
+	turrets._update_effects(st, 1.0 / 60.0)  # the flash's light, made by the first frame's flame, placed by the next
+	var ends: Array = turrets.beam_ends(st)
+	check(is_equal_approx(st.light.global_position.y, 1.0 + HILL) and is_equal_approx(st.flame_light.global_position.y, TurretLayer.FLAME_LANDING_HEIGHT + HILL)
+		and is_equal_approx((ends[0] as Vector3).y, 1.0 + HILL) and is_equal_approx((ends[1] as Vector3).y, 0.45 + HILL),
+		"hills: a turret's flash (%.2f), its flame's landing light (%.2f) and a beam's ends (%.2f, %.2f) are over the hill"
+		% [st.light.global_position.y, st.flame_light.global_position.y, (ends[0] as Vector3).y, (ends[1] as Vector3).y])
+	# A launch's engine light (and the stand-in rocket without a model).
+	var rockets = RocketsScript.new()
+	rockets.model = ChunkModel.new()
+	holder.add_child(rockets)
+	rockets._on_launch(1, Vector2(10, 10), "")
+	rockets._update_launches(1.0)
+	var launch: Dictionary = rockets._launches[0]
+	var engine: OmniLight3D = launch["light"]
+	var body: MeshInstance3D = (launch["node"] as Node3D).get_child(0)
+	check(is_equal_approx(engine.position.y, RocketsScript.HATCH_GLOW_HEIGHT + HILL)
+		and (not (body.mesh is CylinderMesh) or is_equal_approx(body.position.y, 6.0 + HILL)),
+		"hills: a launch's engine light (%.2f) comes up through the hatch of a silo on the hill" % engine.position.y)
+	# The ridden pod's flame, coming down onto the hill.
+	var ride := Ride.new()
+	holder.add_child(ride)
+	ride.state = Ride.ARRIVING
+	ride._ps = "descending"
+	ride._ground = Vector2(8, 8)
+	ride._pod_at = Vector2(8, 8)
+	ride._height = 10.0
+	ride._fly_pod()
+	var jet_y: float = ride._pod.position.y + ride._jet.position.y
+	check(ride._jet.visible and is_equal_approx(jet_y, 10.0 + Ride.JET_BELOW + HILL),
+		"hills: the ridden pod's flame (%.2f) burns under the pod over the hill" % jet_y)
+	# Explosions', fires' and rockets' lights.
+	var wf := WeaponFx.new()
+	holder.add_child(wf)
+	wf.explode("big-demolisher-fissure", Vector3(12.0, 0.0, 12.0))
+	var fire_ground := WeaponFx.Ground.new()
+	fire_ground.fire = true
+	fire_ground.pos = Vector3(-12.0, 0.0, 12.0)
+	fire_ground.cards = [[SpriteFx.Card.new(), 1.0]]
+	wf._ground[991] = fire_ground
+	var flyer := WeaponFx.Flyer.new()
+	flyer.rec = {"l": [1.0, 4.0, [1.0, 0.6, 0.2]]}
+	var flyer_card := SpriteFx.Card.new()
+	flyer_card.pos = Vector3(12.0, 0.8, -12.0)
+	flyer.cards = [[flyer_card, 1.0, 1.0]]
+	wf._flying[992] = flyer
+	wf._update_lights(0.0)
+	var lit_at := {}
+	for l: OmniLight3D in wf._lights:
+		if l.visible:
+			lit_at[Vector2i(roundi(l.position.x), roundi(l.position.z))] = l.position.y
+	check(is_equal_approx(float(lit_at.get(Vector2i(12, 12), -1.0)), 0.5 + HILL) and is_equal_approx(float(lit_at.get(Vector2i(-12, 12), -1.0)), 0.8 + HILL)
+		and is_equal_approx(float(lit_at.get(Vector2i(12, -12), -1.0)), 0.8 + HILL),
+		"hills: an explosion's, a fire's and a rocket's lights are over the hill: %s" % lit_at)
+	# Lightning: the bolt down to the hill and its light.
+	var storm := LightningScript.new()
+	holder.add_child(storm)
+	storm.strike(Vector2(10, 20))
+	var bolt = storm.bolts[0] if storm.bolts.size() > 0 else null
+	var strike: Vector3 = (bolt.paths[0] as PackedVector3Array)[-1] if bolt != null else Vector3.ZERO
+	check(bolt != null and strike.is_equal_approx(Vector3(10, HILL, 20)) and bolt.light != null and is_equal_approx(bolt.light.position.y, 3.0 + HILL),
+		"hills: lightning strikes the hill (%s), its light over it" % strike)
+	# A corpse's puddle lies on the hill.
+	check(Creatures._puddle_lift(Vector3(5.5, 0.0, 6.5)) > Creatures.PUDDLE_HEIGHT + HILL - 0.001,
+		"hills: a corpse's puddle (%.3f) lies on the hill" % Creatures._puddle_lift(Vector3(5.5, 0.0, 6.5)))
+	# Plain-material marks ride the hills in their shader.
+	var borders := TerritoryLayer.new()
+	holder.add_child(borders)
+	var robot_node := Node3D.new()
+	var robot_part := MeshInstance3D.new()
+	robot_part.mesh = BoxMesh.new()
+	robot_node.add_child(robot_part)
+	var robot_shadow: Node3D = trains._make_shadow(robot_node)
+	var aim := CapsuleAim.new()
+	var wires := WireTool.new()
+	var brush := TileBrush.new()
+	holder.add_child(brush)
+	var marks := [borders.material_override, (robot_shadow.get_child(0) as MeshInstance3D).material_override, aim._ok_mat, aim._bad_mat,
+		wires._material, brush._mmi.material_override]
+	var lifted := marks.filter(func(m: Material) -> bool: return m is ShaderMaterial and (m as ShaderMaterial).shader == MarkShader)
+	check(lifted.size() == marks.size(), "hills: territory borders, robots' drop shadows, the throw and wire rings and the tile brush ride the hills: %d of %d" % [lifted.size(), marks.size()])
+	robot_node.free()
+	robot_shadow.free()
+	aim.free()
+	wires.free()
+	# Flat again: the character's lights back down.
+	G.clear()
+	me._process(1.0 / 60.0)
+	check(is_equal_approx(me._lantern.position.y, Avatar.LANTERN_HEIGHT) and G.version() != version_flat,
+		"hills: back on flat ground, the character's lantern is back down (%.2f)" % me._lantern.position.y)
+	turrets.reset()
+	wf._flying.clear()  # (reset() lets their cards go through sprite_fx.gd, which this one has none of)
+	wf._ground.clear()
+	holder.queue_free()
+
+
+## Issue #17 (camera_rig.gd focus_fix; owner: "camera still sags below the character, should just always
+## be in the middle"): the character's body is at the screen's centre in every view, on a 3-tile hill and
+## on flat ground: zoomed all the way in at the lowest tilt, the default view, far out, looking down,
+## orthographic and Factorio's view (F6, at its 48 degrees), with Camera follows the hills off (and an old
+## saved value on changing nothing); the camera over the ground in each. The first camera fix kept the
+## default view level on hills (the character 13% of the screen low on a 3-tile hill) and centred the feet
+## from the default zoom out. A hill behind the camera tilts the view up over it, the character still in
+## the middle, and the tilt eases back once it is gone; running over hills the character stays in the
+## middle (the old follow trailed it by a sixth of the screen zoomed in) without jumps; a jump glides
+## over; flying, the centre rises with the body; the remote view centres on the ground; --camera-focus=off
+## is the old camera.
+func _camera_focus() -> void:
+	CameraRig.GroundHeight.clear()
+	var follow_was = Settings.get_value("camera", "follow_hills")
+	Settings.set_value("camera", "follow_hills", false)
+	var vp := SubViewport.new()
+	vp.size = Vector2i(1920, 1080)
+	vp.render_target_update_mode = SubViewport.UPDATE_DISABLED
+	add_child(vp)
+	var me := Node3D.new()
+	vp.add_child(me)
+	var rig := CameraRig.new()
+	rig.target = me
+	vp.add_child(rig)
+	var run := func(frames: int) -> void:
+		for i in frames:
+			rig._process(1.0 / 60.0)
+	# A field of heights h(x, z), a texel a tile, round the origin.
+	var field := func(h: Callable) -> void:
+		var img := Image.create(128, 128, false, Image.FORMAT_RF)
+		for j in 128:
+			for i in 128:
+				img.set_pixel(i, j, Color(float(h.call(-64.0 + i + 0.5, -64.0 + j + 0.5)), 0.0, 0.0))
+		CameraRig.GroundHeight.set_field(img, Vector2(-64, -64), 1.0)
+	# The 1.7-tile character's middle on the hills (`lift` more up, flying): how far off the screen's
+	# centre (a share of its height), and how far the camera is over the ground under it.
+	var off_centre := func(lift: float) -> float:
+		var body := Vector3(me.position.x, CameraRig.GroundHeight.at(me.position.x, me.position.z) + 0.85 + lift, me.position.z)
+		if rig.camera.is_position_behind(body):
+			return INF
+		return (rig.camera.unproject_position(body) - Vector2(960, 540)).length() / 1080.0
+	var over_ground := func() -> float:
+		var eye: Vector3 = rig.camera.global_position
+		return eye.y - CameraRig.GroundHeight.at(eye.x, eye.z)
+	var closest := func(yaw: float) -> void:
+		rig._snap(yaw, CameraRig.MIN_PITCH, CameraRig.MIN_DISTANCE, false)
+		rig.global_position = me.position  # as main.gd puts it after a jump
+	# Every view, settled: "name off% over" for each, and whether all are centred and over the ground.
+	var views := func() -> Array:
+		var said := []
+		var ok := true
+		for v in [["closest, lowest tilt", 45.0, CameraRig.MIN_PITCH, CameraRig.MIN_DISTANCE, false], ["default", 45.0, 50.0, 30.0, false],
+				["far out", 45.0, 50.0, 140.0, false], ["looking down", 0.0, CameraRig.MAX_PITCH, 12.0, false],
+				["orthographic", 45.0, 50.0, 30.0, true], ["Factorio's view", 0.0, 0.0, 0.0, true]]:
+			if v[0] == "Factorio's view":
+				rig._saved_view = {}
+				rig.toggle_factorio_view()
+			else:
+				rig._snap(v[1], v[2], v[3], v[4])
+			rig.global_position = me.position
+			run.call(150)
+			var off: float = off_centre.call(0.0)
+			var over: float = over_ground.call()
+			ok = ok and off < 0.01 and over >= 1.0 and is_equal_approx(rig.shown_pitch(), CameraRig.FACTORIO_PITCH if v[0] == "Factorio's view" else rig.pitch_degrees)
+			said.append("%s %.1f%% %.1f" % [v[0], minf(off, 9.99) * 100.0, over])
+			if v[0] == "Factorio's view":
+				rig.toggle_factorio_view()
+		return [ok, ", ".join(said)]
+	# A 3-tile plateau.
+	const HILL := 3.0
+	field.call(func(_x: float, _z: float) -> float: return HILL)
+	me.position = Vector3(5.5, 0.0, 6.5)
+	var on_hill: Array = views.call()
+	check(on_hill[0], "issue #17: on a %d-tile hill the character is in the middle in every view, the camera over the ground (off the centre, tiles over the ground): %s" % [int(HILL), on_hill[1]])
+	# An old saved Camera follows the hills changes nothing now.
+	rig._snap(45.0, 50.0, 30.0, false)
+	run.call(150)
+	var y_off: float = rig.global_position.y
+	Settings.set_value("camera", "follow_hills", true)
+	run.call(150)
+	var y_on: float = rig.global_position.y
+	Settings.set_value("camera", "follow_hills", false)
+	check(is_equal_approx(y_off, y_on) and absf(y_off - (HILL + 0.85)) < 0.01,
+		"the old Camera follows the hills changes nothing: the centre on the body (%.2f, %.2f) either way" % [y_off, y_on])
+	# The switch off: the camera as before, at the flat height inside the hill.
+	CameraRig.focus_fix = false
+	closest.call(45.0)
+	run.call(120)
+	var old_above: float = over_ground.call()
+	var old_centre: float = off_centre.call(0.0)
+	CameraRig.focus_fix = true
+	check(old_above < 0.0 and old_centre > 0.3,
+		"--camera-focus=off: the old camera, inside the hill (%.2f) with the character off the centre (%.0f%%)" % [old_above, minf(old_centre, 9.99) * 100.0])
+	# Flat ground: the body in the middle too, not the feet.
+	CameraRig.GroundHeight.clear()
+	var flat: Array = views.call()
+	check(flat[0], "on flat ground the character's body is in the middle in every view: %s" % flat[1])
+	# Flying in mech armour the centre rises with the body as drawn.
+	var flyer_gs := GDScript.new()
+	flyer_gs.source_code = "extends Node3D\nfunc drawn_lift() -> float:\n\treturn 1.0\n"
+	flyer_gs.reload()
+	var flyer: Node3D = flyer_gs.new()
+	vp.add_child(flyer)
+	flyer.position = me.position
+	rig.target = flyer
+	rig._snap(45.0, 50.0, 30.0, false)
+	run.call(150)
+	var fly_off: float = off_centre.call(1.0)
+	rig.target = me
+	flyer.queue_free()
+	check(fly_off < 0.01, "flying, the body a tile up is in the middle (%.1f%% off)" % (minf(fly_off, 9.99) * 100.0))
+	# The map's remote view centres on the ground it looks at, on the hills.
+	field.call(func(_x: float, _z: float) -> float: return HILL)
+	rig.in_remote = true
+	run.call(150)
+	var remote_y: float = rig.global_position.y
+	rig.in_remote = false
+	check(absf(remote_y - HILL) < 0.01, "the remote view centres on the ground on the hill (%.2f)" % remote_y)
+	# A jump (a teleport, another target) glides over instead of cutting.
+	run.call(150)
+	me.position += Vector3(50.0, 0.0, 0.0)
+	run.call(1)
+	var gap_after_one: float = Vector2(rig.global_position.x, rig.global_position.z).distance_to(Vector2(me.position.x, me.position.z))
+	run.call(180)
+	var gap_after: float = Vector2(rig.global_position.x, rig.global_position.z).distance_to(Vector2(me.position.x, me.position.z))
+	check(gap_after_one > 40.0 and gap_after < 0.01, "a 50-tile jump glides over (%.1f tiles to go a frame on, %.3f after 3 s)" % [gap_after_one, gap_after])
+	# A slope rising behind the camera (south-east of the character at yaw 45) to 6 tiles: the view tilts
+	# up over it, round the character.
+	field.call(func(x: float, z: float) -> float: return clampf((x + z) / sqrt(2.0) - 2.0, 0.0, 4.0) * 1.5)
+	me.position = Vector3(0.5, 0.0, 0.5)
+	closest.call(45.0)
+	run.call(60)
+	var lifted: float = rig.shown_pitch()
+	var above_b: float = over_ground.call()
+	var centre_b: float = off_centre.call(0.0)
+	check(lifted > CameraRig.MIN_PITCH + 5.0 and above_b >= CameraRig.CLEARANCE - 0.01 and centre_b < 0.01,
+		"a hill behind the camera tilts the view up (%.1f degrees) over it (%.2f tiles), the character still in the middle (%.1f%% off)"
+		% [lifted, above_b, minf(centre_b, 9.99) * 100.0])
+	# Gone again: the tilt eases back down to the player's.
+	CameraRig.GroundHeight.clear()
+	run.call(1)
+	var easing: float = rig.shown_pitch()
+	run.call(240)
+	check(easing > CameraRig.MIN_PITCH + 1.0 and easing < lifted and absf(rig.shown_pitch() - CameraRig.MIN_PITCH) < 0.01,
+		"with the hill gone the view eases back (%.1f degrees a frame on) to the player's tilt (%.2f)" % [easing, rig.shown_pitch()])
+	# Running (9 tiles a second) along rolling hills, a ridge behind the camera coming and going, zoomed
+	# in at the lowest tilt and at the default view: on every frame over the ground, the character in the
+	# middle (the height's small glide aside), and no jumps.
+	field.call(func(x: float, z: float) -> float:
+		return 2.0 + 1.5 * sin(TAU * x / 24.0) + 2.5 * (0.5 + 0.5 * sin(TAU * x / 40.0)) * smoothstep(1.0, 6.0, z))
+	for view in ["closest", "default"]:
+		me.position = Vector3(-40.0, 0.0, 0.5)
+		if view == "closest":
+			closest.call(0.0)
+		else:
+			rig._snap(0.0, 50.0, 30.0, false)
+			rig.global_position = me.position
+		run.call(60)
+		var lowest := INF
+		var worst := 0.0
+		var jolt := 0.0
+		var eyes: Array[Vector3] = []
+		var raised := 0
+		while me.position.x < 40.0:
+			me.position.x += 9.0 / 60.0
+			rig._process(1.0 / 60.0)
+			lowest = minf(lowest, over_ground.call())
+			worst = maxf(worst, off_centre.call(0.0))
+			eyes.append(rig.camera.global_position)
+			if rig.shown_pitch() > rig.pitch_degrees + 0.5:
+				raised += 1
+			if eyes.size() > 20:  # past the start, where the test's character is at full speed at once
+				jolt = maxf(jolt, (eyes[-1] - 2.0 * eyes[-2] + eyes[-3]).length())
+		var ridge_ok := raised > 30 and raised < eyes.size() - 30 if view == "closest" else raised == 0
+		check(lowest >= CameraRig.CLEARANCE - 0.01 and worst < 0.02 and jolt < 0.06 and ridge_ok,
+			"running over hills (%s view): the camera at least %.2f tiles over the ground, the character at most %.1f%% off the centre, no jumps (%.3f tiles a frame squared), the view raised over the ridge on %d of %d frames"
+			% [view, lowest, minf(worst, 9.99) * 100.0, jolt, raised, eyes.size()])
+	CameraRig.GroundHeight.clear()
+	Settings.set_value("camera", "follow_hills", follow_was)
+	vp.queue_free()
 
 
 ## Contact shading (contact_shade.gd): a model's foot from its lowest vertices, the rim's strength by
@@ -786,6 +1781,108 @@ func _ao_zoom() -> void:
 	cam.queue_free()
 
 
+## The 0.2.1 performance hotfix's post-processing: the same picture for less. Zenith's cloud shadow
+## quad hidden while it would draw nothing, the smog's pass only while smog can show in view, the
+## sun's map at most 4096 under soft shadows behind --soft-shadow-atlas, and look passes drawn first
+## of their priority (flat ground clutter sharing it was drawn and then covered).
+func _post_hotfix() -> void:
+	var SkyScript := preload("res://scripts/world/sky.gd")
+	var sky: Node = SkyScript.new()
+	add_child(sky)
+	var env := Environment.new()
+	var sun := DirectionalLight3D.new()
+	add_child(sun)
+	var quad: MeshInstance3D = sky.get_node("CloudShadows")
+	sky.set_clouds(true)
+	sky.set_planet("nauvis")
+	sky.apply(env, sun, 0.0, 0.0, 0.016, false)
+	var day: bool = quad.visible
+	sky.apply(env, sun, 0.5, 1.0, 0.016, false)
+	var night: bool = quad.visible
+	sky.set_planet("gleba")
+	sky.apply(env, sun, 0.5, 1.0, 0.016, false)
+	var hazy: bool = quad.visible
+	sky.set_planet("nauvis")
+	sky.apply(env, sun, 0.0, 0.0, 0.016, true)
+	var space: bool = quad.visible
+	check(day and not night and hazy and not space,
+		"cloud shadows: drawn by day, hidden at night where they draw nothing, kept for Gleba's haze, none in space (%s %s %s %s)" % [day, night, hazy, space])
+	sky.queue_free()
+	sun.queue_free()
+
+	# Smog: the chunks the pass can read for the camera, and the pass only while one of them has smog.
+	var PollutionScript := preload("res://scripts/world/pollution.gd")
+	var cam := Camera3D.new()
+	cam.fov = 35.0
+	add_child(cam)
+	cam.make_current()
+	var screen := get_viewport().get_visible_rect().size
+	var over := func(x: float, z: float) -> void:
+		cam.look_at_from_position(Vector3(x, sin(deg_to_rad(50.0)) * 30.0, z + cos(deg_to_rad(50.0)) * 30.0), Vector3(x, 0.0, z))
+	over.call(0.0, 0.0)
+	var rect: Variant = PollutionScript.view_chunks(cam, screen, -1.5)
+	check(rect is Rect2i and (rect as Rect2i).has_point(Vector2i(0, 0)) and (rect as Rect2i).has_point(Vector2i(-1, -1))
+		and not (rect as Rect2i).has_point(Vector2i(10, 0)),
+		"smog: the angled view 30 tiles off reads the chunks round where it looks and a chunk beyond, not ten chunks off: %s" % [rect])
+	cam.look_at_from_position(Vector3(0, 1.6, 0), Vector3(0, 1.6, -10))
+	check(not (PollutionScript.view_chunks(cam, screen, -1.5) is Rect2i), "smog: with the horizon in view, any chunk's smog may show")
+	cam.projection = Camera3D.PROJECTION_ORTHOGONAL
+	cam.size = 60.0
+	cam.look_at_from_position(Vector3(0, 100, 1), Vector3.ZERO)
+	var flat: Variant = PollutionScript.view_chunks(cam, screen, -1.5)
+	check(flat is Rect2i and (flat as Rect2i).has_point(Vector2i(0, 0)) and (flat as Rect2i).size.x <= 8,
+		"smog: Factorio's flat view reads the chunks under its square: %s" % [flat])
+	cam.projection = Camera3D.PROJECTION_PERSPECTIVE
+	var pol: Node3D = PollutionScript.new()
+	add_child(pol)
+	var smog: MeshInstance3D = pol.get_node("Smog")
+	over.call(0.0, 0.0)
+	pol.update(Vector2.ZERO, 0.0, 0.05)
+	var none: bool = smog.visible
+	# A heavily polluted chunk ten chunks east (x 320-352), eased in over EASE seconds.
+	pol.handle({"t": "pol", "w": 1, "cx": 10, "cy": 0, "md": 60, "l": [4000]})
+	for i in 120:
+		pol.update(Vector2.ZERO, 0.0, 0.05)
+	var away: bool = smog.visible
+	over.call(336.0, 16.0)
+	pol.update(Vector2(336.0, 16.0), 0.0, 0.05)
+	var on: bool = smog.visible
+	# Looking at the chunk before it, the pass may read its texel (the reads blend chunk centres).
+	over.call(296.0, 16.0)
+	pol.update(Vector2(296.0, 16.0), 0.0, 0.05)
+	var near: bool = smog.visible
+	pol.clear()
+	pol.update(Vector2(336.0, 16.0), 0.0, 0.05)
+	var cleared: bool = smog.visible
+	check(not none and not away and on and near and not cleared,
+		"smog: no pass without pollution, nor with it ten chunks off; drawn over it and over the chunk before it, gone at once on a new surface (%s %s %s %s %s)" % [none, away, on, near, cleared])
+	pol.queue_free()
+	cam.queue_free()
+
+	# The sun's map under soft shadows: the quality's own by default (the owner: 4096 stair-stepped the edges
+	# close up), at most 4096 with --soft-shadow-atlas=4096 (measured: 1.5 ms less at Ultra under the look).
+	var cap_was := SunShadows.soft_atlas_cap
+	SunShadows.soft_atlas_cap = 0
+	var off: int = SunShadows.atlas_for(SunShadows.QUALITY["ultra"], 1.4)
+	SunShadows.soft_atlas_cap = 4096
+	var soft: int = SunShadows.atlas_for(SunShadows.QUALITY["ultra"], 1.4)
+	var hard: int = SunShadows.atlas_for(SunShadows.QUALITY["ultra"], 0.0)
+	var low: int = SunShadows.atlas_for(SunShadows.QUALITY["low"], 1.4)
+	SunShadows.soft_atlas_cap = cap_was
+	check(cap_was == 0 and off == 8192 and soft == 4096 and hard == 8192 and low == 2048,
+		"sun shadows: Ultra's 8192 map under soft shadows by default, 4096 with --soft-shadow-atlas=4096 (%d; %d %d %d %d)" % [cap_was, off, soft, hard, low])
+
+	# Look passes first among what shares their priority (a Looks node outside the tree: the game's
+	# stays the active one).
+	var looks: Node3D = LooksScript.new()
+	var probe := Shader.new()
+	probe.code = "shader_type spatial;\nvoid fragment() {\n\tALBEDO = vec3(1.0);\n}\n"
+	var pass_node: MeshInstance3D = looks._make_pass({"shader": probe}, "ui-test")
+	check(pass_node != null and pass_node.material_override.render_priority == -128 and pass_node.sorting_offset < -10000.0,
+		"look passes: the first at -128, drawn before the ground clutter sharing that priority, wherever the camera is")
+	looks.free()
+
+
 ## The sections `--only=` asks for, or none.
 func _only_sections() -> PackedStringArray:
 	for arg in OS.get_cmdline_user_args():
@@ -816,6 +1913,7 @@ func _run_only(names: PackedStringArray, values: Dictionary) -> void:
 		if known:
 			print("--- " + section)
 			await callv(section, methods[section].map(func(a: String): return values[a]))
+	_nothing_left_behind()
 	print("FAILS: %d" % fails)
 	get_tree().quit(1 if fails else 0)
 
@@ -881,6 +1979,297 @@ func _planet_spin() -> void:
 		unheard.advance(1.0 / 60.0)
 	check(absf(rad_to_deg(unheard.angle("gleba")) - rad_to_deg(u0 * TAU) - 360.0 / 600.0) < 0.01,
 		"before any update a planet turns at Factorio's own day length (Gleba's 10 minutes)")
+
+
+## Nauvis's enemies' skins and poses (I23): each tier's carapace is its sprite's mask layers per vertex
+## under the tier's own tints from the prototypes (creature_skins.json, skin_mode 1 for biters and
+## spitters, 2 for worms and spawners); walking models carry their knees, the walk's bend and their
+## attack and corpse poses' legs (creature_rigs.json, creature_poses.json); a biting or spitting
+## creature and a dying one are drawn with the walking model, its legs blended into the pose (the
+## instance's custom data a), not swapped to the pose's model.
+## Trees' crowns as pollution takes them (tools/models/nature: clumps of leaf cards round dark cores,
+## UV -1 a core, -2 solid leaves): merged into one material the cores share the cards' leaf surface
+## without its leaf_core reaching the cards; a tree's shadow stand-in casts its crown from a surface
+## of its own (cards drawn in to their spray, cores and solid leaves marked) in a shader that drops
+## them; tree-06's strands are leaves too; the spruce has no green cap left on top.
+func _tree_crowns() -> void:
+	var loaded := func(name: String, combine: bool) -> ArrayMesh:
+		var l := ModelLibrary.Load.new()
+		l.path = "res://assets/models/%s.glb" % name
+		l.combine = combine
+		l.run()
+		return ModelLibrary._commit_load(l, []) as ArrayMesh
+	var leaf_shader := load("res://shaders/factorio_material_leaf.gdshader") as Shader
+	var merged: ArrayMesh = loaded.call("tree-05", true)
+	var leaf_surface := -1
+	var bark_rows := []
+	for i in merged.get_surface_count():
+		var sm := merged.surface_get_material(i) as ShaderMaterial
+		if sm != null and sm.shader == leaf_shader:
+			leaf_surface = i
+		elif sm != null:
+			bark_rows = ModelLibrary.MaterialRows.rows(sm).map(func(r: Material) -> String: return r.resource_name)
+	var leaf_mat := merged.surface_get_material(maxi(leaf_surface, 0)) as ShaderMaterial
+	var leaf_rows: Array = ModelLibrary.MaterialRows.rows(leaf_mat).map(func(r: Material) -> String: return r.resource_name)
+	check(leaf_surface >= 0 and leaf_rows.size() == 2 and str(leaf_rows[0]).begins_with("leafcard") and str(leaf_rows[1]).begins_with("leaf-shadow")
+		and not bark_rows.any(func(n: String) -> bool: return n.begins_with("leaf")),
+		"merged, a tree's cores share its leaf cards' surface, not the bark's (%s; bark %s)" % [leaf_rows, bark_rows])
+	# A leaf row edited (nature_looks.gd gives them the prototype's colours): leaf_core stays the core row's.
+	var edited := ModelLibrary.MaterialRows.edit(leaf_mat, func(m: ShaderMaterial) -> bool: return m.shader == leaf_shader,
+		func(m: ShaderMaterial) -> void: m.set_shader_parameter("leaf_tint_count", 0)) as ShaderMaterial
+	check(edited != null and edited.get_shader_parameter("leaf_core") != true, "an edited merged crown doesn't make every card a core")
+	var uvs: PackedVector2Array = ModelLods.arrays_of(merged, maxi(leaf_surface, 0))[Mesh.ARRAY_TEX_UV]
+	var cores := 0
+	var cards := 0
+	for uv in uvs:
+		if uv.x < -0.5:
+			cores += 1
+		elif uv.x >= 0.0 and uv.x <= 1.0:
+			cards += 1
+	check(cores > 0 and cards > 0 and cores + cards == uvs.size(), "cores carry UV -1, cards 0-1 (%d, %d of %d)" % [cores, cards, uvs.size()])
+	# The shadow stand-in: the wood welded as before, the crown its own surface.
+	var plain: ArrayMesh = loaded.call("tree-05", false)
+	for job in [ModelLods._job_for(plain), ModelLods._job_for(merged)]:
+		check(job != null and not job.crown.is_empty() and not job.view_lods, "a tree's stand-in job knows its crown")
+		if job == null:
+			continue
+		job.run()
+		var kinds := {}
+		for uv in job.crown_uvs:
+			kinds[int(uv.y)] = true
+		check(job.crown_vertices.size() > 0 and job.crown_vertices.size() == job.crown_uvs.size() and kinds.has(0) and kinds.has(1)
+			and job.indices.size() >= 3, "its crown cast apart from its wood, cards and cores marked (%s)" % [kinds.keys()])
+	var card := PackedVector3Array()
+	var card_uv := PackedVector2Array()
+	var square := []
+	square.resize(Mesh.ARRAY_MAX)
+	square[Mesh.ARRAY_VERTEX] = PackedVector3Array([Vector3(0, 0, 0), Vector3(1, 0, 0), Vector3(1, 1, 0), Vector3(0, 1, 0)])
+	square[Mesh.ARRAY_TEX_UV] = PackedVector2Array([Vector2(0, 0), Vector2(1, 0), Vector2(1, 1), Vector2(0, 1)])
+	square[Mesh.ARRAY_TEX_UV2] = PackedVector2Array([Vector2(0, 0.25), Vector2(0, 0.25), Vector2(0, 0.25), Vector2(0, 0.25)])
+	square[Mesh.ARRAY_INDEX] = PackedInt32Array([0, 1, 2, 0, 2, 3])
+	ModelLods.Job.crown_arrays(square, false, card, card_uv)
+	check(card.size() == 6 and card[0].is_equal_approx(Vector3(0.5, 0.5, 0) + Vector3(-0.5, -0.5, 0) * ModelLods.Job.CARD_SHADOW)
+		and is_equal_approx(card_uv[0].x, 0.25) and card_uv[0].y == 0.0,
+		"a card's stand-in is drawn in to its spray's share round its middle, with its seed (%s)" % [card[0]])
+	check(load("res://shaders/shadow_stand_in_leaf.gdshader") is Shader and ModelLods.leaf_material().shader != ModelLods.material().shader,
+		"the crown's stand-in has a shader of its own that drops what pollution took")
+	# tree-06's strands: the leaves' shader, UV -2, solid leaves in the stand-in.
+	var weeping: ArrayMesh = loaded.call("tree-06", false)
+	var strands := false
+	for i in weeping.get_surface_count():
+		var sm := weeping.surface_get_material(i) as ShaderMaterial
+		if sm != null and sm.resource_name.begins_with("leaf-0") and sm.shader == leaf_shader:
+			var suv: PackedVector2Array = ModelLods.arrays_of(weeping, i)[Mesh.ARRAY_TEX_UV]
+			strands = suv.size() > 0 and suv[0].x < -1.5
+	check(strands, "tree-06's hanging leaves are drawn with the leaves' shader, marked solid leaves, so pollution takes them")
+	# K4: the spruce's green cap (material leaf-01, a solid cone pollution never took) is gone.
+	var spruce: ArrayMesh = loaded.call("tree-01", false)
+	var cap := false
+	for i in spruce.get_surface_count():
+		var m := spruce.surface_get_material(i)
+		cap = cap or (m != null and m.resource_name == "leaf-01")
+	check(not cap, "a bare (polluted) spruce keeps no green cone on its top")
+	var include_text := FileAccess.get_file_as_string("res://shaders/factorio_material.gdshaderinc")
+	check(include_text.contains("float leaf_kind = leaf_core ? 1.0 : (UV.x < -1.5 ? 2.0 : (UV.x < -0.5 ? 1.0 : 0.0));"),
+		"the leaves' shader tells cores and solid leaves from cards by their UV")
+
+
+func _creature_motion() -> void:
+	var names := ["small-biter", "behemoth-biter", "big-spitter", "medium-worm-turret", "spitter-spawner", "biter-spawner",
+		"small-biter-corpse", "small-biter-corpse-1", "small-biter-corpse-2", "small-biter-corpse-3"]
+	for n in names:
+		ModelLibrary.mesh_for(n)
+	var until := Time.get_ticks_msec() + 20000
+	while not names.all(func(n: String) -> bool: return ModelLibrary.ready(n)) and Time.get_ticks_msec() < until:
+		ModelLibrary.poll()
+		await get_tree().process_frame
+	# The rows (or surfaces' own materials) of a model whose material name contains `part`.
+	var rows_of := func(model: String, part: String) -> Array:
+		var out := []
+		var mesh := ModelLibrary.mesh_for(model) as Mesh
+		if mesh == null:
+			return out
+		for i in mesh.get_surface_count():
+			var m := mesh.surface_get_material(i) as ShaderMaterial
+			var list: Array = ModelLibrary.MaterialRows.rows(m)
+			for r in (list if not list.is_empty() else [m]):
+				if r != null and (r as ShaderMaterial).resource_name.contains(part):
+					out.append(r)
+		return out
+	var skins := {}
+	for pair in [["small-biter", "chitin"], ["behemoth-biter", "chitin"], ["big-spitter", "chitin"], ["medium-worm-turret", "flesh_worm"],
+			["spitter-spawner", "flesh_spawner_dome"], ["biter-spawner", "flesh_spawner_dome"], ["small-biter-corpse-2", "chitin"]]:
+		var found: Array = rows_of.call(pair[0], pair[1])
+		var r: ShaderMaterial = found[0] if not found.is_empty() else null
+		skins[pair[0]] = [r.get_shader_parameter("skin_mode"), r.get_shader_parameter("albedo"), r.get_shader_parameter("skin_tint2")] \
+			if r != null else [-1, Color.BLACK, Color.BLACK]
+	var tier := func(n: String, k: int) -> Color:
+		var t: Array = CreatureModels.skin_of(CreatureModels.base_model(n) if CreatureModels.base_model(n) != "" else n)["tiers"][n][k]
+		return Color(float(t[0]), float(t[1]), float(t[2])).linear_to_srgb()
+	var masks_ok: bool = int(skins["small-biter"][0]) == 1 \
+		and (skins["small-biter"][1] as Color).is_equal_approx(Color(tier.call("small-biter", 0), 1.0)) \
+		and is_equal_approx((skins["small-biter"][2] as Color).a, 0.7) and int(skins["behemoth-biter"][0]) == 1 \
+		and not (skins["behemoth-biter"][1] as Color).is_equal_approx(skins["small-biter"][1]) and int(skins["big-spitter"][0]) == 1 \
+		and int(skins["small-biter-corpse-2"][0]) == 1
+	var mask_ok: bool = int(skins["medium-worm-turret"][0]) == 2 and int(skins["spitter-spawner"][0]) == 2 \
+		and int(skins["biter-spawner"][0]) == 2 and is_equal_approx((skins["spitter-spawner"][2] as Color).a, 1.0) \
+		and is_equal_approx((skins["biter-spawner"][2] as Color).a, 0.5)
+	check(masks_ok and mask_ok, "each tier's carapace is its sprite's masks under the tier's own tints (two for biters and spitters, one over the colours for worms and spawners): %s" % [skins])
+	# A merged material's table carries the skin: flags 16 or 32, the second tint where the emission was.
+	var flags_ok := true
+	for n in ["small-biter", "medium-worm-turret"]:
+		for r: ShaderMaterial in rows_of.call(n, "chitin" if n.contains("biter") else "flesh_worm"):
+			var v: Array[Vector4] = ModelLibrary.MaterialRows.row_vectors(r)
+			flags_ok = flags_ok and int(v[1].w) & (16 if n.contains("biter") else 32) != 0 and v[5].w > 0.0
+	check(flags_ok, "the skin's mode and second tint reach a merged material's table")
+	# Knees, the walk's bend and the poses' legs on the walking model's material, at the tier's size.
+	var walk := (ModelLibrary.mesh_for("small-biter") as Mesh).surface_get_material(0) as ShaderMaterial
+	var knees: Array = walk.get_shader_parameter("rig_knee") if walk != null else []
+	var poses: Array = walk.get_shader_parameter("rig_pose") if walk != null else []
+	var rig: Dictionary = CreatureModels.rig("big-biter")
+	var reach := float((rig["limbs"][0] as Dictionary).get("reach", 0.0))
+	check(knees.size() == 12 and is_equal_approx((knees[0] as Vector4).w, reach * 0.5) and poses.size() == 60
+		and poses.slice(0, 6).any(func(p: Vector4) -> bool: return p != Vector4.ZERO)
+		and poses.slice(12, 18).any(func(p: Vector4) -> bool: return p != Vector4.ZERO),
+		"a walking model carries its knees (scaled with the tier) and its attack and corpse poses' legs: %s %s" % [knees.slice(0, 1), reach])
+	check(CreatureModels.pose_slot("small-biter-attack") == 0 and CreatureModels.pose_slot("behemoth-spitter-corpse-3") == 4
+		and CreatureModels.pose_slot("medium-biter-corpse") == 1 and CreatureModels.pose_slot("small-worm-turret-corpse") == -1,
+		"pose models map to the walking model's pose slots, none for a worm")
+	# Factorio's bite: the walk's stance at its first and last frames, the pose at frame 5 of 11; the
+	# spitter's 14 frames forward and back, the stance at the turn.
+	check(is_zero_approx(Creatures._bite_amount(0.0)) and is_equal_approx(Creatures._bite_amount(5.0 / 11.0), 1.0)
+		and is_zero_approx(Creatures._bite_amount(9.0 / 11.0)) and is_equal_approx(Creatures._rise_amount(0.5), 1.0)
+		and is_zero_approx(Creatures._rise_amount(0.0)), "the bite and the spit follow Factorio's attack frames")
+	# A biting biter is drawn with its walking model, its legs and body blended into the bite.
+	var heap := Creatures.new()
+	add_child(heap)
+	var node := Node3D.new()
+	node.position = Vector3(3, 0, 3)
+	heap.add(55, "small-biter", node)
+	heap.handle_attacks({"l": [55, roundi(4.0 * 256), roundi(3.0 * 256)]})
+	var models := {}
+	var most := 0.0
+	for f in 40:
+		heap._process(1.0 / 60.0)
+		var c = heap._creatures.get(55)
+		if c != null and not c.drawn.is_empty():
+			models[c.drawn_model] = true
+			var a: float = c.drawn[15]
+			if a >= 2.0 and a < 3.0:
+				most = maxf(most, (a - 2.0) / CreatureModels.POSE_SCALE)
+	check(models.keys() == ["small-biter"] and most > 0.9,
+		"a biting biter is drawn with its walking model, its legs blended into the bite (%.2f of the way at most): %s" % [most, models.keys()])
+	# One that dies folds its legs into its corpse's as it falls.
+	heap.remove(55, true)
+	var d = heap._dying[0] if not heap._dying.is_empty() else null
+	var code := Creatures._pose_code(d.corpse, 1.0) if d != null else 0.0
+	check(d != null and code >= 3.0 and code < 7.0 and is_equal_approx(code - floorf(code), CreatureModels.POSE_SCALE),
+		"a dying biter's legs fold into its corpse's (pose code %.3f for %s)" % [code, d.corpse if d != null else ""])
+	node.free()
+	heap.queue_free()
+
+
+## Space Age's creatures (I23's second part): Gleba's wriggler is one model under each tier's own tint
+## over its mask (skin_mode 2, creature_skins.json from tools/models/space_skin.py), with knees fitted
+## to its run and its strike and corpse poses blended on the walking model; pentapods, shells, Gleba's
+## spawners and demolishers carry their skins in their own part colours (`colour`: nothing is done to
+## them on load). A wriggler's corpse lies Factorio's minute without Nauvis's blood, and the Gleba
+## spawners breathe on Factorio's 5 s loop.
+func _space_creatures() -> void:
+	var names := ["small-wriggler-pentapod", "big-wriggler-pentapod", "medium-wriggler-pentapod-corpse", "big-wriggler-pentapod-corpse",
+		"big-stomper-pentapod"]
+	for n in names:
+		ModelLibrary.mesh_for(n)
+	var until := Time.get_ticks_msec() + 20000
+	while not names.all(func(n: String) -> bool: return ModelLibrary.ready(n)) and Time.get_ticks_msec() < until:
+		ModelLibrary.poll()
+		await get_tree().process_frame
+	var legs_of := func(model: String) -> ShaderMaterial:
+		var mesh := ModelLibrary.mesh_for(model) as Mesh
+		if mesh == null:
+			return null
+		for i in mesh.get_surface_count():
+			var m := mesh.surface_get_material(i) as ShaderMaterial
+			var list: Array = ModelLibrary.MaterialRows.rows(m)
+			for r in (list if not list.is_empty() else [m]):
+				if r != null and (r as ShaderMaterial).resource_name.contains("chitin_wriggler_leg"):
+					return r
+		return null
+	var tier := func(n: String, k: int) -> Array:
+		return CreatureModels.skin_of("big-wriggler-pentapod").get("tiers", {}).get(n, [[0, 0, 0, 0], [0, 0, 0, 0]])[k]
+	var looks := {}
+	for n in ["small-wriggler-pentapod", "big-wriggler-pentapod", "medium-wriggler-pentapod-corpse"]:
+		var r: ShaderMaterial = legs_of.call(n)
+		looks[n] = [r.get_shader_parameter("skin_mode"), r.get_shader_parameter("albedo"), r.get_shader_parameter("skin_tint2")] \
+			if r != null else [-1, Color.BLACK, Color.BLACK]
+	var small_t: Array = tier.call("small-wriggler-pentapod", 0)
+	var small_srgb := Color(float(small_t[0]), float(small_t[1]), float(small_t[2])).linear_to_srgb()
+	check(int(looks["small-wriggler-pentapod"][0]) == 2 and int(looks["big-wriggler-pentapod"][0]) == 2
+		and int(looks["medium-wriggler-pentapod-corpse"][0]) == 2
+		and (looks["small-wriggler-pentapod"][1] as Color).is_equal_approx(Color(small_srgb, 1.0))
+		and not (looks["small-wriggler-pentapod"][1] as Color).is_equal_approx(looks["big-wriggler-pentapod"][1])
+		and is_equal_approx((looks["small-wriggler-pentapod"][2] as Color).a, float(tier.call("small-wriggler-pentapod", 1)[3])),
+		"each wriggler tier's legs and back are its sprite's mask under the tier's own tint, its corpse too: %s" % [looks])
+	var stomper := ModelLibrary.mesh_for("big-stomper-pentapod") as ArrayMesh
+	var kept: Material = stomper.surface_get_material(0) if stomper != null else null
+	if stomper != null:
+		CreatureModels.prepare(stomper, "big-stomper-pentapod")
+	check(stomper != null and stomper.surface_get_material(0) == kept
+		and str(CreatureModels.skin_of("big-stomper-pentapod").get("mode", "")) == "colour"
+		and str(CreatureModels.skin_of("demolisher-head").get("mode", "")) == "colour",
+		"pentapods and demolishers carry their skins in their part colours: their materials are left as they load")
+	check(is_equal_approx(float(CreatureModels.rig("gleba-spawner").get("rate", 0.0)), 0.2)
+		and is_equal_approx(float(CreatureModels.rig("gleba-spawner-small").get("rate", 0.0)), 0.2),
+		"Gleba's spawners breathe on Factorio's loop: 16 frames forward and back at 0.1 a tick, 5 s")
+	# Knees from the run sheets and the strike's and corpse's legs on the walking model, at the tier's size.
+	var walk := (ModelLibrary.mesh_for("small-wriggler-pentapod") as Mesh).surface_get_material(0) as ShaderMaterial \
+		if ModelLibrary.mesh_for("small-wriggler-pentapod") != null else null
+	var knees: Array = walk.get_shader_parameter("rig_knee") if walk != null else []
+	var poses: Array = walk.get_shader_parameter("rig_pose") if walk != null else []
+	var reach := float((CreatureModels.rig("big-wriggler-pentapod")["limbs"][0] as Dictionary).get("reach", 0.0))
+	check(reach > 0.0 and knees.size() == 12 and is_equal_approx((knees[0] as Vector4).w, reach * 0.6) and poses.size() == 60
+		and poses.slice(0, 5).any(func(p: Vector4) -> bool: return p != Vector4.ZERO)
+		and poses.slice(12, 17).any(func(p: Vector4) -> bool: return p != Vector4.ZERO),
+		"a wriggler carries its knees (scaled with the tier) and its strike's and corpse's legs: %s" % [knees.slice(0, 1)])
+	check(CreatureModels.pose_slot("small-wriggler-pentapod-attack") == 0
+		and CreatureModels.pose_slot("medium-wriggler-pentapod-premature-corpse") == 1,
+		"a wriggler's strike and corpse map to the walking model's pose slots")
+	var top := Creatures.WRIGGLER_STRIKE_TOP
+	var back := Creatures.WRIGGLER_STRIKE_BACK
+	check(is_zero_approx(Creatures._bite_amount(0.0, top, back)) and is_equal_approx(Creatures._bite_amount(3.0 / 19.0, top, back), 1.0)
+		and is_zero_approx(Creatures._bite_amount(12.0 / 19.0, top, back)), "the wriggler's strike follows its 19 frames")
+	# A striking wriggler is its walking model with its legs blended into the strike; a dead one folds
+	# into its corpse, which lies a minute without Nauvis's blood puddle.
+	var heap := Creatures.new()
+	add_child(heap)
+	var node := Node3D.new()
+	node.position = Vector3(3, 0, 3)
+	heap.add(56, "big-wriggler-pentapod", node)
+	heap.handle_attacks({"l": [56, roundi(4.0 * 256), roundi(3.0 * 256)]})
+	var models := {}
+	var most := 0.0
+	for f in 40:
+		heap._process(1.0 / 60.0)
+		var c = heap._creatures.get(56)
+		if c != null and not c.drawn.is_empty():
+			models[c.drawn_model] = true
+			var a: float = c.drawn[15]
+			if a >= 2.0 and a < 3.0:
+				most = maxf(most, (a - 2.0) / CreatureModels.POSE_SCALE)
+	check(models.keys() == ["big-wriggler-pentapod"] and most > 0.9,
+		"a striking wriggler is drawn with its walking model, its legs blended into the strike (%.2f): %s" % [most, models.keys()])
+	heap.remove(56, true)
+	var d = heap._dying[0] if not heap._dying.is_empty() else null
+	var code := Creatures._pose_code(d.corpse, 1.0) if d != null else 0.0
+	check(d != null and d.corpse == "big-wriggler-pentapod-corpse" and code >= 3.0 and code < 4.0,
+		"a dying wriggler's legs fold into its corpse's (pose code %.3f)" % code)
+	for f in 90:
+		heap._process(1.0 / 60.0)
+	var lying: Array = heap._corpses.filter(func(k) -> bool: return k.model == "big-wriggler-pentapod-corpse")
+	check(lying.size() == 1 and is_equal_approx(lying[0].life, Creatures.WRIGGLER_CORPSE_SECONDS) and lying[0].puddle == -1,
+		"a wriggler's corpse lies Factorio's minute, without Nauvis's blood")
+	node.free()
+	heap.queue_free()
 
 
 ## Machines' moving parts and glow move in the model shader from their state (anim.gd setup_part
@@ -1208,6 +2597,297 @@ func _bs_feed(layer, k: int, extra: Dictionary, frames := 1) -> void:
 	layer.handle(m)
 	for f in frames:
 		layer._process(1.0 / 60.0)
+
+
+## K9 (owner: "when an item is picked up off a belt the items behind it jump to the start of the belt instead
+## of smoothly moving forward"): an inserter takes the only item on a belt's lane and the bridge reads that
+## lane, empty, on the same tick, the update (`bs`) coming before the event (`ie`), as the bridge sends them.
+## Drawn: the taken item leaves the belt and doesn't come back, and the item behind it goes on along the line,
+## never drawn back towards the start of the belt; belt_sim.gd and its C++ twin alike. With
+## --belt-sim-take-first=off (and --belt-sim-take-line=off, which also puts a tick's takes before its reads) the
+## jump comes back (the old order: the read pushed both back).
+func _belt_take() -> void:
+	BeltItemsScript.Job.view_cull = false
+	var was_gd: bool = BeltItemsScript.State.force_gd
+	var sims := [true]
+	if ClassDB.class_exists("BeltSimNative"):
+		sims.append(false)
+	for take_first in [true, false]:
+		for force_gd in sims:
+			BeltItemsScript.State.force_gd = force_gd
+			BeltItemsScript.Job.take_first = take_first
+			# (The old order is both switches off: --belt-sim-take-line puts a tick's takes before its reads
+			# whatever came first.)
+			BeltItemsScript.Job.take_line = take_first
+			var items = BeltItemsScript.new()
+			add_child(items)
+			items._sync = true
+			# Three yellow belts along +x at y 10 (belt u from x = u to u + 1), an item on each.
+			var lm: Array = []
+			for u in [1, 2, 3]:
+				lm.append_array(_bs_lane(u * 8 + 1, 1, 256, 8, u + 1.0, 10.0, u, 10.0))
+			_bs_feed(items, 1000, {"lm": lm, "sl": [25, 1000, 1, 30, 1, 200, 1, 17, 1000, 1, 20, 1, 128, 1, 9, 1000, 1, 10, 1, 100, 1]})
+			var back := 0.0
+			var last_x := -INF
+			var taken_drawn := 0
+			var seen := 0
+			for k in range(1001, 1080):
+				_bs_feed(items, k, {"sl": [17, 1010, 0]} if k == 1010 else {}, 0)
+				if k == 1010:
+					# (Belt 2's item is 48 into its lane then: the hand at x 3 - 48 / 256.)
+					items.handle({"t": "ie", "k": 1010, "n": 6, "p": 2, "part": 1, "parts": 1, "l": [1, 99, 1010, 1, 1, 0, 720, 2560, 2]})
+				items._process(1.0 / 60.0)
+				var d = items.position_of(10)
+				if d != null and items._drawn >= 1000.0:
+					seen += 1
+					back = maxf(back, last_x - (d as Vector3).x)
+					last_x = (d as Vector3).x
+				if items._drawn > 1013.0 and items.position_of(20) != null:
+					taken_drawn += 1
+			var what := "%s, take first %s" % ["belt_sim.gd" if force_gd else "BeltSimNative", "on" if take_first else "off"]
+			if take_first:
+				check(seen > 40 and back < 0.01 and taken_drawn == 0 and not items.has_item(20),
+					"K9 (%s): a take off a belt read on its tick: the taken item isn't drawn after it (%d frames), the item behind never goes back (at most %.3f tiles, %d frames)" % [what, taken_drawn, back, seen])
+			else:
+				check(back > 0.1 or taken_drawn > 0, "K9 (%s): as before, the read first pushes them back (%.3f tiles, the taken item drawn %d frames after)" % [what, back, taken_drawn])
+			items.queue_free()
+	BeltItemsScript.State.force_gd = was_gd
+	BeltItemsScript.Job.take_first = true
+	BeltItemsScript.Job.take_line = true
+	BeltItemsScript.Job.view_cull = true
+
+
+## K19 (owner's video: "belt items all of a sudden jump around ... an item reaching the end and causing it to
+## check all the belts again"): a line of six belts that ends, packed with one kind from its end back, an
+## inserter over belt 3 taking the front item of that belt's lane. The bridge reads the lanes round the hand on
+## the take's tick and sends them before the hand's event (`bs`, then `ie`), the lane behind first, each a
+## tick into closing the hole. Drawn, belt_sim.gd and its C++ twin alike: the taken item leaves and stays
+## gone, 23 items are left, none ever goes back, none ends closer than a gap to another; and the lattice of the
+## lanes behind stays standing while the line closes one gap (--belt-draw-lattice-settle), its slots where
+## they were. With --belt-sim-take-line=off the taken item stays on the belt (the old way: the read of the
+## lane behind moved it across the belt's edge and the take found nothing); with the lattice's settle off the
+## lanes behind take the belt's speed for the closing (each then jumped to the map's phase and back).
+func _belt_line_end() -> void:
+	BeltItemsScript.Job.view_cull = false
+	var was_gd: bool = BeltItemsScript.State.force_gd
+	var sims := [true]
+	if ClassDB.class_exists("BeltSimNative"):
+		sims.append(false)
+	for mode in ["fixed", "take line off", "settle off"]:
+		for force_gd in sims:
+			BeltItemsScript.State.force_gd = force_gd
+			BeltItemsScript.Job.take_line = mode != "take line off"
+			# (The old way is take_edge off too: a take now finds its item past the belt's front edge.)
+			BeltItemsScript.Job.take_edge = mode != "take line off"
+			BeltLatticeScript.settle = mode != "settle off"
+			var items = BeltItemsScript.new()
+			add_child(items)
+			items._sync = true
+			# (In the client's planned ground: the lattice draws only lanes there.)
+			var uvr: Rect2 = items._view_rect()
+			var ox := floorf(uvr.get_center().x) - 3.0 if uvr.size.x > 0.0 else 0.0
+			var oy := floorf(uvr.get_center().y) + 0.5 if uvr.size.x > 0.0 else 30.0
+			# Belt u from x = ox + u to ox + u + 1, items going towards -x: the line ends at x = ox + 1.
+			var lm: Array = []
+			var sl: Array = []
+			var game := {}  # uid -> place along the line (1/256, 0 its end)
+			for u in range(1, 7):
+				lm.append_array(_bs_lane(u * 8 + 1, 1, 256, 8, ox + u, oy, ox + u + 1.0, oy))
+				sl.append_array([u * 8 + 1, 3000, 4])
+				for q in 4:
+					var uid := 100 + 4 * (u - 1) + q
+					game[uid] = (u - 1) * 256 + 64 * q
+					sl.append_array([uid, 1, 64 * q, 1])
+			_bs_feed(items, 3000, {"lm": lm, "sl": sl}, 1)
+			var k := 3000
+			for f in 30:
+				k += 1
+				_bs_feed(items, k, {}, 1)
+				for uid: int in game:
+					items.position_of(uid)
+			# The hand takes item 108 (belt 3's front) before tick `at`; from `at` on the items behind close up.
+			var at := k + 4
+			var taken := 108
+			var taken_place: int = game[taken]
+			game.erase(taken)
+			var lat_native: bool = not (items._state.lattice is BeltLatticeScript)
+			var last := {}
+			var back := 0.0
+			var taken_drawn := 0
+			var lat_moving := 0
+			var lat_frames := 0
+			for t in range(k + 1, at + 70):
+				if t > at:
+					var order: Array = game.keys()
+					order.sort_custom(func(a: int, b: int) -> bool: return int(game[a]) < int(game[b]))
+					var prev := -64
+					for u2: int in order:
+						game[u2] = mini(int(game[u2]), maxi(int(game[u2]) - 8, prev + 64))
+						prev = int(game[u2])
+				var extra := {}
+				if t == at + 1:
+					# (A tick into the closing: the lane behind first, then the pickup lane, as the game has them.)
+					var reads: Array = []
+					for u in [4, 3]:
+						var its: Array = []
+						var order2: Array = game.keys()
+						order2.sort_custom(func(a: int, b: int) -> bool: return int(game[a]) < int(game[b]))
+						for u2: int in order2:
+							var g := int(game[u2])
+							if g >= (u - 1) * 256 and g < u * 256:
+								its.append_array([u2, 1, g - (u - 1) * 256, 1])
+						reads.append_array([u * 8 + 1, t, its.size() / 4])
+						reads.append_array(its)
+					extra["sl"] = reads
+				_bs_feed(items, t, extra, 0)
+				if t == at + 1:
+					items.handle({"t": "ie", "k": t, "n": 6, "p": 2, "part": 1, "parts": 1,
+						"l": [1, 99, t, 1, 1, 0, roundi((ox + 1.0) * 256.0) + taken_place, roundi(oy * 256.0), 3]})
+				items._process(1.0 / 60.0)
+				if items._drawn < float(k):
+					continue
+				for uid: int in game:
+					var d = items.position_of(uid)
+					if d != null:
+						if last.has(uid):
+							back = maxf(back, (d as Vector3).x - float(last[uid]))
+						last[uid] = (d as Vector3).x
+				if items._drawn > float(at + 4) and items.position_of(taken) != null:
+					taken_drawn += 1
+				for u in [5, 6]:
+					var lv := -1
+					if lat_native:
+						lv = items._state.lattice.drawn_speed(u * 8 + 1)
+					else:
+						var ln = items._state.lattice.drawn.get(u * 8 + 1)
+						if ln != null:
+							lv = ln.v
+					if lv >= 0:
+						lat_frames += 1
+						if lv > 0:
+							lat_moving += 1
+			var xs: Array = last.values()
+			xs.sort()
+			var close := 0
+			for i in range(1, xs.size()):
+				if float(xs[i]) - float(xs[i - 1]) < 0.24:
+					close += 1
+			var what := "%s, %s" % ["belt_sim.gd" if force_gd else "BeltSimNative", mode]
+			if mode == "fixed":
+				check(not items.has_item(taken) and taken_drawn == 0 and xs.size() == 23 and back < 0.01 and close == 0,
+					"K19 (%s): a take off a line that ends, the reads of its tick first: the taken item is gone (drawn %d frames after), 23 items drawn (%d), none goes back (%.3f tile), none closer than a gap (%d)"
+					% [what, taken_drawn, xs.size(), back, close])
+				check(lat_frames > 0 and lat_moving == 0,
+					"K19 (%s): the lattice of the lanes behind stands while the line closes one gap (%d of %d lane-frames moving)" % [what, lat_moving, lat_frames])
+			elif mode == "take line off":
+				check(items.has_item(taken), "K19 (%s): as before, the taken item stays on the belt" % what)
+			else:
+				check(lat_moving > 0, "K19 (%s): as before, the lanes behind take the belt's speed for the closing (%d of %d lane-frames)" % [what, lat_moving, lat_frames])
+			items.queue_free()
+	BeltItemsScript.State.force_gd = was_gd
+	BeltItemsScript.Job.take_line = true
+	BeltItemsScript.Job.take_edge = true
+	BeltLatticeScript.settle = true
+	BeltItemsScript.Job.view_cull = true
+
+
+## K22 (owner: "breaking a belt with items shows the 3d items in the world for a while"): a belt Zenith takes away
+## (`mnd`, `del`: main.gd's belt_removed) loses its lanes and the items drawn on them in the next job, the
+## simulation's and the drawing's, not when the bridge's `dl` comes (and then not stood for far icons); its reads
+## still on their way don't bring them back. A belt built on its tile in the same frame (a fast-replace) keeps them;
+## --belt-sim-removed-now=off as before. K16's replace_at: a lane dropped in the update that brings a lane of the same
+## place (a fast-replace's `dl` and `lm`) goes at that lane's read tick, its item carried on, never gone between.
+## belt_sim.gd and its C++ twin alike.
+func _belt_removed() -> void:
+	BeltItemsScript.Job.view_cull = false
+	var was_gd: bool = BeltItemsScript.State.force_gd
+	var sims := [true]
+	if ClassDB.class_exists("BeltSimNative"):
+		sims.append(false)
+	# Three yellow belts along +x at y 10 (belt u from x = u to u + 1), an item on each: 10 on belt 1, 20 on 2, 30 on 3.
+	var lm: Array = []
+	for u in [1, 2, 3]:
+		lm.append_array(_bs_lane(u * 8 + 1, 1, 256, 8, u + 1.0, 10.0, u, 10.0))
+	var sl0 := [25, 1000, 1, 30, 1, 240, 1, 17, 1000, 1, 20, 1, 220, 1, 9, 1000, 1, 10, 1, 200, 1]
+	for force_gd in sims:
+		BeltItemsScript.State.force_gd = force_gd
+		var what := "belt_sim.gd" if force_gd else "BeltSimNative"
+		# (Standing belts here, step 0: the drawn clock, behind the updates, gets to them whenever.)
+		var still: Array = []
+		for u in [1, 2, 3]:
+			still.append_array(_bs_lane(u * 8 + 1, 1, 256, 0, u + 1.0, 10.0, u, 10.0))
+		for mode in ["removed", "replaced", "off"]:
+			BeltItemsScript.removed_now = mode != "off"
+			var items = BeltItemsScript.new()
+			add_child(items)
+			items._sync = true
+			_bs_feed(items, 1000, {"lm": still, "sl": sl0})
+			var k := 1001
+			while k < 1100 and items.position_of(20) == null:
+				_bs_feed(items, k, {})
+				k += 1
+			var had: bool = items.has_item(20) and items.position_of(20) != null
+			items.belt_removed(2, 640, 2560)
+			if mode == "replaced":
+				items.belt_built(640, 2560)
+			_bs_feed(items, k, {})
+			_bs_feed(items, k + 1, {})
+			var st: Array = items._state.sim.items_state()
+			var in_sim := false
+			for i in (st[0] as PackedInt64Array).size():
+				in_sim = in_sim or int(st[0][i]) == 20 or int(st[1][i]) == 17
+			var drawn20: bool = items.has_item(20) or items.position_of(20) != null
+			var others: bool = items.has_item(10) and items.has_item(30)
+			# (A read of the removed belt made before it went, still on its way: passed over.)
+			_bs_feed(items, k + 2, {"lm": _bs_lane(17, 1, 256, 0, 3.0, 10.0, 2.0, 10.0), "sl": [17, k + 2, 1, 21, 1, 100, 1]})
+			for f in 30:
+				_bs_feed(items, k + 3 + f, {})
+			var late: bool = items.has_item(21)
+			if mode == "removed":
+				check(had and not in_sim and not drawn20 and others and not late,
+					"K22 (%s): a belt taken away loses its lanes and items in the next job, the others stay, a late read of it is passed over: had %s, in the simulation %s, drawn %s, the others %s, late read %s"
+					% [what, had, in_sim, drawn20, others, late])
+			elif mode == "replaced":
+				check(had and in_sim and drawn20, "K22 (%s): a belt built on its tile in the same frame (a fast-replace) keeps its items: %s %s" % [what, in_sim, drawn20])
+			else:
+				check(had and in_sim and drawn20, "K22 (%s): --belt-sim-removed-now=off: as before, its items stay till the bridge's dl: %s %s" % [what, in_sim, drawn20])
+			items.queue_free()
+		BeltItemsScript.removed_now = true
+		# replace_at: at 1006 the update replaces belt 2 (lane 17) by belt 7 (lane 57, the same place), the item 20 on it
+		# as the game has it at the new lane's read on 1007, and drops lane 17.
+		for on in [true, false]:
+			BeltItemsScript.Job.replace_at = on
+			var items = BeltItemsScript.new()
+			add_child(items)
+			items._sync = true
+			_bs_feed(items, 1000, {"lm": lm, "sl": sl0})
+			for k in range(1001, 1006):
+				_bs_feed(items, k, {})
+			var missing := 0
+			var back := 0.0
+			var last_x := -INF
+			for k in range(1006, 1030):
+				var extra := {}
+				if k == 1006:
+					extra = {"lm": _bs_lane(57, 1, 256, 8, 3.0, 10.0, 2.0, 10.0), "sl": [57, 1007, 1, 20, 1, 164, 1], "dl": [17]}
+				_bs_feed(items, k, extra)
+				var d = items.position_of(20)
+				if items._drawn < 1003.0:
+					continue
+				if d == null:
+					missing += 1
+				else:
+					back = maxf(back, last_x - (d as Vector3).x)
+					last_x = (d as Vector3).x
+			if on:
+				check(missing == 0 and back < 0.01, "K16 replace_at (%s): a fast-replaced belt's item goes on onto the new lane, never gone (%d frames) or back (%.3f tiles)"
+					% [what, missing, back])
+			else:
+				print("  (replace_at off, %s: the item missing %d frames, back %.3f tiles)" % [what, missing, back])
+			items.queue_free()
+		BeltItemsScript.Job.replace_at = true
+	BeltItemsScript.State.force_gd = was_gd
+	BeltItemsScript.Job.view_cull = true
 
 
 ## A loop whose last belt side-loads onto its own first (one on Aquilo crashed Zenith in the C++
@@ -1700,6 +3380,187 @@ func _belt_unison() -> void:
 	BeltItemsScript.Job.view_cull = true
 
 
+## K14 (owner: "items change their orientation as they move on the belts, looks really off"): a packed
+## lane is drawn as a lattice (belt_lattice.gd) whose slots slide a gap and wrap back, the slot ahead
+## taking the item on, so a turn kept per slot changed every item's turn each quarter tile. One item seen
+## sliding round a packed ring keeps its turn over many slides and from belt to belt (corners too), the
+## lane's items still turning their own ways; one in a packed run keeps it as the run starts and stops.
+## Both lattices (belt_lattice.gd and BeltLatticeNative); --belt-draw-lattice-turns=slot (the old per-slot
+## turns) changes the item's turn, as the owner saw.
+func _belt_lattice_turns() -> void:
+	var kept_native: bool = BeltItemsScript.State.lattice_native
+	var natives := [false]
+	if ClassDB.class_exists("BeltLatticeNative") and ClassDB.class_exists("BeltSimNative"):
+		natives.append(true)
+	var drawn_by: Array = []  # each twin's ring: its items' turns (cosines, sorted)
+	for native: bool in natives:
+		BeltItemsScript.State.lattice_native = native
+		var twin := "C++" if native else "GDScript"
+		var ring: Array = _lattice_turns_ring(true)
+		check(ring[0] >= 140 and ring[1] == 1 and ring[2] > 4.0 and ring[3] >= 16,
+			"K14 %s lattice: an item sliding round a packed ring keeps one turn (%d frames, %d turns seen, went %.2f tiles: %d slides and 4 belts), the ring's 32 items turned %d ways"
+			% [twin, ring[0], ring[1], ring[2], int(ring[2] * 4.0), ring[3]])
+		drawn_by.append(ring[4])
+		var slots: Array = _lattice_turns_ring(false)
+		check(slots[0] >= 140 and slots[1] > 4,
+			"K14 %s lattice: with --belt-draw-lattice-turns=slot the same item takes a new turn as it slides (%d turns over %d frames)" % [twin, slots[1], slots[0]])
+		# (K19's --belt-draw-lattice-settle leaves a standing lattice where it is while its run moves on one
+		# gap: the start and stop of a one-gap move are K14's own with it off; with it on the lattice stands,
+		# and a run that moves on for longer than the settle time starts and stops with its turns kept.)
+		BeltLatticeScript.settle = false
+		var run: Array = _lattice_turns_run()
+		check(run[0] >= 40 and run[1] == 1 and run[2] > 0.2,
+			"K14 %s lattice: (settle off) an item in a packed run keeps its turn as the run moves on a gap and stops (%d frames, %d turns, moved %.3f)" % [twin, run[0], run[1], run[2]])
+		BeltLatticeScript.settle = true
+		var stood: Array = _lattice_turns_run()
+		check(stood[0] >= 40 and stood[1] == 1 and stood[2] < 0.02,
+			"K19 %s lattice: a packed run moving on one gap leaves its lattice standing, the item's turn kept (%d frames, %d turns, moved %.3f)" % [twin, stood[0], stood[1], stood[2]])
+		var flow: Array = _lattice_turns_run(3)
+		check(flow[0] >= 40 and flow[1] == 1 and flow[2] > 0.2,
+			"K14 and K19 %s lattice: a run moving on three gaps starts once it has moved for longer than a closing hole, and stops, the item's turn kept (%d frames, %d turns, moved %.3f)" % [twin, flow[0], flow[1], flow[2]])
+	if drawn_by.size() == 2:
+		var same: bool = (drawn_by[0] as Array).size() == (drawn_by[1] as Array).size() and (drawn_by[0] as Array).size() >= 32
+		for i in (drawn_by[0] as Array).size() if same else 0:
+			same = same and absf(float(drawn_by[0][i]) - float(drawn_by[1][i])) < 0.0001
+		check(same, "K14: the GDScript and C++ lattices turn the ring's items alike (%d and %d drawn)" % [(drawn_by[0] as Array).size(), (drawn_by[1] as Array).size()])
+	BeltItemsScript.State.lattice_native = kept_native
+	BeltLatticeScript.item_turns = true
+	BeltLatticeScript.settle = true
+
+
+## (_belt_lattice_turns) Follows the drawn lattice item nearest `at` for `frames` frames (a tick each): each
+## frame the one nearest where it would be had it gone on as in the frame before (a lane that stops or
+## starts jumps by up to half a gap as it is drawn), its turns (cosines) gathered in `turns`. Returns
+## [frames followed, distinct turns seen, tiles moved, at].
+func _follow_lattice_item(items, at: Vector2, frames: int, k: int, turns := {}) -> Array:
+	var followed := 0
+	var moved := 0.0
+	var reach := 0.14
+	var step := Vector2.ZERO
+	for f in frames:
+		k += 1
+		_bs_feed(items, k, {}, 1)
+		var best := INF
+		var best_at := at
+		var best_c := 0.0
+		var kinds: Array = items._state.lattice.kinds.keys() if items._state.lattice is BeltLatticeScript else items._state.lattice.kind_keys()
+		for kk in kinds:
+			for e in items.drawn_lattice(kk):
+				if e == null:
+					continue
+				var p := Vector2((e[0] as Vector3).x, (e[0] as Vector3).z)
+				if p.distance_to(at + step) < best:
+					best = p.distance_to(at + step)
+					best_at = p
+					best_c = float(e[1])
+		if best > reach:
+			break
+		moved += best_at.distance_to(at)
+		if best_at.distance_to(at) < 0.06:
+			step = best_at - at  # (its own motion: a lane's jump isn't one)
+		at = best_at
+		followed += 1
+		turns[snappedf(best_c, 0.0001)] = true
+	return [followed, turns.size(), moved, at]
+
+
+## A ring of eight packed yellow belts (two a side of a 2 x 2 square, in the lattice's planned ground) full
+## of one kind circulating: one item followed for 150 ticks from the middle of the first belt. Returns
+## [frames followed, distinct turns, tiles moved, the ring's distinct turns at the end, every drawn item's
+## turn then (cosines, sorted)].
+func _lattice_turns_ring(item_turns: bool) -> Array:
+	BeltLatticeScript.item_turns = item_turns
+	BeltItemsScript.Job.view_cull = false
+	var items = BeltItemsScript.new()
+	add_child(items)
+	items._sync = true
+	var vr: Rect2 = items._view_rect()
+	var ox := floorf(vr.get_center().x) - 1.0 if vr.size.x > 0.0 else 0.0
+	var oy := floorf(vr.get_center().y) - 1.0 if vr.size.x > 0.0 else 0.0
+	# Clockwise from (ox, oy): east along the top, south, west along the bottom, north.
+	var points: Array = []
+	for i in 2:
+		points.append(Vector2(ox + i, oy))
+	for i in 2:
+		points.append(Vector2(ox + 2.0, oy + i))
+	for i in 2:
+		points.append(Vector2(ox + 2.0 - i, oy + 2.0))
+	for i in 2:
+		points.append(Vector2(ox, oy + 2.0 - i))
+	var lm: Array = []
+	var sl: Array = []
+	for i in 8:
+		var a: Vector2 = points[i]
+		var b: Vector2 = points[(i + 1) % 8]
+		var key := (60 + i) * 8 + 1
+		lm.append_array(_bs_lane(key, 1, 256, 8, b.x, b.y, a.x, a.y))
+		sl.append_array([key, 3000, 4])
+		for q in 4:
+			sl.append_array([9000 + i * 4 + q, 1, q * 64 + 32, 1])
+	_bs_feed(items, 3000, {"lm": lm, "sl": sl}, 1)
+	var k := 3000
+	for f in 24:  # (the looks, then the lattice)
+		k += 1
+		_bs_feed(items, k, {}, 1)
+	var got := _follow_lattice_item(items, Vector2(ox + 0.5, oy), 150, k)
+	var ring_turns := {}
+	var all_turns: Array = []
+	var kinds: Array = items._state.lattice.kinds.keys() if items._state.lattice is BeltLatticeScript else items._state.lattice.kind_keys()
+	for kk in kinds:
+		for e in items.drawn_lattice(kk):
+			if e != null:
+				ring_turns[snappedf(float(e[1]), 0.0001)] = true
+				all_turns.append(float(e[1]))
+	all_turns.sort()
+	items.queue_free()
+	BeltItemsScript.Job.view_cull = true
+	BeltLatticeScript.item_turns = true
+	return [got[0], got[1], got[2], ring_turns.size(), all_turns]
+
+
+## Four yellow belts in a row, the last leading out of what is sent (its front held where the bridge read it),
+## the three behind packed (the lattice) and standing; the wall moves on `gaps` gaps, so the run moves that
+## far as one block and stands again (as _belt_unison's). One item on the second belt followed. Returns
+## [frames followed, distinct turns, tiles moved].
+func _lattice_turns_run(gaps := 1) -> Array:
+	BeltItemsScript.Job.view_cull = false
+	var items = BeltItemsScript.new()
+	add_child(items)
+	items._sync = true
+	var vr: Rect2 = items._view_rect()
+	var ox := floorf(vr.get_center().x) - 3.0 if vr.size.x > 0.0 else 0.0
+	var oy := floorf(vr.get_center().y) + 0.5 if vr.size.x > 0.0 else 30.0
+	var lm: Array = []
+	for u in range(1, 4):
+		lm.append_array(_bs_lane(u * 8 + 1, 1, 256, 8, ox + u + 1.0, oy, ox + u, oy))
+	lm.append_array(_bs_lane(4 * 8 + 1, 1, 256, 8, ox + 5.0, oy, ox + 4.0, oy, INF, INF, -1))
+	var sl: Array = []
+	var uid := 3500
+	for u in range(4, 0, -1):
+		var n := 3 if u == 4 else 4
+		sl.append_array([u * 8 + 1, 3200, n])
+		for q in n:
+			sl.append_array([uid, 1, (q + (1 if u == 4 else 0)) * 64 + 32, 1])
+			uid += 1
+	_bs_feed(items, 3200, {"lm": lm, "sl": sl}, 1)
+	var k := 3200
+	for f in 24:
+		k += 1
+		_bs_feed(items, k, {}, 1)
+	# (Standing: the item 0.375 into the second belt, then the wall moves on and the run with it.)
+	var turns := {}
+	var start := _follow_lattice_item(items, Vector2(ox + 2.0 + 0.375, oy), 8, k, turns)
+	k += 8
+	# (`gaps` > 1: the wall is the item that many behind the front, those ahead of it running off: the run
+	# moves on that many gaps without stopping.)
+	_bs_feed(items, k + 1, {"ew": [4 * 8 + 1, k + 1, 3500 + gaps - 1, 32]}, 1)
+	k += 1
+	var got := _follow_lattice_item(items, start[3], 40 + 8 * (gaps - 1), k, turns)
+	items.queue_free()
+	BeltItemsScript.Job.view_cull = true
+	return [int(start[0]) + int(got[0]), turns.size() if start[0] > 0 and got[0] > 0 else 0, got[2]]
+
+
 ## G11, G14: Gleba's and Aquilo's ground. Water is told by its collision mask (the wetlands, the
 ## deep lake, brash ice, the ammoniacal ocean), `layer = gleba_tile_offset + 8` is worked out so
 ## the planets' tiles blend in Factorio's order, the water shaders' own pictures fill the swamps
@@ -1881,8 +3742,39 @@ func _hill_culling() -> void:
 	while G.lift_range() == still and frames < 120:
 		await get_tree().process_frame
 		frames += 1
+	# Room that shrinks is taken back a slice a frame.
+	while G.walking() and frames < 240:
+		await get_tree().process_frame
+		frames += 1
 	check(still == Vector2(-1.5, 7.5) and G.lift_range() == Vector2(0.0, 2.5) and plain.extra_cull_margin == 2.5,
 		"a big field is measured on a worker, the last range kept meanwhile: %s after %d frames" % [G.lift_range(), frames])
+	# Hills a little lower (the field moved on) keep the room they have: no node walked (6-13 ms on a
+	# small base's 3,200 nodes, every time the range wobbled half a tile).
+	var lower := Image.create(8, 8, false, Image.FORMAT_RF)
+	lower.fill(Color(1.8, 0.0, 0.0))
+	G.set_field(lower, Vector2(-8, -8), 2.0)
+	check(G.lift_range() == Vector2(0.0, 2.5) and not G.walking() and plain.extra_cull_margin == 2.5,
+		"hills a little lower keep their room: %s" % [G.lift_range()])
+	# Much lower: the room is taken back a slice of the main thread a frame (64 nodes a frame here).
+	var many: Array = []
+	for i in 200:
+		var m := MeshInstance3D.new()
+		add_child(m)
+		many.append(m)
+	G.walk_usec = 0
+	var flatter := Image.create(8, 8, false, Image.FORMAT_RF)
+	flatter.fill(Color(0.3, 0.0, 0.0))
+	G.set_field(flatter, Vector2(-8, -8), 2.0)
+	var spread := 0
+	while G.walking() and spread < 120:
+		await get_tree().process_frame
+		spread += 1
+	G.walk_usec = G.WALK_USEC
+	check(G.lift_range() == Vector2(0.0, 0.5) and spread >= 2 and not G.walking() and plain.extra_cull_margin == 0.5
+		and many.all(func(m) -> bool: return (m as MeshInstance3D).extra_cull_margin == 0.5),
+		"much lower hills give the room back over %d frames, to every node" % spread)
+	for m: Node in many:
+		m.queue_free()
 	await _hills_never_wait(G, big)
 	G.clear()
 	check(G.lift_range() == Vector2.ZERO and not G.holding() and plain.extra_cull_margin == 0.0 and late.extra_cull_margin == 9.0
@@ -2171,7 +4063,8 @@ func _streaming() -> void:
 	check(w.chunks.is_empty() and left_now == gone.size() and hidden and gone.all(func(n) -> bool: return not is_instance_valid(n)),
 		"chunks let go of (unloaded, or all on a reset, hidden at once) are freed over the next frames (%d kept at first)" % left_now)
 	w.queue_free()
-	# An item seen for the first time: its model is read on a thread, its kind hidden until then.
+	# An item seen for the first time: its model is read there and then on the main thread (item_models.gd: the
+	# threaded reads could deadlock at start), drawn at once.
 	var fresh_item := ""
 	for file in DirAccess.get_files_at("res://assets/models/items/"):
 		if file.ends_with(".glb") and not preload("res://scripts/world/item_models.gd")._cache.has(file.get_basename()):
@@ -2182,14 +4075,10 @@ func _streaming() -> void:
 	cards.protos.add_items([[77, fresh_item]])
 	add_child(cards)
 	cards.draw({77: [Vector3(1, 0, 1)]})
-	var waited_hidden: bool = not cards._kinds[77].visible
-	var until := Time.get_ticks_msec() + 120000  # as long as the worker queue takes on a busy PC
-	while not cards._kinds[77].visible and Time.get_ticks_msec() < until:
-		await get_tree().process_frame
-	check(fresh_item != "" and waited_hidden and cards._kinds[77].visible
+	check(fresh_item != "" and cards._kinds[77].visible
 		and cards._kinds[77].multimesh.mesh == preload("res://scripts/world/item_models.gd").mesh_for(fresh_item)
 		and cards._kinds[77].multimesh.visible_instance_count == 1,
-		"an item's model is read on a thread the first time it is seen (%s), drawn once it is" % fresh_item)
+		"an item's model is read on the main thread the first time it is seen (%s), drawn at once" % fresh_item)
 	cards.queue_free()
 	# The map's pictures from their palette, as bytes: the same as a pixel at a time.
 	var pal := [[255, 0, 0], [0, 128, 255], "bad"]
@@ -2252,6 +4141,22 @@ func _frame_budget() -> void:
 	for i in FrameBudget.STARVE_FRAMES:
 		starved = maxi(starved, FrameBudget.grant(&"wires"))
 	check(starved == FrameBudget.MIN_SLICE, "frame budget: a system starved %d times gets %d µs" % [FrameBudget.STARVE_FRAMES, starved])
+	# --frame-budget-belts=first (on): far belt icons rank with the messages: builds waiting don't hold them back; off,
+	# they come after the builds (priority 6, no floor), as before.
+	var lanes_got := {}
+	for first in [true, false]:
+		FrameBudget.reset()
+		FrameBudget.belts_first = first
+		FrameBudget.waiting(&"messages", 40)
+		FrameBudget.waiting(&"build", 5)
+		FrameBudget.waiting(&"lanes", 9)
+		await get_tree().process_frame
+		var m := FrameBudget.grant(&"messages")
+		FrameBudget.spent(&"messages", m, 0)
+		lanes_got[first] = FrameBudget.grant(&"lanes")
+	FrameBudget.belts_first = true
+	check(int(lanes_got[true]) >= FrameBudget.MIN_SLICE and int(lanes_got[false]) == 0,
+		"frame budget: far belt icons get their slice with builds waiting (%d µs), off nothing while builds wait (%d µs)" % [lanes_got[true], lanes_got[false]])
 	# Standing (nothing waiting near the character), a backlog of far work drains at the larger pool.
 	FrameBudget.reset()
 	FrameBudget.test_other_usec = 3000
@@ -2285,6 +4190,18 @@ func _frame_budget() -> void:
 		backlog -= done
 		FrameBudget.spent(&"far_install", done * 1000, backlog)
 	check(backlog == 0 and frames <= 62, "frame budget: moving, far work still drains under the builds, a millisecond a frame: %d frames" % frames)
+	# A busy frame (the pool at its floor, far work waiting): messages get the floor less the far work's
+	# share, backlog or not; fallen behind (bridge.gd --message-catchup) their whole slice.
+	FrameBudget.reset()
+	FrameBudget.test_other_usec = 60000
+	FrameBudget.waiting(&"messages", 4000)
+	FrameBudget.waiting(&"wires", 9)
+	await get_tree().process_frame
+	var busy_msgs := FrameBudget.grant(&"messages", 2)
+	var caught := FrameBudget.grant(&"messages", 2, true)
+	check(FrameBudget.pool == FrameBudget.POOL_MIN and busy_msgs == FrameBudget.POOL_MIN - FrameBudget.LOW_RESERVE
+		and caught == int(FrameBudget.SYSTEMS[&"messages"][1]) and int(FrameBudget.catchups.get(&"messages", 0)) == 1,
+		"frame budget: with the pool at its floor messages get %d µs with 4,000 waiting, %d once behind" % [busy_msgs, caught])
 	# Overruns are counted per system.
 	FrameBudget.reset()
 	await get_tree().process_frame
@@ -2309,6 +4226,233 @@ func _frame_budget() -> void:
 	FrameBudget.shared = was
 
 
+## 0.2.1's main-thread fixes (art-src/perf-plans/client-cpu.md): a chunk built once its snapshot's
+## last part is in, levels of detail looked at by bands of rings, kept chunks replayed through
+## Bridge's queue, the frame budget measuring the frame's own scripts, the ground's texture array
+## written a layer at a time.
+func _hotfix_021() -> void:
+	const FrameBudget := preload("res://scripts/world/frame_budget.gd")
+	# One build per snapshot: held while parts are still to come, built once with the last.
+	var hw := WorldMirror.new()
+	add_child(hw)
+	hw.protos.add_entities([[1, "zz-test-box", "container", -0.5, -0.5, 0.5, 0.5, 200, 180, 0, 1, 1]])
+	var hcv := ChunkView.new()
+	hcv.coord = Vector2i.ZERO
+	hw.chunks[Vector2i.ZERO] = hcv
+	hw.add_child(hcv)
+	hw.handle({"t": "chunk", "cx": 0, "cy": 0, "tiles": [], "parts": 3})
+	hw._dirty_terrain.clear()  # (no tile prototypes here: no ground to mesh)
+	hw.handle({"t": "ents", "cx": 0, "cy": 0, "part": 1, "parts": 3, "e": [[1, 1, 5 * 256 + 128, 5 * 256 + 128, 0]]})
+	var builds := hw.entity_builds
+	hw._rebuild_dirty()
+	var held := hw.entity_builds == builds and hw._dirty.has(Vector2i.ZERO)
+	hw.handle({"t": "ents", "cx": 0, "cy": 0, "part": 2, "parts": 3, "e": [[2, 1, 6 * 256 + 128, 5 * 256 + 128, 0]]})
+	hw._rebuild_dirty()
+	held = held and hw.entity_builds == builds
+	hw.handle({"t": "ents", "cx": 0, "cy": 0, "part": 3, "parts": 3, "e": [[3, 1, 7 * 256 + 128, 5 * 256 + 128, 0]]})
+	hw._rebuild_dirty()
+	var once := hw.entity_builds == builds + 1 and not hw._dirty.has(Vector2i.ZERO) and hcv.entities.size() == 3
+	check(held and once, "a chunk's snapshot is built once, with its last part, not on each part (%d builds)" % (hw.entity_builds - builds))
+	# A part lost on the way: built anyway once PARTS_WAIT_MSEC has passed.
+	hw.handle({"t": "chunk", "cx": 0, "cy": 0, "tiles": [], "parts": 2})
+	hw._dirty_terrain.clear()  # (no tile prototypes here: no ground to mesh)
+	hw.handle({"t": "ents", "cx": 0, "cy": 0, "part": 1, "parts": 2, "e": [[1, 1, 5 * 256 + 128, 5 * 256 + 128, 0]]})
+	builds = hw.entity_builds
+	hw._rebuild_dirty()
+	var waited := hw.entity_builds == builds
+	hcv.snapshot_msec -= WorldMirror.PARTS_WAIT_MSEC + 1
+	hw._rebuild_dirty()
+	check(waited and hw.entity_builds == builds + 1, "and a snapshot with a part lost is built after %d ms" % WorldMirror.PARTS_WAIT_MSEC)
+	hw.queue_free()
+
+	# Levels of detail by bands: standing still only the camera's 3x3 chunks are looked at; a little
+	# movement the next ring too; a zoom every chunk; a chunk shown again behind the camera at once.
+	var lw := WorldMirror.new()
+	add_child(lw)
+	for y in range(-6, 7):
+		for x in range(-6, 7):
+			var lcv := ChunkView.new()
+			lcv.coord = Vector2i(x, y)
+			lcv.loaded = true
+			lw.chunks[lcv.coord] = lcv
+			lw.add_child(lcv)
+	lw._sq_center = Vector2i.ZERO
+	lw._sq_radius = 6
+	var at := Vector3(16.0, 30.0, 16.0)
+	var per_tile := 0.001
+	var looked_all := 0
+	for i in 200:
+		lw._update_lod_bands(at, per_tile, -1.0, 0.016)
+		looked_all += lw.lod_looked
+		var busy := false
+		for band: WorldMirror.LodBand in lw._lod_bands:
+			busy = busy or band.ring >= 0
+		if not busy:
+			break
+	lw._update_lod_bands(at, per_tile, -1.0, 0.016)
+	var still := lw.lod_looked
+	lw._update_lod_bands(at + Vector3(1.5, 0.0, 0.0), per_tile, -1.0, 0.016)
+	var moved := lw.lod_looked
+	lw._update_lod_bands(at + Vector3(1.5, 0.0, 0.0), per_tile, -1.0, 0.016)
+	var after := lw.lod_looked
+	var zoomed := 0
+	for i in 200:
+		lw._update_lod_bands(at + Vector3(1.5, 0.0, 0.0), per_tile * 1.1, -1.0, 0.016)
+		zoomed += lw.lod_looked
+		var busy := false
+		for band: WorldMirror.LodBand in lw._lod_bands:
+			busy = busy or band.ring >= 0
+		if not busy:
+			break
+	lw.chunk_shown(Vector2i(5, 5))
+	lw._update_lod_bands(at + Vector3(1.5, 0.0, 0.0), per_tile * 1.1, -1.0, 0.016)
+	var shown := lw.lod_looked
+	check(looked_all >= 13 * 13 and still == 9 and moved == 9 + 16 and after == 9 and zoomed >= 13 * 13 and shown == 10,
+		"levels of detail by bands: all %d at first, %d standing, %d a step on, %d after it, %d on a zoom, %d with one shown again"
+		% [looked_all, still, moved, after, zoomed, shown])
+	lw.queue_free()
+
+	# Kept chunks are replayed through Bridge's queue, ahead of what came after them.
+	var b = load("res://scripts/net/bridge.gd").new()
+	var got: Array = []
+	var handler := func(m: Dictionary) -> void: got.append(m.get("n"))
+	b._waiting = [{"t": "zz", "n": 1}, {"t": "zz", "n": 2}]
+	b._waiting_len = PackedInt32Array([1, 1])
+	b._waiting_at = 1
+	b.requeue_front([[handler, {"n": "a"}], [handler, {"n": "b"}]])
+	var queued: bool = b._waiting.size() == 3 and b._waiting_at == 0 and b._waiting_len.size() == 3 and b._waiting[2].get("n") == 2
+	b._drain()
+	check(queued and got == ["a", "b"] and not b.draining() and b.waiting_count() == 0,
+		"kept chunks' messages go to the front of the queue and are handled there, in order: %s" % [got])
+	b.free()
+
+	# The frame budget's other scripts: the frame from its first ask to its last script, less the
+	# sliced work (Godot's TIME_PROCESS is the slowest whole frame of the last second).
+	FrameBudget.reset()
+	var was_measure: bool = FrameBudget.measure_frame
+	FrameBudget.measure_frame = true
+	FrameBudget.test_other_usec = -1
+	var f := Engine.get_process_frames()
+	FrameBudget._frame = f - 1
+	FrameBudget._frame_start = 1000000
+	FrameBudget._end_frame = f - 1
+	FrameBudget._end_usec = 1000000 + 5000
+	FrameBudget.used_total = 1000
+	FrameBudget.grant(&"build")
+	check(FrameBudget.other_usec == 4000, "frame budget: the other scripts measured from the frame itself: %d µs" % FrameBudget.other_usec)
+	FrameBudget.measure_frame = was_measure
+	FrameBudget.reset()
+
+	# Charts' pictures and chunks' tiles decoded as the bridge reads them (its parsing thread); a
+	# message with fields of the wrong kind left as it came, for its handler to read the old way.
+	const MessageDecode := preload("res://scripts/net/message_decode.gd")
+	var chart := {"t": "chart", "n": 2, "pal": [[10, 20, 30], [200, 210, 220]], "px": [0, 1, 1, 0]}
+	MessageDecode.prepare(chart, "chart")
+	var bad := {"t": "chart", "n": 2, "pal": [[10, 20, 30]], "px": [0, "x", 0, 0]}
+	MessageDecode.prepare(bad, "chart")
+	var runs := {"t": "chunk", "tiles": [5, 3, 7, 2000]}
+	MessageDecode.prepare(runs, "chunk")
+	var tcv := ChunkView.new()
+	tcv.set_tiles_rle([5, 3, 7, 2000])
+	check(chart.get("_img") is Image and (chart["_img"] as Image).get_pixel(1, 0).r8 == 200 and not chart.has("px")
+		and not bad.has("_img") and bad.has("px") and runs.get("_tiles") == tcv.tile_ids,
+		"charts' pictures and chunks' tiles decoded off the main thread, as the main thread did; odd ones left as they came")
+	tcv.free()
+
+	# The ground's array: made with room, then a new kind of ground is one layer written.
+	var saved := [TerrainTextures._images.duplicate(), TerrainTextures._infos, TerrainTextures._reflects, TerrainTextures._array,
+		TerrainTextures._room, TerrainTextures._uploaded, TerrainTextures._dirty]
+	var mats: Array = []
+	for m: ShaderMaterial in [Visuals.terrain_material(), Visuals.water_material()]:
+		mats.append([m, m.get_shader_parameter("tiles"), m.get_shader_parameter("tile_info"), m.get_shader_parameter("textured"),
+			m.get_shader_parameter("tile_reflect")])
+	TerrainTextures._images.clear()
+	TerrainTextures._infos = PackedColorArray()
+	TerrainTextures._reflects = PackedFloat32Array()
+	TerrainTextures._room = 0
+	TerrainTextures._uploaded = 0
+	var add_layer := func() -> void:
+		var image := Image.create_empty(8, 8, true, Image.FORMAT_RGB8)
+		TerrainTextures._images.append(image)
+		TerrainTextures._infos.append(Color(10, 1, 1, 1))
+		TerrainTextures._reflects.append(1.0)
+		TerrainTextures._dirty = true
+	var made := TerrainTextures.arrays_made
+	var written := TerrainTextures.layers_written
+	for i in 3:
+		add_layer.call()
+	TerrainTextures.commit(true)
+	var first: bool = TerrainTextures.arrays_made == made + 1 and TerrainTextures._array.get_layers() == 3 + TerrainTextures.ARRAY_STEP_PLAIN
+	add_layer.call()
+	TerrainTextures.commit(true)
+	var one := TerrainTextures.arrays_made == made + 1 and TerrainTextures.layers_written == written + 1
+	for i in TerrainTextures.ARRAY_STEP_PLAIN:
+		add_layer.call()
+	TerrainTextures.commit(true)
+	var grown: bool = TerrainTextures.arrays_made == made + 2 and TerrainTextures._array.get_layers() == 8 + TerrainTextures.ARRAY_STEP_PLAIN
+	check(first and one and grown, "the ground's array: made with room, a new kind of ground written into its own layer, made again only when full")
+	TerrainTextures._images.assign(saved[0])
+	TerrainTextures._infos = saved[1]
+	TerrainTextures._reflects = saved[2]
+	TerrainTextures._array = saved[3]
+	TerrainTextures._room = saved[4]
+	TerrainTextures._uploaded = saved[5]
+	TerrainTextures._dirty = saved[6]
+	for entry: Array in mats:
+		var m: ShaderMaterial = entry[0]
+		m.set_shader_parameter("tiles", entry[1])
+		m.set_shader_parameter("tile_info", entry[2])
+		m.set_shader_parameter("textured", entry[3])
+		m.set_shader_parameter("tile_reflect", entry[4])
+	await get_tree().process_frame
+
+
+## A model whose shader and vertex format no pipeline has met yet waits out of view while Godot
+## compiles them (pipeline_warm.gd); one with a shader and format met already is drawn at once.
+func _pipeline_warm() -> void:
+	const PipelineWarm := preload("res://scripts/world/pipeline_warm.gd")
+	PipelineWarm._read_args()
+	var was_enabled := PipelineWarm.enabled
+	var was_hold := PipelineWarm.hold_msec
+	PipelineWarm.enabled = true
+	PipelineWarm.hold_msec = 50
+	var holder := Node3D.new()
+	add_child(holder)
+	PipelineWarm.attach(holder)
+	var shader := Shader.new()
+	shader.code = "shader_type spatial;\nvoid fragment() { ALBEDO = vec3(0.5); }\n"
+	var material := ShaderMaterial.new()
+	material.shader = shader
+	var make := func() -> ArrayMesh:
+		var arrays := []
+		arrays.resize(Mesh.ARRAY_MAX)
+		arrays[Mesh.ARRAY_VERTEX] = PackedVector3Array([Vector3.ZERO, Vector3.RIGHT, Vector3.UP])
+		var mesh := ArrayMesh.new()
+		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+		mesh.surface_set_material(0, material)
+		return mesh
+	var a: ArrayMesh = make.call()
+	var b: ArrayMesh = make.call()
+	var instances := PipelineWarm.instances_made
+	var first_held := not PipelineWarm.mesh_ready(a) and PipelineWarm.pending_count() == 1 and PipelineWarm.instances_made == instances + 1
+	var same_held := not PipelineWarm.mesh_ready(b) and PipelineWarm.instances_made == instances + 1  # its pipelines on their way: no second instance
+	var gen := PipelineWarm.generation
+	var until := Time.get_ticks_msec() + 3000
+	while PipelineWarm.pending_count() > 0 and Time.get_ticks_msec() < until:
+		await get_tree().process_frame
+		PipelineWarm.poll()
+	var c: ArrayMesh = make.call()
+	check(first_held and same_held and PipelineWarm.mesh_ready(a) and PipelineWarm.mesh_ready(b) and PipelineWarm.generation > gen
+		and PipelineWarm.mesh_ready(c) and PipelineWarm.instances_made == instances + 1,
+		"pipelines: a new shader and vertex format waits out of view, then counts as met; a mesh like it is drawn at once")
+	await get_tree().process_frame
+	check(holder.get_child(0).get_child_count() == 0, "and its warming instance is gone")
+	PipelineWarm.enabled = was_enabled
+	PipelineWarm.hold_msec = was_hold
+	holder.queue_free()
+	await get_tree().process_frame
+
+
 ## The bridge reads datagrams' JSON on a thread of its own (while moving, decoding was about half
 ## of the main thread's message time).
 func _bridge_parsing() -> void:
@@ -2320,7 +4464,7 @@ func _bridge_parsing() -> void:
 	var got: Array = []
 	b.message_received.connect(func(msg: Dictionary) -> void: got.append(int(msg.get("k", -1))))
 	var tx := PacketPeerUDP.new()
-	tx.set_dest_address("127.0.0.1", b._udp.get_local_port())
+	tx.set_dest_address("127.0.0.1", b.local_port())
 	tx.put_packet('{"t":"welcome","r":1,"v":1,"k":1}'.to_utf8_buffer())
 	for d in 4:
 		var lines: Array = []
@@ -2351,6 +4495,132 @@ func _bridge_parsing() -> void:
 	b.disconnect_from()
 	check(b._parse_thread == null and b._io_thread == null, "... and both threads stop with the connection")
 	b.queue_free()
+
+
+## A server on another PC: the bridge's link to the relay beside it (server/relay.py), over TCP, here
+## against a stand-in relay (a TCPServer): greeted, commands framed, datagrams in frames read as over
+## UDP (a frame split across writes too), a dropped link made again with the last hello first (how the
+## relay gives the session its port back), a refusal's reason kept. tools/test_relay.py tests the relay.
+func _bridge_relay() -> void:
+	var front := load("res://scripts/menu/front_end.gd")
+	check(front.parse_address("192.168.1.20:34200") == ["192.168.1.20", 34200] and front.parse_address("pi.local") == ["pi.local", 34200]
+		and front.parse_address("34210") == ["127.0.0.1", 34210] and front.parse_address("localhost:5") == ["127.0.0.1", 5]
+		and front.parse_address("[fd00::7]:34300") == ["fd00::7", 34300] and front.parse_address("a:b").is_empty()
+		and front.parse_address("host:70000").is_empty(),
+		"Connect to address reads host:port, a host alone (port 34200), a port alone (this PC) and [IPv6]:port")
+	var b = load("res://scripts/net/bridge.gd").new()
+	check(not b.through_relay("127.0.0.1") and not b.through_relay("localhost") and not b.through_relay("::1")
+		and b.through_relay("192.168.1.20") and b.through_relay("server.local"),
+		"a host other than this PC is a server on another PC (through its relay)")
+	var swap := load("res://scripts/menu/game_swap.gd")
+	var swap_said: String = swap._after_focus(2, false, 0, "192.168.1.20")
+	check(swap_said.contains("192.168.1.20") and swap_said.contains("Connect to address") and swap._after_focus(0, false, 0, "192.168.1.20") == "",
+		"Ctrl+F9 with the server on another PC and no Factorio window here says how to join it: %s" % swap_said)
+	var server := TCPServer.new()
+	var port := 0
+	for p in range(35870, 35896):
+		if server.listen(p, "127.0.0.1") == OK:
+			port = p
+			break
+	add_child(b)
+	b.relay_forced = true
+	b.connect_to("127.0.0.1", port, 0)
+	check(port > 0 and b.via_relay and b.bind_error == OK and b.local_port() == 0 and b.server_on_this_pc(),
+		"--relay: the bridge goes through a relay even on this PC, binding no UDP port (the server still counts as on this PC)")
+	var got: Array = []
+	b.message_received.connect(func(msg: Dictionary) -> void: got.append(int(msg.get("k", -1))))
+	var peer: StreamPeerTCP = await _relay_accept(server)
+	if peer == null:
+		check(false, "the bridge connects to the relay")
+		b.disconnect_from()
+		server.stop()
+		b.queue_free()
+		return
+	var said := await _relay_read(peer, 4)
+	peer.put_data("ZRL1".to_ascii_buffer())
+	var hello := await _relay_frame(peer)
+	check(said.get_string_from_ascii() == "ZRL1" and str(hello.get("t", "")) == "hello" and str(hello.get("sid", "")) != "",
+		"it says it is Zenith, then its hello comes as a frame: %s %s" % [said.get_string_from_ascii(), hello.get("t")])
+	peer.put_data(_relay_framed('{"t":"welcome","r":1,"v":1,"k":1}'))
+	var lines: Array = []
+	for i in 50:
+		lines.append('{"t":"sky","k":%d}' % (2 + i))
+	var batch := _relay_framed("\n".join(lines))
+	peer.put_data(batch.slice(0, 700))  # a frame split across writes
+	await get_tree().process_frame
+	peer.put_data(batch.slice(700))
+	peer.put_data(_relay_framed('{"t":"sky","k":52}'))
+	var waited := 0
+	while got.size() < 51 and waited < 180:
+		await get_tree().process_frame
+		waited += 1
+	var in_order := got.size() == 51
+	for i in got.size():
+		in_order = in_order and got[i] == 2 + i
+	check(in_order and b.relay_status() == "connected" and b.connected,
+		"the relay's frames are the bridge's datagrams, read whole and in order: %d of 51, %s" % [got.size(), b.relay_status()])
+	# The link drops: made again, the last hello first.
+	peer.disconnect_from_host()
+	var again: StreamPeerTCP = await _relay_accept(server, 6000)
+	var said_again := PackedByteArray()
+	var first := {}
+	if again != null:
+		said_again = await _relay_read(again, 4)
+		first = await _relay_frame(again)
+	check(again != null and said_again.get_string_from_ascii() == "ZRL1" and str(first.get("t", "")) == "hello"
+		and str(first.get("sid", "")) == str(hello.get("sid", "")),
+		"a dropped link is made again, its first frame the last hello (the same session: the relay gives back its port)")
+	# A relay that refuses: the reason is kept for the connecting screen.
+	if again != null:
+		again.put_data("ZRL!".to_ascii_buffer())
+		again.put_data(_relay_framed("the relay has 8 Zeniths connected already (--max-clients)"))
+	waited = 0
+	while not b.relay_status().begins_with("refused") and waited < 180:
+		await get_tree().process_frame
+		waited += 1
+	check(b.relay_status() == "refused: the relay has 8 Zeniths connected already (--max-clients)",
+		"a refusal's reason is kept: %s" % b.relay_status())
+	b.disconnect_from()
+	check(b._io_thread == null and not b.via_relay and b.relay_status() == "", "... and the link closes with the connection")
+	server.stop()
+	b.queue_free()
+
+
+func _relay_accept(server: TCPServer, msec := 4000) -> StreamPeerTCP:
+	var until := Time.get_ticks_msec() + msec
+	while Time.get_ticks_msec() < until:
+		if server.is_connection_available():
+			return server.take_connection()
+		await get_tree().process_frame
+	return null
+
+
+func _relay_read(peer: StreamPeerTCP, n: int, msec := 4000) -> PackedByteArray:
+	var until := Time.get_ticks_msec() + msec
+	while Time.get_ticks_msec() < until:
+		peer.poll()
+		if peer.get_available_bytes() >= n:
+			return peer.get_data(n)[1]
+		await get_tree().process_frame
+	return PackedByteArray()
+
+
+## The next frame from the bridge, as JSON ({} after the time).
+func _relay_frame(peer: StreamPeerTCP) -> Dictionary:
+	var head := await _relay_read(peer, 4)
+	if head.size() < 4:
+		return {}
+	var size := (head[0] << 24) | (head[1] << 16) | (head[2] << 8) | head[3]
+	var body := await _relay_read(peer, size)
+	var parsed = JSON.parse_string(body.get_string_from_utf8())
+	return parsed if parsed is Dictionary else {}
+
+
+func _relay_framed(text: String) -> PackedByteArray:
+	var data := text.to_utf8_buffer()
+	var out := PackedByteArray([(data.size() >> 24) & 255, (data.size() >> 16) & 255, (data.size() >> 8) & 255, data.size() & 255])
+	out.append_array(data)
+	return out
 
 
 ## Machines with a state near a point come from their chunks (fx.gd, working_glow.gd), not from a
@@ -2390,44 +4660,58 @@ func _stream_spread() -> void:
 			ordered = false
 	check(order.size() == 29 * 29 and square.size() == order.size() and ordered and order[0] == Vector2i.ZERO,
 		"the subscription's order: every chunk of the square once, nearest first (%d)" % order.size())
-	# Walking: each step asks for what asking from scratch would (still-wanted chunks kept, the
-	# nearest of the rest while fewer than the allowance are on their way), nearest first, and only
-	# chunks asked for are kept.
+	# Walking: each step asks for what asking from scratch would (still-wanted chunks kept, chunks of
+	# the area cache wanted again at once, the first of the rest while fewer than the allowance are on
+	# their way), in the view's order (I18: the way the view looks and moves first, prio_order), and
+	# the only other chunks kept are the area cache's, up to WARM_RINGS past the square.
 	var sw := WorldMirror.new()
 	add_child(sw)
 	sw.view_radius = 6
 	var same := true
-	var nearest_first := true
+	var in_order := true
+	var only_cache := true
 	for k in 40:
 		sw.set_focus(Vector2(16.0 + k * 9.0, 16.0 - k * 4.0))
 		var asked_before := {}
 		for c in sw._subscribed:
 			asked_before[c] = true
 		var coming_before: Dictionary = sw._coming.duplicate()
+		var warm_before: Dictionary = sw._warm.duplicate()
+		var had: Dictionary = sw.chunks.duplicate()
 		sw._update_subscription(WorldMirror.STREAM_STEP)
-		# From scratch: wanted nearest first; still-asked kept; then the nearest new ones while those
-		# on their way (not drawn: here those not marked drawn below) stay under the allowance.
+		# From scratch: wanted in the view's order; still-asked kept, and kept chunks wanted again;
+		# then the first new ones while those on their way (not drawn: here those not marked drawn
+		# below) stay under the allowance.
 		var center := WorldMirror.chunk_of(sw.focus())
+		var prio: Array = WorldMirror.prio_order(6, sw._wanted_sector)
 		var expect := {}
 		var on_way := 0
 		# Walking a few at a time; the first steps are a standing start (nothing drawn yet).
 		var allowance := WorldMirror.STREAM_MOVING if Time.get_ticks_msec() - sw._moved_msec < WorldMirror.MOVING_FOR * 1000.0 else WorldMirror.STREAM_STILL
-		for off: Vector2i in WorldMirror.ring_order(6):
+		for off: Vector2i in prio:
 			if asked_before.has(center + off):
 				expect[center + off] = true
 				if coming_before.has(center + off) and not sw._drawn(center + off):
 					on_way += 1
-		for off: Vector2i in WorldMirror.ring_order(6):
+			elif warm_before.has(center + off) and had.has(center + off):
+				expect[center + off] = true
+		for off: Vector2i in prio:
 			if not expect.has(center + off) and on_way < allowance:
 				expect[center + off] = true
 				on_way += 1
 		var got := {}
 		for c in sw._subscribed:
 			got[c] = true
-		same = same and got == expect and sw.chunks.size() == got.size()
+		same = same and got == expect
+		for c: Vector2i in sw.chunks:
+			if not got.has(c) and not (sw._warm.has(c) and sw._past_square(c) <= WorldMirror.WARM_RINGS):
+				only_cache = false
+		var rank := {}
+		for i in prio.size():
+			rank[prio[i]] = i
 		for i in range(1, sw._subscribed.size()):
-			if (sw._subscribed[i] - center).length_squared() < (sw._subscribed[i - 1] - center).length_squared():
-				nearest_first = false
+			if int(rank.get(sw._subscribed[i] - center, -1)) < int(rank.get(sw._subscribed[i - 1] - center, -1)):
+				in_order = false
 		# Half the chunks on their way arrive (no ground, nothing to build).
 		var n := 0
 		for c in sw._coming.keys():
@@ -2436,8 +4720,9 @@ func _stream_spread() -> void:
 				var acv: ChunkView = sw.chunks[c]
 				acv.loaded = true
 				acv.tile_ids = PackedInt32Array()
-	check(same and nearest_first,
-		"walking, the subscription asks for what asking from scratch would, nearest first, and keeps only those chunks")
+	check(same and in_order and only_cache,
+		"walking, the subscription asks for what asking from scratch would, in the view's order, and keeps only those chunks and the area cache (same %s, order %s, cache %s)"
+		% [same, in_order, only_cache])
 	for f in 400:
 		sw._free_unloaded()
 		if sw._unloaded.is_empty():
@@ -2959,14 +5244,69 @@ func _belt_item_shadows() -> void:
 	cam.global_position = Vector3(10.0, 100.0, 20.0)
 	items._update_shadows()
 	check(kind.cast_shadow == OFF and second.cast_shadow == OFF, "and stop again zooming far out")
+	check(kind.layers == ItemCardsScript.BELT_LAYER and second.layers == ItemCardsScript.BELT_LAYER,
+		"items on belts are on their own render layer, which the character's lights leave out of their shadows")
+	# Shadows Low: none at any zoom (sun_shadows.gd QUALITY "items" 0, 30, 45, 60).
+	BeltItemsScript.shadows_within = float(SunShadows.QUALITY["low"]["items"])
+	cam.global_position = Vector3(10.0, 21.0, 20.0)
+	items._update_shadows()
+	check(kind.cast_shadow == OFF and SunShadows.QUALITY["medium"]["items"] == 30.0 and SunShadows.QUALITY["high"]["items"] == 45.0
+		and SunShadows.QUALITY["ultra"]["items"] == 60.0, "on Low items on belts cast no shadows even up close; Medium to Ultra 30, 45, 60 tiles")
 	BeltItemsScript.shadows_within = within_before
 	vp.queue_free()
 	var loose := ItemCardsScript.new()
 	add_child(loose)
 	loose.prepare(1)
 	var lone: MultiMeshInstance3D = loose._kinds[1]
-	check(lone.cast_shadow == GeometryInstance3D.SHADOW_CASTING_SETTING_ON, "items on the ground and in hands still do")
+	check(lone.cast_shadow == GeometryInstance3D.SHADOW_CASTING_SETTING_ON and lone.layers == 1,
+		"items on the ground and in hands still do, on the usual layer")
 	loose.queue_free()
+
+
+## Levels of detail, the shadow stand-ins (Godot's own LODs) and SSAO count pixels on at most
+## ModelLods.max_lines (High and Medium 1440, Low 1080): a 4K picture is counted as 1440 lines, so it
+## doesn't keep detail twice as far as 1080p. The ground's relief is off at Level of detail Low.
+func _lod_lines() -> void:
+	ModelLods.apply_quality("high", get_viewport())
+	check(ModelLods.max_lines == 1440.0 and ModelLods.counted_lines(2160.0) == 1440.0 and ModelLods.counted_lines(1080.0) == 1080.0
+		and ModelLods.counted_lines(0.0) == 1.0, "Level of detail High counts at most 1440 lines, a smaller picture its own")
+	var vp := SubViewport.new()
+	vp.render_target_update_mode = SubViewport.UPDATE_DISABLED
+	vp.size = Vector2i(3840, 2160)
+	add_child(vp)
+	ModelLods.apply_quality("high", vp)
+	var high_4k := vp.mesh_lod_threshold
+	vp.size = Vector2i(1920, 1080)
+	ModelLods.fit_lines(vp)
+	var high_1080 := vp.mesh_lod_threshold
+	vp.size = Vector2i(3840, 2160)
+	ModelLods.apply_quality("low", vp)
+	var low_4k := vp.mesh_lod_threshold
+	check(is_equal_approx(high_4k, 1.5) and is_equal_approx(high_1080, 1.0) and is_equal_approx(low_4k, 8.0),
+		"Godot's own levels (the shadow stand-ins) allow as many real pixels at 4K as 1440 lines' (High 1.5, 1080p 1, Low at 4K 8): %.2f %.2f %.2f"
+		% [high_4k, high_1080, low_4k])
+	ModelLods.max_lines = 0.0
+	ModelLods.fit_lines(vp)
+	check(is_equal_approx(vp.mesh_lod_threshold, 4.0) and ModelLods.counted_lines(2160.0) == 2160.0, "--lod-lines=0 counts every real line, as before 0.2.1")
+	vp.queue_free()
+	# SSAO at 4K fades out where it does at 1440p (ao_zoom.gd measures on the counted lines).
+	ModelLods.apply_quality("medium", get_viewport())
+	var AoZoom := preload("res://scripts/world/ao_zoom.gd")
+	var cam := Camera3D.new()
+	cam.fov = 35.0
+	add_child(cam)
+	cam.look_at_from_position(Vector3(0, sin(deg_to_rad(50.0)) * 100.0, cos(deg_to_rad(50.0)) * 100.0), Vector3.ZERO)
+	var at_4k := AoZoom.view_tiles_per_pixel(cam, Vector2(3840, ModelLods.counted_lines(2160.0)))
+	var at_1440 := AoZoom.view_tiles_per_pixel(cam, Vector2(2560, 1440))
+	check(is_equal_approx(at_4k, at_1440) and at_4k > AoZoom.SSAO_FULL, "a 4K view 100 tiles off is measured as 1440p's: %.4f tiles a pixel" % at_4k)
+	cam.queue_free()
+	# The ground's bumps and crevices: off at Level of detail Low (three texture reads a ground pixel).
+	var terrain := Visuals.terrain_material()
+	Visuals.set_ground_relief(false)
+	var off: bool = terrain.get_shader_parameter("ground_relief") == false
+	Visuals.set_ground_relief(true)
+	check(off and terrain.get_shader_parameter("ground_relief") == true, "the ground's relief switches off and on (Level of detail Low)")
+	ModelLods.apply_quality(str(Settings.get_value("graphics", "lod_quality")), get_viewport())
 
 
 ## Fast belts' surfaces are smeared over the way they move in a frame (belt_blur.gd, the shader's
@@ -3199,11 +5539,43 @@ func _ups_governor() -> void:
 	_govern(g, tick, 3.0, helped)
 	check(g.level == first, "the next step waits PAUSE_DOWN after the last")
 	_govern(g, tick, 150.0, helped)
-	check(g.level == UpsGovernor.STEPS.size() and g.limit("entity", 192.0) == 64.0 and g.limit("updates", 6000.0) == 1500.0
+	check(g.level == UpsGovernor.STEPS.size() and g.limit("entity", 192.0) == 64.0 and g.limit("updates", 6000.0) == 6000.0
 		and g.limit("far", 160.0) == 32.0 and g.limit("view", 10.0) == 5.0 and g.limit("fps", 0.0) == 45.0 and g.limit("map", 1.0) == 4.0
-		and g.limit("rate", 0.0) == 3.0,
-		"still slow: every step taken, each knob at its floor and no lower: level %d, %s" % [g.level, g.status()])
+		and g.limit("rate", 0.0) == 3.0 and not g.status().contains("moving belt items"),
+		"still slow: every step taken, each knob at its floor and no lower; the Moving belt items steps skipped (the belts are simulated here, the bridge's square ignores the cap): level %d, %s" % [g.level, g.status()])
 	check(g.limit("updates", 1000.0) == 1000.0 and g.limit("fps", 30.0) == 30.0, "a player's setting under the floor stays theirs")
+	# --ups-updates-steps=on: the Moving belt items steps are taken as before (a bridge whose square the cap bounds).
+	var g2 = UpsGovernor.new()
+	add_child(g2)
+	g2.set_process(false)
+	g2.updates_steps = true
+	var tick2 := [1000.0]
+	_govern(g2, tick2, 40.0, 60.0)
+	_govern(g2, tick2, 150.0, helped)
+	check(g2.level == UpsGovernor.STEPS.size() and g2.limit("updates", 6000.0) == 1500.0 and g2.status().contains("moving belt items 1500"),
+		"--ups-updates-steps=on: the Moving belt items steps are taken, to their floor: level %d, %s" % [g2.level, g2.status()])
+	g2.queue_free()
+	# --governor-belts-last (on): the belt item distance is cut only once every other step is taken, the view
+	# distance and the FPS cap too; off, STEPS' order as before (96 at the seventh step).
+	var g3 = UpsGovernor.new()
+	add_child(g3)
+	g3.set_process(false)
+	var others := 0
+	for st: Array in g3.steps:
+		if st[0] != "far" and st[0] != "updates":
+			others += 1
+	for i in others:
+		g3._step(1)
+	var far_kept: float = g3.limit("far", 160.0)
+	var view_then: float = g3.limit("view", 10.0)
+	var fps_then: float = g3.limit("fps", 0.0)
+	g3._step(1)
+	var far_first: float = g3.limit("far", 160.0)
+	g3.belts_last = false
+	var old_order: bool = g3.steps == UpsGovernor.STEPS
+	g3.queue_free()
+	check(far_kept == 160.0 and view_then == 5.0 and fps_then == 45.0 and far_first == 96.0 and old_order,
+		"--governor-belts-last: the belt item distance holds (%s) until view distance (%s) and the FPS cap (%s) are at their floors, then 96 (%s); off, STEPS' order" % [far_kept, view_then, fps_then, far_first])
 	# The load goes away: one step back up per HOLD_UP at 60, back to the player's settings.
 	var top: int = g.level
 	_govern(g, tick, 45.0, 60.0)
@@ -3780,6 +6152,48 @@ func _performance() -> void:
 	while b.waiting_count() > 0:
 		b._drain()
 	check(got.size() == 3000, "... and they are all handled in order over the next frames")
+	# Messages that have waited past --message-catchup-msec since their datagram was read are behind
+	# (their frame's slice then is the whole of theirs, frame_budget.gd); fresh ones, or the switch off, not.
+	b._queue('{"t":"sky","k":4000}\n{"t":"sky","k":4001}'.to_utf8_buffer())
+	var q_now := Time.get_ticks_usec()
+	var q_fresh: bool = b.behind(q_now)
+	b._waiting_usec[b._waiting_at] = q_now - b.catchup_usec - 1000
+	var q_old: bool = b.behind(q_now)
+	b.message_catchup = false
+	var q_off: bool = b.behind(q_now)
+	b.message_catchup = true
+	check(not q_fresh and q_old and not q_off and b.waiting_msec() >= b.catchup_usec / 1000 and b._waiting_usec.size() == b._waiting.size(),
+		"messages are behind once the oldest has waited over %d ms (fresh %s, old %s, switched off %s)" % [b.catchup_usec / 1000, q_fresh, q_old, q_off])
+	while b.waiting_count() > 0:
+		b._drain()
+	check(b.waiting_msec() == 0 and not b.behind(Time.get_ticks_usec()), "... and not once they are handled")
+	# --belt-messages-first (on): the belt simulation's updates (bs) are handled before the others waiting, but never
+	# ahead of a welcome or surface still waiting (they start the belts over), nor of belt messages queued behind one;
+	# the inserters' events (ie) stay in order.
+	got.clear()
+	var lens := PackedInt32Array([10, 10, 10])
+	var now_q := Time.get_ticks_usec()
+	b._route([{"t": "sky", "k": 5000}, {"t": "bs", "k": 5000}, {"t": "sky", "k": 5001}], lens, now_q)
+	var ahead: Array = b._belt_waiting.duplicate()
+	while b.waiting_count() > 0 or not b._belt_waiting.is_empty():
+		b._drain()
+	var first_order: Array = got.duplicate()
+	got.clear()
+	b._route([{"t": "surface", "r": b._expected_r, "k": 5002}, {"t": "bs", "k": 5002}], PackedInt32Array([10, 10]), now_q)
+	var held_back: bool = b._belt_waiting.is_empty() and b._belt_barriers == 1 and b._belts_behind == 1
+	b._route([{"t": "bs", "k": 5003}], PackedInt32Array([10]), now_q)
+	var still_behind: bool = b._belt_waiting.is_empty() and b._belts_behind == 2
+	b._route([{"t": "ie", "k": 5003}], PackedInt32Array([10]), now_q)
+	var ie_in_order: bool = b._belt_waiting.is_empty() and b._belts_behind == 2
+	while b.waiting_count() > 0 or not b._belt_waiting.is_empty():
+		b._drain()
+	var after_barrier: Array = got.duplicate()
+	b._route([{"t": "bs", "k": 5004}], PackedInt32Array([10]), now_q)
+	var fast_again: bool = b._belt_waiting.size() == 1 and b._belt_barriers == 0 and b._belts_behind == 0
+	b._drain()
+	check(ahead.size() == 1 and first_order == ["bs", "sky", "sky"] and held_back and still_behind
+		and ie_in_order and after_barrier == ["surface", "bs", "bs", "ie"] and fast_again,
+		"--belt-messages-first: a bs is handled ahead of the messages before it %s, but behind a surface still waiting %s (held %s %s, fast again %s)" % [first_order, after_barrier, held_back, still_behind, fast_again])
 	b.free()
 	# Chunk rebuilds stop at their time budget (at least one a frame).
 	var build_slice := int(preload("res://scripts/world/frame_budget.gd").SYSTEMS[&"build"][1])
@@ -4043,6 +6457,258 @@ func _dev_tools(hud: Hud) -> void:
 	get_tree().auto_accept_quit = quit_before
 
 
+## The debug menu's Updates tab (update_overlay.gd, owner: "see when and where the bridge is updating parts by
+## outlining the tiles"): a kind switched on outlines what each of its messages touched (an entity's footprint,
+## turned as it stands, a chunk's square, a lane's strip, a hand's spot), full at once and faded out a second
+## later, then not drawn at all; a kind off draws nothing; with every kind off there is no overlay node, no
+## handler on the Bridge and no belt tap; a public build (no dev tools) or no game switches none on. The states:
+## how each lane is drawn (the lattice's lanes as belt_items.gd's lattice has them, the rest the simulation's,
+## belts with no lane far icons or nothing) and the lattice against the simulation (standing while the
+## simulation moves, pulsing once held). The legend counts updates a second. The flash shader parses; a broken
+## copy doesn't.
+func _update_overlays(hud: Hud) -> void:
+	var dm = hud.ui.debug_menu
+	var ids: Array = UpdateOverlayScript.kind_ids()
+	var boxes := 0
+	for id: String in ids:
+		if dm.find_child("Upd_" + id, true, false) is CheckBox:
+			boxes += 1
+	dm._open_tab(3)
+	check(dm.current_tab() == "Updates" and dm.find_child("UpdatesPage", true, false) != null and boxes == ids.size(),
+		"update overlays: the debug menu's Updates tab, a switch per kind (%d of %d)" % [boxes, ids.size()])
+	dm._open_tab(0)
+	var was_main = dm.main
+	Settings.dev_tools_override = 0
+	var public_on: bool = dm.set_update_kind("add", true)
+	Settings.dev_tools_override = -1
+	dm.main = null
+	var no_game_on: bool = dm.set_update_kind("add", true)
+	check(not public_on and not no_game_on and dm.update_overlay() == null and not (dm.find_child("Upd_add", true, false) as CheckBox).button_pressed,
+		"update overlays: a public build or no game switches none on (no overlay made, the box unticked)")
+	# A stand-in game: a world with an assembler (3 x 3), a splitter (2 x 1) and belts, belt_items.gd, far icons.
+	var w := WorldMirror.new()
+	add_child(w)
+	w.protos.add_entities([[1, "assembling-machine-1", "assembling-machine", -1.5, -1.5, 1.5, 1.5, 150, 150, 150, 3, 3],
+		[2, "splitter", "splitter", -0.9, -0.5, 0.9, 0.5, 200, 200, 0, 2, 1],
+		[3, "transport-belt", "transport-belt", -0.5, -0.5, 0.5, 0.5, 200, 200, 0, 1, 1]])
+	var belts = BeltItemsScript.new()
+	add_child(belts)
+	belts._sync = true
+	# (The states' belts and lanes well away from the rest: they count what lies within TINT_RADIUS of the focus.)
+	var ox := 300.0
+	var oy := 300.5
+	for at: Vector2 in [Vector2(10, 10), Vector2(20, 5), Vector2(ox + 8.5, oy), Vector2(ox + 40.5, oy)]:
+		var c: Vector2i = WorldMirror.chunk_of(at)
+		if not w.chunks.has(c):
+			var cv := ChunkView.new()
+			cv.coord = c
+			cv.loaded = true
+			w.chunks[c] = cv
+			w.add_child(cv)
+	w._add([5, 1, 10 * 256 + 128, 10 * 256 + 128, 0])
+	w._add([6, 2, 20 * 256 + 128, 5 * 256, 4])  # facing east: 1 x 2 on the map, on a tile's middle across, its edge along
+	w._add([77, 3, roundi((ox + 8.5) * 256), roundi(oy * 256), 0])
+	w._add([78, 3, roundi((ox + 40.5) * 256), roundi(oy * 256), 0])
+	w.set_focus(Vector2(ox, oy))
+	var lanes_gs := GDScript.new()
+	lanes_gs.source_code = "extends Node\nvar covered := Vector3()\nvar distance := 160\nvar far := {}\nfunc built_chunks() -> Dictionary:\n\treturn far\n"
+	lanes_gs.reload()
+	var far_lanes: Node = lanes_gs.new()
+	far_lanes.covered = Vector3(ox, oy, 2.0)
+	far_lanes.far = {WorldMirror.chunk_of(Vector2(ox + 8.5, oy)): true}
+	add_child(far_lanes)
+	var stand_gs := GDScript.new()
+	stand_gs.source_code = "extends Node\nvar world\nvar belt_items\nvar belt_lanes\n"
+	stand_gs.reload()
+	var stand: Node = stand_gs.new()
+	stand.world = w
+	stand.belt_items = belts
+	stand.belt_lanes = far_lanes
+	add_child(stand)
+	dm.main = stand
+	(dm.find_child("Upd_add", true, false) as CheckBox).button_pressed = true
+	var ov = dm.update_overlay()
+	check(ov != null and ov.get_parent() == w and ov.is_on("add") and Bridge.message_received.is_connected(Callable(ov, "on_message")) and not belts.debug_tap.is_valid(),
+		"update overlays: ticking a kind makes the overlay in the world, its handler on the Bridge (no belt tap for an entity kind)")
+	if ov == null:
+		dm.main = was_main
+		for n in [w, belts, far_lanes, stand]:
+			n.queue_free()
+		return
+	ov.on_message({"t": "add", "e": [7, 1, 30 * 256 + 128, 12 * 256 + 128, 0]})
+	ov.on_message({"t": "del", "u": 6, "p": 2, "x": 20 * 256 + 128, "y": 5 * 256})  # off: nothing
+	ov._process(0.016)
+	var f: Array = ov.drawn_at("add", 0)
+	check(ov.drawn_count("add") == 1 and not ov.has_layer("del") and f.size() > 5 and (f[0] as Vector2).is_equal_approx(Vector2(30.5, 12.5))
+		and (f[1] as Vector2).is_equal_approx(Vector2(3, 3)) and float(f[5]) > 0.95,
+		"update overlays: an `add` outlines its entity's footprint at once, at full strength; `del`, off, draws nothing: %s" % [f])
+	ov.time_shift += 0.5
+	var half: float = ov.drawn_at("add", 0)[5]
+	ov.time_shift += 0.6
+	var faded: float = ov.drawn_at("add", 0)[5]
+	ov._process(0.016)
+	check(absf(half - 0.5) < 0.06 and faded == 0.0 and ov.drawn_count("add") == 0,
+		"update overlays: a flash fades over a second, then nothing of it is drawn: %.2f, %.2f, %d drawn" % [half, faded, ov.drawn_count("add")])
+	# Removed and machine states: the footprint turned as the entity stands (`del` carries no direction).
+	dm.set_update_kind("del", true)
+	dm.set_update_kind("st", true)
+	ov.on_message({"t": "del", "u": 6, "p": 2, "x": 20 * 256 + 128, "y": 5 * 256})
+	ov.on_message({"t": "st", "l": [6, 1, 999, 0]})  # 999 has no record: nothing
+	ov._process(0.016)
+	var d: Array = ov.drawn_at("del", 0)
+	var s: Array = ov.drawn_at("st", 0)
+	var turned := func(a: Array) -> bool:
+		return a.size() > 2 and (a[0] as Vector2).is_equal_approx(Vector2(20.5, 5.0)) and (a[1] as Vector2).is_equal_approx(Vector2(1.8, 1.0)) \
+			and absf(absf(float(a[2])) - PI / 2.0) < 0.01
+	check(turned.call(d) and turned.call(s) and ov.drawn_count("st") == 1 and UpdateOverlayScript.guess_dir(Vector2i(2, 1), Vector2(20.0, 4.5)) == 0,
+		"update overlays: a splitter facing east is outlined 1 x 2, from its record (`st`) and guessed from where it stood (`del`): %s / %s" % [d, s])
+	dm.set_update_kind("chunk", true)
+	ov.on_message({"t": "chunk", "cx": -1, "cy": 0, "tiles": [], "parts": 1})
+	ov._process(0.016)
+	var ch: Array = ov.drawn_at("chunk", 0)
+	check(ch.size() > 3 and (ch[0] as Vector2).is_equal_approx(Vector2(-16, 16)) and float((ch[1] as Vector2).x) > 31.0 and float(ch[3]) > 0.0,
+		"update overlays: a chunk snapshot outlines the chunk's square: %s" % [ch])
+	# Belt lanes: placed by the lane's meta (`bs` lm) when it came while on; else by belt_items.gd's, in its debug tap.
+	dm.set_update_kind("sl", true)
+	dm.set_update_kind("bre", true)
+	dm.set_update_kind("hand", true)
+	ov.on_message({"t": "bs", "k": 10, "lm": _bs_lane(9, 1, 256, 8, 2.0, 10.0, 1.0, 10.0), "sl": [9, 10, 1, 30, 1, 200, 1]})
+	ov._process(0.016)
+	var sl: Array = ov.drawn_at("sl", 0)
+	check(belts.debug_tap.is_valid() and sl.size() > 3 and (sl[0] as Vector2).is_equal_approx(Vector2(1.5, 10.0)) and absf(float((sl[1] as Vector2).x) - 1.0) < 0.01
+		and float(sl[3]) == 0.0, "update overlays: a lane read outlines the lane, a strip from its exit to its entry; a belt kind sets belt_items.gd's tap: %s" % [sl])
+	_bs_feed(belts, 1000, {"lm": _bs_lane(17, 1, 256, 8, 6.0, 12.0, 5.0, 12.0)}, 1)
+	ov.on_message({"t": "bs", "k": 1001, "sl": [17, 1001, 0]})  # its meta came before the overlay heard it
+	ov._process(0.016)
+	var waited: int = ov.waiting_count("sl") + ov._lane_wait.size()
+	_bs_feed(belts, 1001, {}, 1)  # a job: the tap places it from belt_items.gd's lanes
+	ov._process(0.016)
+	var late: Array = ov.drawn_at("sl", 1)
+	var job_gs := GDScript.new()
+	job_gs.source_code = "extends RefCounted\nvar resend := [17]\n"
+	job_gs.reload()
+	ov.on_belt_job(job_gs.new())
+	ov.on_message({"t": "ie", "k": 5, "l": [6, 99, 5, 9, 128, 777, 1, 1, 1]})
+	ov.on_message({"t": "ie", "k": 7, "l": [6, 99, 5, 9, 128, 777, 1, 1, 1]})  # the same record again: once
+	ov._process(0.016)
+	# (belt_items.gd's own jobs may have asked for lanes too: the stand-in job's is looked for among them.)
+	var drawn_near := func(id: String, at: Vector2) -> bool:
+		for i in ov.drawn_count(id):
+			if (ov.drawn_at(id, i)[0] as Vector2).is_equal_approx(at):
+				return true
+		return false
+	var put: Array = ov.drawn_at("hand", 0)
+	check(waited == 1 and late.size() > 0 and (late[0] as Vector2).is_equal_approx(Vector2(5.5, 12.0)) and drawn_near.call("bre", Vector2(5.5, 12.0))
+		and ov.drawn_count("hand") == 1 and (put[0] as Vector2).is_equal_approx(Vector2(1.5, 10.0)),
+		"update overlays: a lane known only to belt_items.gd waits for its next job; `bre` outlines what was asked; a hand's put (`ie` 6) its item's place, once: %s %s" % [late, put])
+	dm.set_update_kind("mv", true)
+	ov.on_message({"t": "mv", "z": 1, "l": [[100, 1, 2560, 2560, 0], [1, 0, 256, 0, 0]]})
+	ov.on_message({"t": "mv", "z": 1, "l": [[100, 1, 2560, 2560, 0]]})  # again at once: not flashed again
+	ov._process(0.016)
+	var mv1: Array = ov.drawn_at("mv", 1)
+	check(ov.drawn_count("mv") == 2 and mv1.size() > 0 and (mv1[0] as Vector2).is_equal_approx(Vector2(11, 10)) and (mv1[1] as Vector2).is_equal_approx(Vector2(3, 3)),
+		"update overlays: movers (delta-coded `mv`) at their places, each flashed at most every %.2f s: %d drawn, %s" % [UpdateOverlayScript.REFLASH, ov.drawn_count("mv"), mv1])
+	# The states. How lanes are drawn: four lanes (some maybe the lattice's), a belt with no lane in a far-icon chunk, one with none.
+	var lm: Array = []
+	for u in range(1, 4):
+		lm.append_array(_bs_lane(u * 8 + 1, 1, 256, 8, ox + u + 1.0, oy, ox + u, oy))
+	lm.append_array(_bs_lane(4 * 8 + 1, 1, 256, 8, ox + 5.0, oy, ox + 4.0, oy, INF, INF, -1))
+	var reads: Array = []
+	for u in range(4, 0, -1):
+		var n := 3 if u == 4 else 4
+		reads.append_array([u * 8 + 1, 2000, n])
+		for q in n:
+			reads.append_array([3000 + u * 8 + q, 1, (q + (1 if u == 4 else 0)) * 64 + 32, 1])
+	_bs_feed(belts, 2000, {"lm": lm, "sl": reads}, 1)
+	for k in range(2001, 2008):
+		_bs_feed(belts, k, {}, 1)
+	dm.set_update_kind("lanes", true)
+	dm.set_update_kind("frozen", true)
+	ov.sample_lanes(belts._state)
+	var lat := 0
+	for u in range(1, 5):
+		if belts._state.lat.has(u * 8 + 1):
+			lat += 1
+	var modes: Dictionary = ov.stats.get("lanes", {})
+	check(int(modes.get("lattice", -1)) == lat and int(modes.get("sim", -1)) == 4 - lat and int(modes.get("far", -1)) == 1 and int(modes.get("none", -1)) == 1
+		and ov.drawn_count("lanes") == 6, "update overlays: how lanes are drawn, as belt_items.gd has them (%d of 4 the lattice's), a belt with no lane far icons or nothing: %s, %d drawn" % [lat, modes, ov.drawn_count("lanes")])
+	# The lattice against the simulation, from a stand-in state: lane 41 standing while its items move, 49 sliding while they stand.
+	var lattice_gs := GDScript.new()
+	lattice_gs.source_code = "extends RefCounted\nvar v := {}\nfunc drawn_speed(key: int) -> int:\n\treturn int(v.get(key, -1))\n"
+	lattice_gs.reload()
+	var sim_gs := GDScript.new()
+	sim_gs.source_code = "extends RefCounted\nvar f := {}\nfunc lane_fronts(keys: PackedInt64Array) -> PackedInt32Array:\n\tvar out := PackedInt32Array()\n\tfor k in keys:\n\t\tout.append_array(f.get(k, PackedInt32Array([-1, 0, 0])))\n\treturn out\n"
+	sim_gs.reload()
+	var st_gs := GDScript.new()
+	st_gs.source_code = "extends RefCounted\nvar lanes := {}\nvar lat := {}\nvar sim\nvar lattice\n"
+	st_gs.reload()
+	var fake = st_gs.new()
+	fake.sim = sim_gs.new()
+	fake.lattice = lattice_gs.new()
+	for key in [41, 49, 57]:
+		fake.lanes[key] = PackedInt32Array([1, 256, 8, roundi((ox + 1.0) * 256), roundi(oy * 256), roundi((ox + 0.5) * 256), roundi(oy * 256), roundi(ox * 256), roundi(oy * 256)])
+		fake.lat[key] = true
+	fake.lattice.v = {41: 0, 49: 8, 57: 8}
+	fake.sim.f = {41: PackedInt32Array([10, 8, 3]), 49: PackedInt32Array([10, 0, 3]), 57: PackedInt32Array([10, 8, 3])}
+	ov.sample_frozen(fake)
+	var first: Array = ov.stats.get("frozen", [])
+	ov.time_shift += 0.6
+	ov.sample_frozen(fake)
+	var then: Array = ov.stats.get("frozen", [])
+	var pulsing := 0
+	for i in ov.drawn_count("frozen"):
+		if float(ov.drawn_at("frozen", i)[6]) < -1.5:
+			pulsing += 1
+	var classes: Array = UpdateOverlayScript.lattice_against_sim(PackedInt64Array([1, 2, 3, 4]), PackedInt32Array([0, 8, 0, -1]),
+		PackedInt32Array([5, 8, 2, 5, 0, 2, -1, 0, 0, 5, 8, 2]))
+	check(first == [1, 0, 1] and then == [1, 1, 1] and pulsing == 1 and Array(classes[0]) == [1] and Array(classes[1]) == [2],
+		"update overlays: the lattice standing while the simulation moves (pulsing once held %.1f s) and sliding while it stands: %s then %s, %d pulsing, %s" % [UpdateOverlayScript.HELD_SEC, first, then, pulsing, classes])
+	# The subscription: its square, a chunk still to come (on its way: outlined too), the view's direction.
+	w._sq_center = Vector2i(9, 9)
+	w._sq_radius = 3
+	w._subscribed = [Vector2i(9, 9), Vector2i(12, 9)]
+	w._coming = {Vector2i(12, 9): true}
+	w._sent_sector = 0
+	dm.set_update_kind("sub", true)
+	ov._subscription()
+	var square: Array = ov.drawn_at("sub", 0)
+	check(ov.stats.get("sub", []) == [2, 1, 1] and ov.drawn_count("sub") == 4 and square.size() > 1
+		and (square[0] as Vector2).is_equal_approx(Vector2(304, 304)) and (square[1] as Vector2).is_equal_approx(Vector2(224, 224)),
+		"update overlays: the subscription's square, the chunk still to come and on its way, the view's direction: %s, %d drawn" % [ov.stats.get("sub"), ov.drawn_count("sub")])
+	# The legend: a kind's updates in the last second.
+	ov.roll()
+	ov.on_message({"t": "st", "l": [6, 1, 5, 0, 6, 0]})
+	ov.roll()
+	ov._update_legend()
+	var legend: String = ov.legend_text()
+	check(ov.rate_of("st") == 3 and legend.contains("Machine states  3/s") and legend.contains("Lattice standing, simulation moving: 1") and legend.contains("far icons: 1"),
+		"update overlays: the legend counts each kind's updates a second and the states': %s" % legend.replace("\n", " | "))
+	# The flash shader parses (its uniforms are listed); a copy with an error doesn't.
+	var good := Shader.new()
+	good.code = FileAccess.get_file_as_string("res://shaders/update_flash.gdshader")
+	var bad := Shader.new()
+	bad.code = good.code.replace("ALPHA = a;", "ALPHA = a +;")
+	var good_u: Array = good.get_shader_uniform_list().map(func(u: Dictionary) -> String: return str(u["name"]))
+	var bad_u: Array = bad.get_shader_uniform_list()
+	check(good_u.has("now") and good_u.has("fade") and good_u.has("fill") and bad_u.is_empty(),
+		"update overlays: the flash shader parses (uniforms %s); a broken copy doesn't (%d)" % [good_u, bad_u.size()])
+	# Every kind off: no node, no handler, no tap.
+	(dm.find_child("Updates_off", true, false) as Button).pressed.emit()
+	await get_tree().process_frame
+	var handlers := 0
+	for con: Dictionary in Bridge.message_received.get_connections():
+		var o = (con["callable"] as Callable).get_object()
+		if o != null and o.get_script() == UpdateOverlayScript:
+			handlers += 1
+	check(not is_instance_valid(ov) and dm.update_overlay() == null and handlers == 0 and not belts.debug_tap.is_valid()
+		and w.find_child("UpdateOverlay", true, false) == null and not (dm.find_child("Upd_lanes", true, false) as CheckBox).button_pressed,
+		"update overlays: with every kind off nothing is left (no node, no handler on the Bridge, no belt tap, boxes unticked)")
+	dm.main = was_main
+	for n in [w, belts, far_lanes, stand]:
+		n.queue_free()
+	await get_tree().process_frame
+
+
 ## Items in 3D's cap and 3D grass follow the camera drawing when it isn't Zenith's own view round the
 ## character (view_priority.gd): a camera away from the character gives the models to the items in
 ## its view, nearest it first, none behind it; in the normal view the square's centre decides, as before.
@@ -4185,6 +6851,139 @@ func _console(hud: Hud) -> void:
 	con.rcon = old_rcon
 	con.has_rcon = old_has
 	sent()
+
+
+## K1, K2: Alt-mode draws the modules in machines and the science packs in labs in rows, as the
+## prototype's icons_positioning lays them out (`eprops` isq, `am`), and the machine's own icon where
+## its icon_draw_specification puts it (`eprops` ids): an assembling machine 3 with four modules (2.1's
+## defaults for a 3-wide machine), a lab with seven packs and two modules (Space Age's lab), a beacon's
+## only while the mouse is on it, each quality's mark, first person's quads.
+func _alt_sequences() -> void:
+	# The layouts alone, in tiles from the machine's centre (x right, y down).
+	var asm_row := ["m", 0, 0.7, 0.5, 4, 2, 1.1, -0.1]
+	var near := func(got: Array, want: Array) -> bool:
+		if got.size() != want.size():
+			return false
+		for i in got.size():
+			if absf(float(got[i]) - float(want[i])) > 0.001:
+				return false
+		return true
+	var four: Array = AltOverlay.sequence_cells(4, asm_row)
+	var xs: Array = four.map(func(c): return (c[0] as Vector2).x)
+	var on_row := func(c) -> bool:
+		return is_equal_approx((c[0] as Vector2).y, 0.7) and is_equal_approx(float(c[1]), 0.5)
+	check(four.size() == 4 and near.call(xs, [-0.825, -0.275, 0.275, 0.825]) and four.all(on_row),
+		"K1: four modules in an assembling machine 3: one row 0.7 tiles below its centre, 0.55 apart, 0.5 tiles each: %s" % [four])
+	var box := Rect2(-1.5, -1.5, 3, 3)
+	var lab_packs := ["l", 0, 0, 0.5, 6, 2, 0.909, -0.1]
+	var lab_mods := ["m", 0, 0.9, 0.5, 4, 2, 1.1, -0.1]
+	var packs: Array = AltOverlay.sequence_cells(7, lab_packs)
+	var mods: Array = AltOverlay.sequence_cells(2, lab_mods)
+	var rects: Array[Rect2] = []
+	for c in packs + mods:
+		rects.append(Rect2((c[0] as Vector2) - Vector2(c[1], c[1]) * 0.5, Vector2(c[1], c[1])))
+	var inside := rects.all(func(r: Rect2): return box.encloses(r))
+	var pack_bottom := 0.0
+	for i in 7:
+		pack_bottom = maxf(pack_bottom, rects[i].end.y)
+	check(packs.size() == 7 and is_equal_approx((packs[0][0] as Vector2).y, -0.1) and is_equal_approx((packs[5][0] as Vector2).y, -0.1)
+		and is_equal_approx((packs[6][0] as Vector2).x, 0.0) and absf((packs[6][0] as Vector2).y - (-0.1 + 0.4545)) < 0.001
+		and absf((packs[0][0] as Vector2).x + 2.5 * 0.4545) < 0.001,
+		"K2: a lab's seven packs: six in the first row lifted 0.1, the seventh centred under them, 0.4545 apart: %s" % [packs])
+	check(inside and pack_bottom < rects[7].position.y and is_equal_approx((mods[0][0] as Vector2).y, 0.9),
+		"K2: the lab's packs and its modules' row under them fit in its 3 x 3 without overlapping: %.3f < %.3f" % [pack_bottom, rects[7].position.y])
+	var base_lab: Array = AltOverlay.sequence_cells(7, ["l", 0, 0, 0.5, 4, 2, 0.909, -0.1])
+	check(near.call(base_lab.slice(4).map(func(c): return (c[0] as Vector2).x), [-0.4545, 0.0, 0.4545]),
+		"K2: the base game's lab, four a row: the last three centred")
+	check(AltOverlay.sequence_cells(9, asm_row).size() == 8
+		and (AltOverlay.sequence_cells(1, asm_row)[0][0] as Vector2).is_equal_approx(Vector2(0, 0.7)),
+		"K1: no more than a row's icons times its rows; one alone on the shift")
+	# Drawn: from above, the rows round each machine's centre on the screen, its own icon by ids.
+	var holder := Node3D.new()
+	add_child(holder)
+	var w := WorldMirror.new()
+	holder.add_child(w)
+	w.protos.add_entities([[21, "assembling-machine-3", "assembling-machine", -1.5, -1.5, 1.5, 1.5, 150, 150, 150, 3, 3],
+		[22, "lab", "lab", -1.5, -1.5, 1.5, 1.5, 150, 150, 150, 3, 3],
+		[23, "beacon", "beacon", -1.5, -1.5, 1.5, 1.5, 150, 150, 150, 3, 3]])
+	w.chunks[Vector2i.ZERO] = ChunkView.new()
+	w._add([960, 21, 5 * 256 + 128, 5 * 256 + 128, 0, {"ai": ["recipe", "iron-gear-wheel"]}])
+	w._add([961, 22, 12 * 256 + 128, 5 * 256 + 128, 0])
+	w._add([962, 23, 19 * 256 + 128, 5 * 256 + 128, 0])
+	var gs := GDScript.new()
+	gs.source_code = "extends Node3D\nvar world\nvar rig\nvar camera: Camera3D\nvar first_person := false\nvar hovered\nvar eprops := {}\n"
+	gs.reload()
+	var rig: Node3D = gs.new()
+	rig.camera = Camera3D.new()
+	rig.add_child(rig.camera)
+	holder.add_child(rig)
+	var fake_player: Node3D = gs.new()
+	fake_player.world = w
+	fake_player.rig = rig
+	var fake_model: Node3D = gs.new()  # only its eprops are read
+	fake_model.eprops = {21: {"x": {"ids": [0, -0.3, 1], "isq": [asm_row]}}, 22: {"x": {"isq": [lab_mods, lab_packs]}},
+		23: {"x": {"isq": [["m", 0, 0, 0.5, 2, 2, 1.1, -0.3]]}}}
+	var overlay := AltOverlay.new()
+	overlay.model = fake_model
+	overlay.player = fake_player
+	overlay.on = true
+	add_child(overlay)
+	rig.camera.position = Vector3(12.5, 40, 5.5)
+	rig.camera.look_at(Vector3(12.5, 0, 5.5), Vector3(0, 0, -1))
+	var turns_before: int = Bridge.alt_contents
+	Bridge.set_alt_contents(true)
+	var seven: Array = ["automation-science-pack", "logistic-science-pack", "military-science-pack", "chemical-science-pack",
+		"production-science-pack", "utility-science-pack", "space-science-pack"]
+	w.handle({"t": "am", "g": Bridge.alt_contents, "l": [[960, ["speed-module-3", ["speed-module-3", "rare"], "productivity-module-3",
+		"productivity-module-3"]], [961, ["speed-module", "speed-module"], seven], [962, ["speed-module-3", "speed-module-3"]]]})
+	w.handle({"t": "am", "g": Bridge.alt_contents + 5, "l": [[961]]})
+	overlay.collect()
+	check(overlay.drawn == 1 + 4 + 9 and (w.alt_machines_now().get(961, []) as Array).size() == 2,
+		"K1, K2: the recipe, four modules, seven packs and two modules drawn; the beacon's not while the mouse is off it: %d" % overlay.drawn)
+	var anchor := func(x: float) -> Vector2:
+		return rig.camera.unproject_position(Vector3(x, Visuals.height_for(w.protos.entity(21)), 5.5))
+	var module_rects: Array = overlay._icons.get(Kit.item_icon("productivity-module-3"), [])
+	var recipe_rects: Array = overlay._icons.get(Kit.item_icon("iron-gear-wheel"), [])
+	var asm_at: Vector2 = anchor.call(5.5)
+	var ok_rows := module_rects.size() == 2 and recipe_rects.size() == 1
+	if ok_rows:
+		var m0: Rect2 = module_rects[0]
+		var rc: Rect2 = recipe_rects[0]
+		# Tiles as drawn: the recipe icon is ICON_TILES across (held to its 8-80 px, the rows with it).
+		var per_tile: float = rc.size.x / AltOverlay.ICON_TILES
+		ok_rows = absf((m0.get_center().y - asm_at.y) / per_tile - 0.7) < 0.05 and absf(m0.size.x / per_tile - 0.5) < 0.05 \
+			and absf((rc.get_center().y - asm_at.y) / per_tile + 0.3) < 0.05 and rc.end.y < m0.position.y
+	check(ok_rows, "K1: on the screen the modules' row sits 0.7 tiles under the machine's centre, its recipe 0.3 over it (ids), apart: %s %s" % [module_rects, recipe_rects])
+	var rare := Slot.quality_icon("rare")
+	check(rare == null or (overlay._marks.get(rare, []) as Array).size() == 1,
+		"K1: a rare module carries its quality's mark (when the install has the picture)")
+	fake_player.hovered = w.entities[962]
+	overlay.collect()
+	check(overlay.drawn == 1 + 4 + 9 + 2, "K1: the beacon's modules with the mouse on it, as Factorio 2.1 draws them: %d" % overlay.drawn)
+	fake_player.hovered = null
+	rig.first_person = true
+	rig.camera.position = Vector3(12.5, 1.6, 14)
+	rig.camera.look_at(Vector3(12.5, 1.0, 5.5))
+	overlay.collect()
+	var shown_quads := overlay._quads.filter(func(q): return q.visible)
+	check(overlay.drawn == 1 + 4 + 9 and shown_quads.size() == overlay.drawn + overlay._marks_3d,
+		"K1, K2: first person draws them as depth-tested quads (C9), quality marks besides: %d %d" % [overlay.drawn, shown_quads.size()])
+	rig.first_person = false
+	rig.camera.position = Vector3(12.5, 40, 5.5)
+	rig.camera.look_at(Vector3(12.5, 0, 5.5), Vector3(0, 0, -1))
+	w.handle({"t": "am", "g": Bridge.alt_contents, "l": [[960], [961, 0, seven.slice(0, 2)]]})
+	overlay.collect()
+	var cleared := overlay.drawn
+	Bridge.set_alt_contents(false)
+	overlay.collect()
+	check(cleared == 1 + 2 and overlay.drawn == 1 and w.alt_machines_now().is_empty(),
+		"K1, K2: [unit] clears a machine's icons, 0 leaves a lab its packs alone, Alt-mode off draws none of them: %d %d" % [cleared, overlay.drawn])
+	if turns_before > 0:
+		Bridge.set_alt_contents(true)
+	overlay.on = false
+	overlay._process(0.0)
+	overlay.queue_free()
+	holder.queue_free()
 
 
 ## Turrets (turrets.gd) from the mod's turret states: folded until a target comes, raised at
@@ -4376,19 +7175,74 @@ class SiloMovers:
 		return fogged
 
 
-## Where a line of belts begins and ends: what feeds a belt from behind and what takes its items.
+## The little of camera_rig.gd that ride.gd moves.
+class RideRig:
+	var target
+	var global_position := Vector3.ZERO
+
+	func cinematic(_pitch: float, _distance: float) -> void:
+		pass
+
+	func cinematic_end() -> void:
+		pass
+
+
+## The owner's client log, loading an old autosave of a test map: "Out of bounds get index '-1'" at
+## rockets.gd drive() from ride.gd's _rocket, eight times while the save loaded. The ride's `me` came
+## before the silo's chunk, so no launch could start there and drive() read the last launch of none
+## (or, with another silo's launch going, drove that one). drive() now says it couldn't and ride.gd
+## asks again each frame: the ridden rocket comes once its silo is in the world. Fails on the old code
+## (the other silo's launch taken).
+func _ride_before_silo() -> void:
+	var layer = RocketsScript.new()
+	layer.model = ChunkModel.new()
+	add_child(layer)
+	var silo_movers := SiloMovers.new()
+	silo_movers.world = SiloWorld.new()
+	layer.movers = silo_movers
+	silo_movers.world.silo = true
+	layer._on_launch(1, Vector2(200, 200), "")  # another silo's launch, far away
+	var other: Dictionary = layer._launches[0]
+	silo_movers.world.silo = false  # the ridden rocket's silo isn't in the world yet
+	var ride := Ride.new()
+	ride.rockets = layer
+	ride.rig = RideRig.new()
+	add_child(ride)
+	for climbed in [30, 60]:  # the pod's first height is its rest in the rocket: the second is 30 up
+		ride.handle_me({"t": "me", "u": 7, "x": 2560, "y": 2560 - climbed * 256, "pod": 50, "ps": "ascending", "up": 1, "gx": 2560, "gy": 2560, "hp": 250, "q": 0})
+	for i in 8:
+		ride._process(1.0 / 60.0)
+	check(ride.riding() and layer._launches.size() == 1 and not bool(other.get("driven", false)),
+		"a ride loaded before its silo's chunk waits for it: no launch read past the list, another silo's launch not taken (%d launches)" % layer._launches.size())
+	silo_movers.world.silo = true  # the chunk comes
+	ride._process(1.0 / 60.0)
+	var mine: Dictionary = layer._launch_at(Vector2(10, 10))
+	check(layer._launches.size() == 2 and bool(mine.get("driven", false)) and not bool(other.get("driven", false)) and float(mine.get("h", 0.0)) > 0.0,
+		"once the silo is there the ridden rocket starts from it and follows the game's height (%.1f)" % float(mine.get("h", 0.0)))
+	ride.queue_free()
+	layer.queue_free()
+
+
+## Where a line of belts begins and ends: what feeds a belt from behind and what carries its line on.
 func _belt_end_rules() -> void:
 	check(WorldMirror.belt_feeds(0, "transport-belt", 0, "") and not WorldMirror.belt_feeds(0, "transport-belt", 4, ""),
 		"belt ends: a belt behind going the same way feeds it, one going across doesn't")
 	check(WorldMirror.belt_feeds(0, "underground-belt", 0, "o") and not WorldMirror.belt_feeds(0, "underground-belt", 0, "i"),
 		"belt ends: an underground's exit feeds what is in front of it, an entrance doesn't")
-	check(WorldMirror.belt_accepts(0, "transport-belt", 4, "") and not WorldMirror.belt_accepts(0, "transport-belt", 8, ""),
-		"belt ends: a belt takes items from the side, not head-on")
-	check(WorldMirror.belt_accepts(0, "underground-belt", 0, "i") and WorldMirror.belt_accepts(0, "underground-belt", 4, "o")
-		and not WorldMirror.belt_accepts(0, "underground-belt", 0, "o"),
-		"belt ends: an underground takes items at its entrance and from the side, not into an exit's back")
-	check(WorldMirror.belt_accepts(0, "splitter", 0, "") and not WorldMirror.belt_accepts(0, "splitter", 4, ""),
-		"belt ends: a splitter takes items only from behind")
+	check(WorldMirror.belt_continues(0, "transport-belt", 0, "") and not WorldMirror.belt_continues(0, "transport-belt", 8, ""),
+		"belt ends: a belt going on the same way carries the line on, one head-on doesn't")
+	# Side-loading (owner, with Vasillo's belts: "the belts going into other belts should use the front part too").
+	check(not WorldMirror.belt_continues(0, "transport-belt", 4, "", "s") and not WorldMirror.belt_continues(0, "transport-belt", 12, "", "s"),
+		"belt ends: a belt facing into either side of a straight belt side-loads: its line ends there")
+	check(WorldMirror.belt_continues(4, "transport-belt", 0, "", "l") and WorldMirror.belt_continues(12, "transport-belt", 0, "", "r"),
+		"belt ends: a belt feeding a curve it makes (a left curve from the west, a right one from the east) goes on")
+	check(not WorldMirror.belt_continues(12, "transport-belt", 0, "", "l") and not WorldMirror.belt_continues(4, "transport-belt", 0, "", "r"),
+		"belt ends: a belt facing into a curve's other side side-loads: its line ends there")
+	check(WorldMirror.belt_continues(0, "underground-belt", 0, "i") and not WorldMirror.belt_continues(0, "underground-belt", 0, "o")
+		and not WorldMirror.belt_continues(0, "underground-belt", 4, "i") and not WorldMirror.belt_continues(0, "underground-belt", 12, "o"),
+		"belt ends: an underground carries a line on at its entrance's back, not into an exit's back or from the side (side-loading)")
+	check(WorldMirror.belt_continues(0, "splitter", 0, "") and not WorldMirror.belt_continues(0, "splitter", 4, ""),
+		"belt ends: a splitter carries a line on only from behind")
 
 
 ## A modeller's belt ends: a lone straight belt gets both pieces in its chunk, at its tail and head in
@@ -4434,6 +7288,7 @@ func _belt_line_ends() -> void:
 	w._add([12, 1, 11 * 256 + 128, 10 * 256 + 128, 4, {"s": "s"}])
 	check(w.entities[11].belt_ends == 1 and w.entities[12].belt_ends == 2, "two belts in a line: the first only begins, the second only ends: %d, %d" % [w.entities[11].belt_ends, w.entities[12].belt_ends])
 	_belt_line_ends_splitters_undergrounds(w, cv, start, end)
+	_belt_side_load_ends(w, cv, end)
 	w.queue_free()
 	for n: String in names:
 		ModelLibrary._sources.erase(n)
@@ -4483,11 +7338,14 @@ func _belt_line_ends_splitters_undergrounds(w, cv, start: Mesh, end: Mesh) -> vo
 	# Fed on its left half only: that half doesn't begin, and the belt feeding it doesn't end.
 	w._add([22, 1, 9 * 256 + 128, 11 * 256 + 128, 0, {"s": "s"}])
 	check(sp.belt_ends == 14 and w.entities[22].belt_ends == 1, "a splitter fed on one half: that half's start goes, the belt's end too: %d, %d" % [sp.belt_ends, w.entities[22].belt_ends])
-	# Taken from on its right half by a belt going on north; a belt across in front of its left half
-	# takes too (side-loading); then mined, the halves end again.
+	# Taken from on its right half by a belt going on north, on its left by a belt it bends east (a right
+	# curve fed from the south); then mined, the halves end again.
 	w._add([23, 1, 10 * 256 + 128, 9 * 256 + 128, 0, {"s": "s"}])
-	w._add([24, 1, 9 * 256 + 128, 9 * 256 + 128, 4, {"s": "s"}])
+	w._add([24, 1, 9 * 256 + 128, 9 * 256 + 128, 4, {"s": "r"}])
 	check(sp.belt_ends == 4, "a splitter taken from on both halves and fed on one: only the unfed half begins: %d" % sp.belt_ends)
+	# The belt across in front of its left half straight (fed from behind too): that half side-loads it and ends.
+	w._add([24, 1, 9 * 256 + 128, 9 * 256 + 128, 4, {"s": "s"}])
+	check(sp.belt_ends == 6, "a splitter's half side-loading onto a straight belt ends there: %d" % sp.belt_ends)
 	w._remove(23)
 	w._remove(24)
 	check(sp.belt_ends == 14, "belts in front of a splitter mined: its halves end again: %d" % sp.belt_ends)
@@ -4529,6 +7387,58 @@ func _belt_line_ends_splitters_undergrounds(w, cv, start: Mesh, end: Mesh) -> vo
 		and not ModelLibrary.part_doubled(roller, Transform3D(Basis(), Vector3(0, 0, 0.5)), [theirs])
 		and not ModelLibrary.part_doubled(roller, Transform3D(Basis(Vector3.UP, PI / 2.0), Vector3.ZERO), [theirs]),
 		"a piece's roller is left out only where the model has the same roller")
+	reset.call()
+
+
+## A belt facing into another's side (owner, with Vasillo's belts: "the belts going into other belts should
+## use the front part too"): side-loading onto a straight belt, a curve fed from its other side or an
+## underground, its line ends there and gets its end piece, where Factorio draws its ending sprite; feeding a
+## curve it makes (the bridge's `upd` bends the belt in front), it goes on without one.
+func _belt_side_load_ends(w, cv, end: Mesh) -> void:
+	var reset := func() -> void:
+		cv.clear_entities()
+		w.entities.clear()
+		w._belts.clear()
+	var ends := func(unit: int) -> int:
+		return w.entities[unit].belt_ends
+	reset.call()
+	# A straight belt going north on (10, 10), fed from behind, side-loaded from the west and from the east.
+	w._add([41, 1, 10 * 256 + 128, 11 * 256 + 128, 0, {"s": "s"}])
+	w._add([42, 1, 10 * 256 + 128, 10 * 256 + 128, 0, {"s": "s"}])
+	w._add([43, 1, 9 * 256 + 128, 10 * 256 + 128, 4, {"s": "s"}])
+	w._add([44, 1, 11 * 256 + 128, 10 * 256 + 128, 12, {"s": "s"}])
+	check(ends.call(43) == 3 and ends.call(44) == 3,
+		"belts side-loading onto a straight belt from the west and the east end there: %d, %d" % [ends.call(43), ends.call(44)])
+	check(ends.call(41) == 1 and ends.call(42) == 2, "the straight run keeps its own start and end: %d, %d" % [ends.call(41), ends.call(42)])
+	cv.build_entities(w.protos, {}, null)
+	var placed: int = cv._nodes[end].multimesh.instance_count if cv._nodes.has(end) else 0
+	check(placed == 3, "the side-loading belts' end pieces are in the chunk, with the run's own: %d" % placed)
+	# A lone belt fed from its side alone bends (the bridge's `upd`): the belt feeding it goes on.
+	reset.call()
+	w._add([45, 1, 10 * 256 + 128, 10 * 256 + 128, 0, {"s": "s"}])
+	w._add([46, 1, 9 * 256 + 128, 10 * 256 + 128, 4, {"s": "s"}])
+	check(ends.call(46) == 3, "a belt facing into a straight belt's side, before it bends: an end piece: %d" % ends.call(46))
+	w._add([45, 1, 10 * 256 + 128, 10 * 256 + 128, 0, {"s": "l"}])
+	check(ends.call(46) == 1, "the belt in front bent into a left curve fed by it: no end piece: %d" % ends.call(46))
+	w._add([47, 1, 20 * 256 + 128, 10 * 256 + 128, 0, {"s": "r"}])
+	w._add([48, 1, 21 * 256 + 128, 10 * 256 + 128, 12, {"s": "s"}])
+	check(ends.call(48) == 1, "a belt feeding a right curve it makes, from the east: no end piece: %d" % ends.call(48))
+	# Into the left curve's other side: a side-load, an end piece; and once that makes the belt straight
+	# again (fed from both sides), both side-load it and end.
+	w._add([49, 1, 11 * 256 + 128, 10 * 256 + 128, 12, {"s": "s"}])
+	check(ends.call(49) == 3 and ends.call(46) == 1, "a belt facing into a curve's other side ends there, the curve's feeder doesn't: %d, %d" % [ends.call(49), ends.call(46)])
+	w._add([45, 1, 10 * 256 + 128, 10 * 256 + 128, 0, {"s": "s"}])
+	check(ends.call(49) == 3 and ends.call(46) == 3, "fed from both sides the belt goes straight: both side-load it and end: %d, %d" % [ends.call(49), ends.call(46)])
+	# Underground belts side-loaded, at an entrance and at an exit; into an entrance's back the line goes on.
+	reset.call()
+	w._add([51, 3, 10 * 256 + 128, 10 * 256 + 128, 0, {"u": "i"}])
+	w._add([52, 1, 9 * 256 + 128, 10 * 256 + 128, 4, {"s": "s"}])
+	w._add([53, 3, 20 * 256 + 128, 10 * 256 + 128, 0, {"u": "o"}])
+	w._add([54, 1, 21 * 256 + 128, 10 * 256 + 128, 12, {"s": "s"}])
+	w._add([55, 1, 10 * 256 + 128, 11 * 256 + 128, 0, {"s": "s"}])
+	check(ends.call(52) == 3 and ends.call(54) == 3,
+		"belts side-loading onto an underground's entrance and exit end there: %d, %d" % [ends.call(52), ends.call(54)])
+	check(ends.call(55) == 1 and ends.call(51) == 0, "a belt into an entrance's back goes on, the entrance fed: %d, %d" % [ends.call(55), ends.call(51)])
 	reset.call()
 
 
@@ -4763,6 +7673,18 @@ func _fx_movers() -> void:
 	fx.handle({"t": "mv", "k": 12, "l": [[702, 5, 768, 256, 0]]})
 	var c = fx._tracked.get(702)
 	check(c != null and c.pos == Vector2(3, 1) and c.proto_id == 5, "fx: and plain records as they are")
+	# J11: each swing plays the entity's own mining sound (`eprops` ms), else Factorio's default: wood for
+	# trees, the ore sound for everything else.
+	fx.handle({"t": "eprops", "l": [[31, 0, 0, 0, {"ms": "core/sound/axe-mining-stone"}], [32, 0, 0, 0, {"lr": 25}], [5, 0, 7.5, 2.5]]})
+	var protos := ProtoDB.new()
+	protos.add_entities([[30, "tree-01", "tree", -0.4, -0.4, 0.4, 0.4, 0, 0, 0, 1, 1], [31, "huge-rock", "simple-entity", -1, -1, 1, 1, 0, 0, 0, 2, 2],
+		[33, "assembling-machine-1", "assembling-machine", -1.5, -1.5, 1.5, 1.5, 0, 0, 0, 3, 3]])
+	var own: Dictionary = fx._mining_sounds
+	var rock_sound := FxScript.sound_for(protos.entity(31), own)
+	check(own == {31: "core/sound/axe-mining-stone"} and FxScript.sound_for(protos.entity(30), own) == "core/sound/mining-wood"
+		and FxScript.sound_for(protos.entity(33), own) == "core/sound/axe-mining-ore"
+		and rock_sound == ("core/sound/axe-mining-stone" if SoundBank.data_dir() != "" else "core/sound/axe-mining-ore"),
+		"J11: a swing plays the prototype's own mining sound, else trees' wood and the ore sound: %s, rock %s" % [own, rock_sound])
 	# Never in the tree, so its own nodes were never made its children.
 	for n in [fx.sfx, fx.sprites, fx.weapons, fx.lightning, fx]:
 		n.free()
@@ -5041,6 +7963,7 @@ func _hud(hud: Hud, player: Node) -> void:
 			{"i": 2, "g": "", "on": 0, "m": 1, "man": 1, "f": []}]})
 	m.handle({"t": "ccol", "c": [10, 20, 200]})
 	ui.window.open_crafting(true)
+	ui.window.show_tab("Logistics")  # J7: the right half's second tab
 	await get_tree().process_frame
 	await get_tree().process_frame
 	var lg = ui.window._logistics
@@ -5110,6 +8033,8 @@ func _hud(hud: Hud, player: Node) -> void:
 	if m.has_signal("logistics_changed"):
 		m.set("char_requests", [{"item": "iron-plate", "min": 50, "max": -1}])
 		m.set("char_requests_on", true)
+		m.set("char_logistics", true)
+		w.show_tab("Logistics")
 		w._logistics_sig = "-"
 		w._refresh_logistics()
 		check(_find_checkbox(w._logistics, "Personal logistics") != null and _find_checkbox(w._logistics, "Trash unrequested") != null,
@@ -5751,11 +8676,367 @@ func _focus_never_blocks() -> void:
 		"Ctrl+F9: the focusing script is started, not waited for (%d ms), and answers later (exit %d)" % [start_ms, got[0]])
 
 
+## K7: first person picks what the crosshair is on (aim_pick.gd), as a shooter does, not where its
+## ray meets the ground: looking level at a machine two tiles off selects it (a level look meets no
+## ground, so the old pick found nothing), a belt behind a chest isn't picked through the chest (the
+## old pick took the belt the ray landed on) and the right button mines the chest, a vehicle behind
+## what the ray met isn't hovered, a held entity goes beside the face looked at, the boxes stand on
+## the hills, and --fp-pick=ground (fp_pick_models off) picks from the ground point as before.
+func _first_person_aim(hud: Hud) -> void:
+	const G := preload("res://scripts/world/ground_height.gd")
+	G.clear()
+	var vp := SubViewport.new()
+	vp.size = Vector2i(640, 360)
+	vp.render_target_update_mode = SubViewport.UPDATE_DISABLED
+	add_child(vp)
+	var rig := CameraRig.new()
+	vp.add_child(rig)
+	await get_tree().process_frame  # its default view's deferred toggles
+	if not rig.first_person:
+		rig.toggle_first_person()
+	var world := WorldMirror.new()
+	world.pick_build_usec = 1 << 40  # the whole pick index at once (see _predictions)
+	# Names without models: the boxes are the placeholders' heights (visuals.gd), whatever is read.
+	world.protos.add_entities([
+		[1, "fp-test-assembler", "assembling-machine", -1.5, -1.5, 1.5, 1.5, 120, 120, 120, 3, 3],
+		[2, "fp-test-chest", "container", -0.5, -0.5, 0.5, 0.5, 200, 180, 0, 1, 1],
+		[3, "fp-test-belt", "transport-belt", -0.5, -0.5, 0.5, 0.5, 200, 180, 0, 1, 1],
+	])
+	world.chunks[Vector2i.ZERO] = ChunkView.new()
+	world._add([901, 1, 10 * 256 + 128, 7 * 256 + 128, 0])  # an assembler, its south face at y = 9
+	world._add([902, 2, 20 * 256 + 128, 9 * 256 + 128, 0])  # a chest
+	world._add([903, 3, 20 * 256 + 128, 7 * 256 + 128, 0])  # a belt behind it
+	var machine: WorldMirror.Rec = world.entities[901]
+	var chest: WorldMirror.Rec = world.entities[902]
+	var belt: WorldMirror.Rec = world.entities[903]
+	var input := PlayerInput.new()
+	input.world = world
+	input.hud = hud
+	input.rig = rig
+	input.tile_brush.pi = input
+	input.cursor_item = ""
+	input.fp_pick_models = true
+	var look := func(at: Vector3, yaw: float, pitch: float) -> void:
+		rig.global_position = at
+		rig._look_yaw = yaw
+		rig._look_pitch = pitch
+		rig._process(0.0)
+		input._update_ground()
+	# Standing two tiles south of the assembler's face, looking level north at it.
+	look.call(Vector3(10.5, 0, 11.0), 0.0, 0.0)
+	var inside := Rect2(9, 6, 3, 3).has_point(input.ground)
+	var unit_of := func(r: WorldMirror.Rec) -> String: return str(r.unit) if r != null else "nothing"
+	check(input.hovered == machine and input.has_ground and inside,
+		"K7: first person, looking level at a machine two tiles off selects it (hovered %s, cursor at %s)" % [unit_of.call(input.hovered), input.ground])
+	# Looking down past a chest: the ray meets the ground on the belt behind it (3.5 tiles off).
+	var past := rad_to_deg(atan(CameraRig.EYE_HEIGHT / 3.5))
+	look.call(Vector3(20.5, 0, 11.0), 0.0, past)
+	var ground_pt = rig.ground_point(rig.aim_position())
+	check(ground_pt != null and Rect2(20, 7, 1, 1).has_point(Vector2(ground_pt.x, ground_pt.z)) and world.pick(Vector2(ground_pt.x, ground_pt.z)) == belt,
+		"(the ray meets the ground on the belt behind the chest)")
+	check(input.hovered == chest and Rect2(20, 9, 1, 1).has_point(input.ground),
+		"K7: a belt behind a chest isn't picked through the chest: the chest is (hovered %s)" % unit_of.call(input.hovered))
+	sent()
+	input._rmb_down = true
+	input._update_mining(0.0)
+	var mines: Array = sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "mine")
+	check(mines.size() == 1 and int(mines[0].get("u", 0)) == 902, "K7: the right button mines the chest looked at, not the belt behind it: %s" % [mines])
+	input._rmb_down = false
+	input._update_mining(0.0)
+	sent()
+	# A car behind the chest (further along the ray than what it met) isn't hovered; one in front is.
+	var car_behind := [77, 9, Vector2i.ZERO, Vector2(20.5, 6.0), Vector2.ONE, 0.0, 6.0]
+	var car_front := [78, 9, Vector2i.ZERO, Vector2(20.5, 10.5), Vector2.ONE, 0.0, 0.5]
+	check(input._nearer_than_aim(car_behind).is_empty() and input._nearer_than_aim(car_front) == car_front,
+		"K7: a vehicle counts only in front of what the ray met")
+	# Holding something: on the machine's side it goes just out from the face; on the chest's top, where the ray met it.
+	input.cursor_item = "fp-test-chest"
+	look.call(Vector3(10.5, 0, 11.0), 0.0, 0.0)
+	var beside := input.build_point()
+	check(input.hovered == null and not input._aim.is_empty(), "with something held nothing is hovered, as before, but the aim still decides where it goes")
+	input.cursor_item = "fp-test-assembler"
+	var beside_big := input.build_point()
+	check(beside.is_equal_approx(Vector2(10.5, 9.5)) and absf(beside_big.y - 10.5) < 0.001,
+		"K7: a held chest goes on the tile in front of the machine's face (%s), a held assembler as far out as it reaches (%s)" % [beside, beside_big])
+	look.call(Vector3(20.5, 0, 11.0), 0.0, past)
+	check(input.build_point() == input.ground, "on the chest's top the held entity stays where the ray met it (fast-replace, or red)")
+	input.cursor_item = ""
+	# Looking down at a belt with nothing in front: the belt, as before.
+	look.call(Vector3(20.5, 0, 6.0), 180.0, rad_to_deg(atan(CameraRig.EYE_HEIGHT / 1.5)))
+	check(input.hovered == belt, "looking down at a belt with nothing before it picks the belt")
+	# Hills: the boxes stand on the ground under them, as the models do.
+	var hill := Image.create(32, 32, false, Image.FORMAT_RF)
+	hill.fill(Color(3.0, 0.0, 0.0))
+	G.set_field(hill, Vector2(-64, -64), 4.0)
+	look.call(Vector3(10.5, 3.0, 11.0), 0.0, 0.0)
+	check(input.hovered == machine, "K7: on a 3-tile hill, looking level at the machine standing on it picks it")
+	G.clear()
+	# --fp-pick=ground: the ground point picks, as before K7.
+	input.fp_pick_models = false
+	look.call(Vector3(10.5, 0, 11.0), 0.0, 0.0)
+	var level_old := input.hovered
+	look.call(Vector3(20.5, 0, 11.0), 0.0, past)
+	check(level_old == null and input.hovered == belt and input._aim.is_empty(),
+		"--fp-pick=ground: a level look picks nothing and the belt behind the chest is picked, as before")
+	input.fp_pick_models = true
+	rig.toggle_first_person()
+	input._update_ground()
+	check(input._aim.is_empty(), "out of first person the ray pick stays off")
+	hud.ui.set_selected(null)
+	input.free()
+	var cv0: ChunkView = world.chunks[Vector2i.ZERO]
+	world.chunks.clear()
+	cv0.free()
+	world.free()
+	vp.queue_free()
+	await get_tree().process_frame
+
+
+## K23: a finished research (`rdone`) plays Factorio's research_completed chime once a tick however many
+## finished, writes "<icon> <name> researched." in the console for each (an infinite one at the level
+## it finished), and the research panel shows the last one's icon and "<name> finished. Press T." until
+## the next research starts.
+func _research_done(hud: Hud) -> void:
+	var ui = hud.ui
+	var m = ui.model
+	var r = ui.research_hud
+	var chimes := [0]
+	var was_chime: Callable = ui.research_chime
+	ui.research_chime = func() -> void: chimes[0] += 1
+	var saved_techs: Dictionary = m.techs.duplicate(true)
+	var lines_at_start: int = m.chat_log.size()
+	var lines_before := lines_at_start
+	var plain := {"order": "a", "prerequisites": [], "ingredients": [], "count": 10, "seconds": 10.0, "state": 1, "trigger": "",
+		"effects": [], "level": 1, "max_level": 1, "trigger_detail": [], "saved": 0.0, "formula": ""}
+	m.techs["automation"] = plain.duplicate()
+	m.techs["logistics"] = plain.duplicate()
+	var infinite: Dictionary = plain.duplicate()
+	infinite["level"] = 7
+	infinite["max_level"] = -1
+	m.techs["mining-productivity-3"] = infinite
+	m.handle({"t": "rs", "cur": "automation", "pr": 990, "q": []})
+	await get_tree().process_frame
+	check(r._name.text == Kit.tech_name("automation") and r._percent.text == "99%", "K23: researching automation, 99%%: %s" % r._name.text)
+
+	m.handle({"t": "rdone", "k": 900, "r": 1, "tick": 899, "l": [["automation", 0]]})
+	await get_tree().process_frame
+	check(chimes[0] == 1, "K23: a finished research plays the chime once: %d" % chimes[0])
+	var added: Array = m.chat_log.slice(lines_before)
+	check(added.size() == 1 and str(added[0][0]) == "" and str(added[0][1]) == "[technology=automation] %s researched." % Kit.tech_name("automation"),
+		"K23: its console line is Factorio's technology-researched, the technology's icon and name: %s" % [added])
+	var tokens: Array = RichText.parse(str(added[0][1])) if added.size() == 1 else []
+	check(not tokens.is_empty() and tokens[0]["t"] == "icon" and tokens[0]["kind"] == "technology" and tokens[0]["name"] == "automation",
+		"K23: the line starts with the technology's icon: %s" % [tokens])
+	check(m.research == "" and r.finished == "automation" and r._name.text == "%s finished. Press T." % Kit.tech_name("automation")
+		and r._percent.text == "100%" and not r._hint.visible,
+		"K23: the research panel says it finished (before the next rs): %s, %s" % [r._name.text, r._percent.text])
+	var icon: Texture2D = GuiAssets.tech_icon("automation")
+	check(r._icon.texture == icon or icon == null, "K23: with the technology's icon: %s" % r._icon.texture)
+	var shown: bool = ui.chat._lines.get_child_count() > 0 and (ui.chat._lines.get_child(ui.chat._lines.get_child_count() - 1) as RichTextLabel).get_parsed_text().ends_with("researched.")
+	check(shown, "K23: the console shows the line")
+	m.handle({"t": "rs", "cur": "", "pr": 0, "q": []})
+	await get_tree().process_frame
+	check(r.finished == "automation" and r._name.text.ends_with("finished. Press T."), "K23: it stays after rs says nothing is researched: %s" % r._name.text)
+
+	# Two in one tick: one chime, a line each; an infinite one with the level it finished.
+	m.handle({"t": "rs", "cur": "mining-productivity-3", "pr": 999, "q": []})
+	await get_tree().process_frame
+	check(r._name.text == Kit.tech_level_name("mining-productivity-3", 7), "K23: an infinite research in progress at its level: %s" % r._name.text)
+	lines_before = m.chat_log.size()
+	m.handle({"t": "rdone", "k": 1200, "r": 2, "tick": 1199, "l": [["logistics", 0], ["mining-productivity-3", 7]]})
+	m.handle({"t": "rdone", "k": 1200, "r": 3, "tick": 1199, "l": [["automation", 0]]})  # the same tick, another message
+	await get_tree().process_frame
+	added = m.chat_log.slice(lines_before)
+	var mining := Kit.tech_level_name("mining-productivity-3", 7)
+	check(chimes[0] == 2, "K23: several in one tick chime once (Factorio 2.0.34): %d chimes in all" % chimes[0])
+	check(added.size() == 3 and str(added[0][1]) == "[technology=logistics] %s researched." % Kit.tech_name("logistics")
+		and str(added[1][1]) == "[technology=mining-productivity-3] %s researched." % mining and mining.ends_with(" 7"),
+		"K23: each gets its line, the infinite one with its level: %s" % [added])
+	check(r.finished == "automation", "K23: the panel shows the last one: %s" % r.finished)
+	m.handle({"t": "rdone", "k": 1300, "r": 4, "tick": 1299, "l": [["mining-productivity-3", 8]], "n": 4})
+	await get_tree().process_frame
+	check(chimes[0] == 3 and r.finished == "mining-productivity-3" and r._name.text == "%s finished. Press T." % Kit.tech_level_name("mining-productivity-3", 8)
+		and str(m.chat_log[-1][1]) == "4 more technologies researched.",
+		"K23: an infinite one finished: its level in the panel; n's rest in one line: %s / %s" % [r._name.text, m.chat_log[-1][1]])
+	m.handle({"t": "rs", "cur": "logistics", "pr": 0, "q": []})
+	await get_tree().process_frame
+	check(r.finished == "" and r._name.text == Kit.tech_name("logistics"), "K23: the next research clears it: %s" % r._name.text)
+	# Something else finishing (a trigger technology) while a research runs: chime and line, the panel
+	# keeps the research in progress.
+	m.handle({"t": "rdone", "k": 1350, "r": 5, "tick": 1349, "l": [["automation", 0]]})
+	await get_tree().process_frame
+	check(chimes[0] == 4 and m.research == "logistics" and r._name.text == Kit.tech_name("logistics")
+		and str(m.chat_log[-1][1]).ends_with(" researched."), "K23: another technology finishing keeps the research in progress: %s" % r._name.text)
+	# A bridge before `rdone`: its msg with `tech` is said the same way (main.gd turns it into an rdone
+	# with the message's k).
+	m.handle({"t": "rs", "cur": "", "pr": 0, "q": []})
+	m.handle({"t": "rdone", "k": 1400, "l": [["automation", 0]]})
+	await get_tree().process_frame
+	check(chimes[0] == 5 and r.finished == "automation", "K23: an rdone without its own tick chimes by k")
+	m.handle({"t": "rdone", "l": [[]], "tick": 1500})
+	m.handle({"t": "rdone", "l": "x", "tick": 1501})
+	check(chimes[0] == 5, "K23: an rdone naming nothing plays nothing")
+
+	ui.research_chime = was_chime
+	m.chat_log.resize(mini(m.chat_log.size(), lines_at_start))
+	m.handle({"t": "rs", "cur": "", "pr": 0, "q": []})
+	m.techs.clear()
+	m.techs.merge(saved_techs)
+	r.finished = ""
+	r.finished_level = 0
+	await get_tree().process_frame
+
+
 ## The latency layer (FFF #83): what is built shows at once, before the game confirms it, and
 ## goes when the game's entity is drawn or the game has moved on without it.
+## J20 and J27: what the character mines goes from the world on the bridge's `mnd` (the tick it is mined,
+## ahead of its `del`), a record of it coming before the `del` (read before the mining) is left out, and
+## its items fly to the character; a drill with nothing left to mine has Factorio's resources-depleted
+## icon over it, not a button on the alert bar.
+func _mining_feedback(hud: Hud) -> void:
+	var ui = hud.ui
+	var m: UiModel = ui.model
+	var world := WorldMirror.new()
+	world.protos.add_entities([
+		[1, "transport-belt", "transport-belt", -0.5, -0.5, 0.5, 0.5, 200, 180, 0, 1, 1],
+		[2, "tree-01", "tree", -0.5, -0.5, 0.5, 0.5, 60, 120, 60, 1, 1],
+		[3, "electric-mining-drill", "mining-drill", -1.5, -1.5, 1.5, 1.5, 120, 120, 120, 3, 3],
+	])
+	world.chunks[Vector2i.ZERO] = ChunkView.new()
+	world._add([90, 1, 4 * 256 + 128, 4 * 256 + 128, 4])
+	world._add([0, 2, 6 * 256 + 128, 4 * 256 + 128, 0])
+	var tree_key = WorldMirror.static_key(2, 6 * 256 + 128, 4 * 256 + 128)
+	check(world.entities.has(90) and world.entities.has(tree_key), "J20: a belt and a tree in the world")
+	world._dirty.clear()
+	var belt_mnd := {"t": "mnd", "u": 90, "p": 1, "x": 4 * 256 + 128, "y": 4 * 256 + 128, "g": 1,
+		"l": [["transport-belt", 1], ["iron-plate", 3]]}
+	world.mined(belt_mnd)
+	ui.mined(belt_mnd)
+	check(not world.entities.has(90) and world._dirty.has(Vector2i.ZERO),
+		"J20: the mined belt leaves the world on `mnd`, its chunk drawn again, without waiting for the `del`")
+	var flights: Array = ui.flying._flights
+	check(flights.size() >= 2 and str(flights[-2][0]) == "transport-belt" and str(flights[-1][0]) == "iron-plate"
+		and str(flights[-1][1]) == "+3" and str(flights[-1][3]) == "character" and flights[-1][2] is Vector3,
+		"J20: the belt and the items it carried fly from where it was to the character: %s" % [flights.slice(-2)])
+	flights.clear()  # (the test's avatar has no ground for "character" to land on)
+	world._add([90, 1, 4 * 256 + 128, 4 * 256 + 128, 4])
+	check(not world.entities.has(90), "J20: a record of it read before the mining (a snapshot or `upd` ahead of the `del`) is left out")
+	world.handle({"t": "del", "u": 90, "p": 1, "x": 4 * 256 + 128, "y": 4 * 256 + 128})
+	check(not world._mined_early.has(90), "J20: its `del` ends that")
+	world._add([90, 1, 4 * 256 + 128, 4 * 256 + 128, 4])
+	check(world.entities.has(90), "J20: after the `del` a record of that unit is taken again")
+	var ore_mnd := {"t": "mnd", "u": 0, "p": 2, "x": 6 * 256 + 128, "y": 4 * 256 + 128, "g": 0, "l": [["wood", 4]]}
+	world.mined(ore_mnd)
+	check(world.entities.has(tree_key), "J20: `g` 0 (ore mined a unit at a time) leaves the entity")
+	world.mined({"t": "mnd", "u": 0, "p": 2, "x": 6 * 256 + 128, "y": 4 * 256 + 128, "g": 1, "l": [["wood", 4]]})
+	check(not world.entities.has(tree_key), "J20: a tree (no unit number) goes by its prototype and place")
+	for cv in world.chunks.values():
+		cv.free()
+	world.free()
+
+	# --- J27: a drill with nothing left to mine ------------------------------------------------------
+	check(AlertIconsScript.DRAWN.has("depleted") and str(AlertIconsScript.DRAWN["depleted"][0]) == "resources-depleted-icon.png",
+		"J27: the depleted drill's icon is Factorio's resources-depleted-icon.png")
+	var icons := AlertIconsScript.new()
+	add_child(icons)
+	var fake_world := GDScript.new()
+	fake_world.source_code = "extends RefCounted\nvar entities := {}\n"
+	fake_world.reload()
+	var fw = fake_world.new()
+	var drill_rec := WorldMirror.Rec.new()
+	drill_rec.key = 31
+	drill_rec.unit = 31
+	drill_rec.pos = Vector2(12, 8)
+	fw.entities[31] = drill_rec
+	icons.world = fw
+	icons.show_alerts({"depleted": [{"position": Vector2(12, 8), "si": 1, "unit": 31}]}, 1)
+	check(icons.shown.get("depleted") == 1 and is_equal_approx((icons.placed["depleted"][0] as Vector3).x, 12.0),
+		"J27: the icon over the drill, where the world draws it: %s" % [icons.placed.get("depleted")])
+	icons.world = null
+	icons.queue_free()
+	m.handle({"t": "al", "l": [["depleted", 1, [[12 * 256, 8 * 256, 1, "electric-mining-drill", 31, "no_minable_resources"]]]]})
+	await get_tree().process_frame
+	var bar_button = ui.alerts._buttons.get("depleted")
+	check(bar_button == null or not bar_button.visible, "J27: no button on the alert bar (Factorio has no alert for it)")
+	m.handle({"t": "al", "l": []})
+	await get_tree().process_frame
+
+
+## Issue #18: what F takes (`pku`): an item off the ground is hidden at once; one off a belt leaves the simulated
+## lane on the game's tick by the inserters' own take (pick_up.gd: an `ie` pick by no inserter, the item of its
+## kind nearest where the game had it), the item behind it staying; a stack taken in part stays; every kind flies
+## from where the nearest of it was to the character with what was got.
+func _pick_up(hud: Hud) -> void:
+	var ui = hud.ui
+	var msg := {"t": "pku", "k": 2005, "l": [
+		["iron-gear-wheel", 1, roundi(1.906 * 256), 10 * 256, 9, 801, 0, 2],
+		["iron-plate", 1, 30 * 256 + 64, 40 * 256 + 64, 0, 0, 0, 1],
+		["copper-plate", 2, roundi(3.5 * 256), 10 * 256, 25, 805, 1, 3],
+		["iron-gear-wheel", 3, roundi(4.5 * 256), 10 * 256, 33, 806, 0, 2]]}
+	var takes: Dictionary = PickUpScript.belt_takes(msg)
+	var tl: Array = takes.get("l", [])
+	check(str(takes.get("t", "")) == "ie" and int(takes.get("k", 0)) == 2005 and tl.size() == 18
+		and tl.slice(0, 9) == [1, 0, 2005, 1, 2, 0, roundi(1.906 * 256), 10 * 256, 1]
+		and tl.slice(9, 18) == [1, 0, 2005, 2, 2, 0, roundi(4.5 * 256), 10 * 256, 4],
+		"issue #18: what F took off belts goes to the belt layer as picks by no inserter (unit 0), each its own, on its belt; a stack taken in part isn't: %s" % [tl])
+	var spots: Array[Vector2i] = PickUpScript.ground_spots(msg)
+	check(spots.size() == 1 and spots[0] == Vector2i(30 * 256 + 64, 40 * 256 + 64), "issue #18: and what it took off the ground is where it lay: %s" % [spots])
+	# Five yellow belts in a row along +x at y 10 (belt u from x = u to u + 1), lane 1 each, as _belt_sim's: a gear
+	# 0.25 from the first belt's exit and a plate half a tile behind it, read on tick 2000. On 2005 F took the gear
+	# where the game had it then (40 on: line position 24, x 1.906).
+	var was_cull: bool = BeltItemsScript.Job.view_cull
+	BeltItemsScript.Job.view_cull = false
+	var items = BeltItemsScript.new()
+	add_child(items)
+	items._sync = true
+	var lm: Array = []
+	for u in range(1, 6):
+		lm.append_array(_bs_lane(u * 8 + 1, 1, 256, 8, u + 1.0, 10.0, u, 10.0))
+	_bs_feed(items, 2000, {"lm": lm, "sl": [9, 2000, 2, 801, 2, 64, 1, 804, 1, 192, 1]})
+	var k := 2000
+	for f in 3:
+		k += 1
+		_bs_feed(items, k, {}, 1)
+	items.handle(takes)
+	for f in 90:
+		k += 1
+		_bs_feed(items, k, {}, 1)
+	var uids: PackedInt64Array = items._state.sim.items_state()[0]
+	check(not uids.has(801) and uids.has(804) and not items.has_item(801) and items.has_item(804),
+		"issue #18: the gear F took leaves the simulated belt, the plate behind it stays: %s" % [uids])
+	items.queue_free()
+	BeltItemsScript.Job.view_cull = was_cull
+	# The ground's item hidden at once, as main.gd does with each spot.
+	var protos := ProtoDB.new()
+	protos.add_items([[1, "iron-plate"], [2, "iron-gear-wheel"], [3, "copper-plate"]])
+	var gi_layer := GroundItemsScript.new()
+	gi_layer.protos = protos
+	add_child(gi_layer)
+	gi_layer.handle({"t": "gi", "k": 5, "part": 1, "parts": 1, "l": [1, 30 * 256 + 64, 40 * 256 + 64, 1, 31 * 256, 40 * 256]})
+	for at in PickUpScript.ground_spots(msg):
+		gi_layer.take(at)
+	check(gi_layer.count() == 1 and gi_layer.item_at(Vector2(30.25, 40.25)).is_empty(),
+		"issue #18: an item F took off the ground is hidden at once, the other stays")
+	gi_layer.queue_free()
+	# Each kind flies once, from the nearest of it, with all of it that was got.
+	var flights: Array = ui.flying._flights
+	flights.clear()
+	ui.picked(msg)
+	check(flights.size() == 3 and str(flights[0][0]) == "iron-gear-wheel" and str(flights[0][1]) == "+4"
+		and str(flights[1][0]) == "iron-plate" and str(flights[1][1]) == "+1" and str(flights[2][0]) == "copper-plate"
+		and str(flights[2][1]) == "+2" and str(flights[0][3]) == "character" and flights[0][2] is Vector3
+		and (flights[0][2] as Vector3).is_equal_approx(Vector3(488.0 / 256.0, 0.25, 10.0)),
+		"issue #18: each kind F took flies to the character, from the nearest of it, with its count: %s" % [flights])
+	flights.clear()
+
+
 func _predictions(hud: Hud) -> void:
 	var m: UiModel = hud.ui.model
 	var world := WorldMirror.new()
+	# What is under a point is looked up in each chunk's pick index, built in play a slice a frame
+	# from the frame budget's "pick" share: after other sections spent it this frame, picks found
+	# nothing (J23's pair, J24's marks and the underground's end failed only after other sections).
+	world.pick_build_usec = 1 << 40
 	world.protos.add_entities([
 		[1, "wooden-chest", "container", -0.35, -0.35, 0.35, 0.35, 120, 90, 60, 1, 1],
 		[2, "stone-furnace", "furnace", -0.9, -0.9, 0.9, 0.9, 120, 120, 120, 2, 2],
@@ -5851,7 +9132,189 @@ func _predictions(hud: Hud) -> void:
 	var ug: WorldMirror.Rec = world.entities[82]
 	pred.turn(ug, false)
 	check(ug.dir == 12 and str(ug.extra.get("u")) == "o", "an underground entrance turns into an exit facing back")
+	# J23: R on one end of a pair turns the other with it, as Factorio does (2.1.24 flips both); one
+	# rotate goes to the game, which sends both ends back.
+	world._add([84, 3, 24 * 256 + 128, 12 * 256 + 128, 4, {"u": "i"}])
+	world._add([85, 3, 27 * 256 + 128, 12 * 256 + 128, 4, {"u": "o"}])
+	world._add([86, 3, 31 * 256 + 128, 12 * 256 + 128, 4, {"u": "o"}])  # an exit with no entrance in reach
+	var had_under: Variant = m.eprops.get(3)
+	m.eprops[3] = {"under": 5.0, "wire": 0.0, "supply": 0.0, "x": {}}
+	input.tile_brush.pi = input
+	input.cursor_item = ""
+	input.hovered = world.entities[84]
+	sent()
+	input._rotate(false)
+	var ug_in: WorldMirror.Rec = world.entities[84]
+	var ug_out: WorldMirror.Rec = world.entities[85]
+	var rotates: Array = sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "rotate")
+	check(ug_in.dir == 12 and str(ug_in.extra.get("u")) == "o" and ug_out.dir == 12 and str(ug_out.extra.get("u")) == "i"
+		and (world.entities[86] as WorldMirror.Rec).dir == 4 and rotates.size() == 1 and int(rotates[0].get("u", 0)) == 84,
+		"J23: R on an underground's entrance shows its exit turned with it (entrance and exit swapped), one rotate sent: %s" % [rotates])
+	check(UndergroundPairs.partner(world, ug_out, 5) == ug_in and UndergroundPairs.partner(world, world.entities[86], 5) == null,
+		"J23: the pair is still a pair the other way round; a lone exit has no partner")
+	input.hovered = null
+	if had_under == null:
+		m.eprops.erase(3)
+	else:
+		m.eprops[3] = had_under
 	Bridge.server_tick = tick0
+	sent()
+	m.main_slots = had
+	m.counts = had_counts
+	m.has_slots = had_slots
+	input.free()
+	pred.queue_free()
+
+
+## K21: a building Factorio can't turn (a furnace, a chest), turned with R in the build cursor,
+## stands turned once placed. The game puts it down facing north whatever was sent; its `add` takes
+## the cursor's turn as a look-only one (visual_turns.gd), kept for the save, so it stays turned. A
+## drag turns every one it places; one the game turns itself only sends its direction.
+func _turned_previews(hud: Hud) -> void:
+	var m: UiModel = hud.ui.model
+	var world := WorldMirror.new()
+	world.pick_build_usec = 1 << 40  # the whole pick index at once (see _predictions)
+	world.protos.add_entities([
+		[2, "stone-furnace", "furnace", -0.9, -0.9, 0.9, 0.9, 120, 120, 120, 2, 2],
+		[4, "inserter", "inserter", -0.15, -0.15, 0.15, 0.15, 200, 180, 0, 1, 1],
+		[6, "assembling-machine-2", "assembling-machine", -1.4, -1.4, 1.4, 1.4, 150, 150, 160, 3, 3],
+		[7, "assembling-machine-1", "assembling-machine", -1.4, -1.4, 1.4, 1.4, 150, 150, 160, 3, 3],
+	])
+	world.protos.item_places = {"stone-furnace": "stone-furnace", "inserter": "inserter",
+		"assembling-machine-2": "assembling-machine-2", "assembling-machine-1": "assembling-machine-1"}
+	world.chunks[Vector2i.ZERO] = ChunkView.new()
+	# The prediction of a turned assembler is drawn only once its model is made (predicted.gd).
+	var until_models := Time.get_ticks_msec() + 120000
+	while Time.get_ticks_msec() < until_models and not (ModelLibrary.entity_ready("assembling-machine-1", "assembling-machine", {}, 4)
+			and ModelLibrary.entity_ready("stone-furnace", "furnace", {}, 4)):
+		ModelLibrary.poll()
+		await get_tree().process_frame
+	var pred := Predicted.new()
+	pred.world = world
+	add_child(pred)
+	var input := PlayerInput.new()
+	input.world = world
+	input.hud = hud
+	input.predicted = pred
+	input.drag.pi = input
+	input.tile_brush.pi = input
+	input.hovered = null
+	var had: Array = m.main_slots
+	var had_slots := m.has_slots
+	var had_counts: Dictionary = m.counts.duplicate()
+	var had_am2: Variant = m.eprops.get(6)
+	m.eprops[6] = {"under": 0.0, "wire": 0.0, "supply": 0.0, "x": {"fb": [[0, -2, 0, "i"]]}}  # fluid boxes: Factorio turns it
+	m.handle({"t": "slots", "l": {"main": [["stone-furnace", 10], ["inserter", 2], ["assembling-machine-2", 2], ["assembling-machine-1", 2]]}})
+	var sid: String = Bridge.save_id
+	var units := [301, 311, 312, 313, 314, 321, 331, 341, 351]
+	for u in units:
+		VisualTurns.forget(sid, u)
+	VisualTurns._expected.clear()
+	var furnace: ProtoDB.EntityProto = world.protos.entity(2)
+	var yaw_of := func(r: WorldMirror.Rec) -> Basis:
+		var p: ProtoDB.EntityProto = world.protos.entity(r.proto_id)
+		return ModelLibrary.placed(p.name, p.type, r.dir, r.extra, Vector3(r.pos.x, 0.0, r.pos.y)).basis
+	var builds := func() -> Array:
+		return sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "build")
+
+	# Hold a stone furnace, R once, place it: the game's `add` comes back facing north.
+	input.cursor_item = "stone-furnace"
+	input.build_dir = 0
+	sent()
+	input._rotate(false)
+	check(input.build_dir == 4, "K21: R turns the held furnace's preview a quarter")
+	input.drag.begin("stone-furnace", furnace, Vector2(10.2, 10.7), false)
+	input.drag.end()
+	var one: Array = builds.call()
+	check(one.size() == 1 and int(one[0].get("d", -1)) == 4 and VisualTurns.expecting(),
+		"K21: the furnace is sent turned and waits for its building: %s" % [one])
+	check(pred.count() == 1 and pred._pending[0].dir == 4, "K21: its prediction is drawn turned")
+	world.handle({"t": "add", "e": [301, 2, 10 * 256, 11 * 256, 0]})
+	var placed: WorldMirror.Rec = world.entities.get(301)
+	check(placed != null and placed.dir == 4 and (yaw_of.call(placed) as Basis).is_equal_approx(Basis(Vector3.UP, -TAU / 4.0))
+		and VisualTurns.quarters(sid, 301) == 1 and not VisualTurns.expecting(),
+		"K21: the furnace the game put down unturned is drawn a quarter turned, as the preview was, its look-only turn kept")
+	world._add([301, 2, 10 * 256, 11 * 256, 0])  # the chunk sent again, or after a restart
+	var cfg := ConfigFile.new()
+	cfg.load(VisualTurns.PATH)
+	check((world.entities[301] as WorldMirror.Rec).dir == 4 and int(cfg.get_value(sid if sid != "" else "unnamed", "301", 0)) == 1,
+		"K21: it stays turned when the game sends it again, and the turn is in the save's file for the next start")
+
+	# A drag places a row: every one turned.
+	input.drag.begin("stone-furnace", furnace, Vector2(14.0, 24.0), false)
+	input.drag.update(Vector2(20.0, 24.0))
+	input.drag.end()
+	var row: Array = builds.call()
+	check(row.size() == 4 and row.all(func(c: Dictionary) -> bool: return int(c.get("d", -1)) == 4),
+		"K21: a drag sends every furnace turned: %s" % [row])
+	for i in 4:
+		world.handle({"t": "add", "e": [314 - i, 2, (20 - 2 * i) * 256, 24 * 256, 0]})  # answered in any order
+	var row_turned := 0
+	for u in [311, 312, 313, 314]:
+		var r: WorldMirror.Rec = world.entities.get(u)
+		if r != null and r.dir == 4 and VisualTurns.quarters(sid, u) == 1:
+			row_turned += 1
+	check(row_turned == 4, "K21: each furnace of the drag stands turned once its `add` comes (%d of 4)" % row_turned)
+
+	# Shift+R the other way round: three quarters.
+	input._rotate(true)
+	input._rotate(true)
+	check(input.build_dir == 12, "Shift+R turns the preview back")
+	input.drag.begin("stone-furnace", furnace, Vector2(4.0, 28.0), false)
+	input.drag.end()
+	builds.call()
+	world.handle({"t": "add", "e": [321, 2, 4 * 256, 28 * 256, 0]})
+	check((world.entities[321] as WorldMirror.Rec).dir == 12 and VisualTurns.quarters(sid, 321) == 3,
+		"K21: turned back once, it is placed turned back (three quarters)")
+
+	# An assembler without fluid boxes can't turn either: its prediction keeps the turn (a turnable
+	# one is drawn north until it has a recipe), and so does the building.
+	input.cursor_item = "assembling-machine-1"
+	input.build_dir = 4
+	input.drag.begin("assembling-machine-1", world.protos.entity(7), Vector2(26.5, 4.5), false)
+	input.drag.end()
+	builds.call()
+	var am1 := pred._pending.filter(func(p) -> bool: return p.proto.id == 7)
+	check(am1.size() == 1 and am1[0].dir == 4, "K21: an assembler Factorio can't turn is predicted turned")
+	world.handle({"t": "add", "e": [331, 7, 26 * 256 + 128, 4 * 256 + 128, 0]})
+	check((world.entities[331] as WorldMirror.Rec).dir == 4 and VisualTurns.quarters(sid, 331) == 1, "K21: and placed turned")
+
+	# What Factorio turns itself gets its direction from the game, with no look-only turn.
+	input.cursor_item = "inserter"
+	input.build_dir = 4
+	input.drag.begin("inserter", world.protos.entity(4), Vector2(28.5, 12.5), false)
+	input.drag.end()
+	var ins: Array = builds.call()
+	check(ins.size() == 1 and int(ins[0].get("d", -1)) == 4 and not VisualTurns.expecting(), "an inserter is sent turned; nothing waits for it")
+	world.handle({"t": "add", "e": [341, 4, 28 * 256 + 128, 12 * 256 + 128, 4]})
+	check((world.entities[341] as WorldMirror.Rec).dir == 4 and VisualTurns.quarters(sid, 341) == 0, "the game's own turn, nothing added")
+	input.cursor_item = "assembling-machine-2"
+	input.drag.begin("assembling-machine-2", world.protos.entity(6), Vector2(26.5, 18.5), false)
+	input.drag.end()
+	builds.call()
+	check(not VisualTurns.expecting(), "an assembler with fluid boxes (Factorio turns it) gets no look-only turn")
+	# Ghosts are the game's: none waits. A build the game refused long ago doesn't turn one put there later.
+	input.cursor_item = "stone-furnace"
+	input.drag.begin("stone-furnace", furnace, Vector2(4.0, 4.0), true)
+	input.drag.end()
+	check(not VisualTurns.expecting(), "a ghost turned in the cursor waits for nothing")
+	input.drag.begin("stone-furnace", furnace, Vector2(10.0, 30.0), false)
+	input.drag.end()
+	builds.call()
+	check(VisualTurns._expected.size() == 1, "the furnace sent turned waits for its building")
+	if not VisualTurns._expected.is_empty():
+		VisualTurns._expected[0][3] = int(VisualTurns._expected[0][3]) - VisualTurns.EXPECT_MSEC - 1
+	world.handle({"t": "add", "e": [351, 2, 10 * 256, 30 * 256, 0]})
+	check((world.entities[351] as WorldMirror.Rec).dir == 0 and not VisualTurns.expecting(), "a build long refused turns nothing later")
+
+	for u in units:
+		VisualTurns.forget(sid, u)
+	VisualTurns._expected.clear()
+	if had_am2 == null:
+		m.eprops.erase(6)
+	else:
+		m.eprops[6] = had_am2
+	input.cursor_item = ""
 	sent()
 	m.main_slots = had
 	m.counts = had_counts
@@ -5867,6 +9330,7 @@ func _predictions(hud: Hud) -> void:
 func _world_marks(hud: Hud) -> void:
 	var m: UiModel = hud.ui.model
 	var world := WorldMirror.new()
+	world.pick_build_usec = 1 << 40  # the whole pick index at once (see _predictions)
 	world.protos.add_entities([
 		[1, "transport-belt", "transport-belt", -0.5, -0.5, 0.5, 0.5, 200, 180, 0, 1, 1],
 		[2, "underground-belt", "underground-belt", -0.5, -0.5, 0.5, 0.5, 200, 180, 0, 1, 1],
@@ -5876,6 +9340,7 @@ func _world_marks(hud: Hud) -> void:
 		[6, "steam-engine", "generator", -1.5, -2.5, 1.5, 2.5, 120, 120, 120, 3, 5],
 		[7, "locomotive", "locomotive", -1, -3, 1, 3, 120, 120, 120, 2, 6],
 		[8, "assembling-machine-2", "assembling-machine", -1.5, -1.5, 1.5, 1.5, 120, 120, 120, 3, 3],
+		[9, "pipe-to-ground", "pipe-to-ground", -0.5, -0.5, 0.5, 0.5, 120, 120, 120, 1, 1],
 	])
 	m.handle({"t": "eprops", "l": [[2, 5, 0, 0], [3, 0, 0, 0, {"ip": [0, -2], "id": [0, 2.2]}], [4, 0, 0, 0, {"lr": 25, "cr": 55}],
 		[5, 0, 0, 0, {"mr": 2.49, "vp": [0, -1.85], "fb": [[-1, 0, 12, "b"]], "fo": 1}],
@@ -5899,6 +9364,32 @@ func _world_marks(hud: Hud) -> void:
 	check(input.build_extra(under, Vector2(10.5, 5.5), 4) == {"u": "o"}, "one ahead of an entrance facing the same way is its exit")
 	check(input.build_extra(under, Vector2(10.5, 5.5), 12) == {"u": "i"}, "facing the other way it is an entrance")
 	check(input.build_extra(under, Vector2(14.5, 5.5), 4) == {"u": "i"}, "out of reach it is an entrance")
+	# J24: held, it shows Factorio's underground connection to the entrance it would join (its
+	# underground_sprite on the tiles between) and, green, the furthest its exit may go; past that the
+	# connection is red, too far; with nothing to join, the furthest its exit could go from it.
+	var tunnel_of := func(marks: Array) -> Array:
+		return marks.filter(func(k: Dictionary) -> bool: return k["k"] == "tunnel").map(
+			func(k: Dictionary) -> Array: return [int(floorf((k["at"] as Vector2).x)), "g" if k["c"] == UndergroundPairs.MAX_REACH
+				else ("r" if k["c"] == UndergroundPairs.TOO_FAR else "y")])
+	var near_marks: Array = tunnel_of.call(UndergroundPairs.held_marks(world, under, Vector2(10.5, 5.5), 4, 5))
+	var far_marks: Array = tunnel_of.call(UndergroundPairs.held_marks(world, under, Vector2(14.5, 5.5), 4, 5))
+	var lone_marks: Array = tunnel_of.call(UndergroundPairs.held_marks(world, under, Vector2(10.5, 5.5), 12, 5))
+	check(near_marks == [[8, "y"], [9, "y"], [12, "g"]] and far_marks == [[8, "r"], [9, "r"], [10, "r"], [11, "r"], [13, "r"], [12, "g"]]
+		and lone_marks == [[5, "g"]],
+		"J24: a held underground's connection, yellow in reach, red past it, its furthest exit green: %s %s %s" % [near_marks, far_marks, lone_marks])
+	var ptg: ProtoDB.EntityProto = world.protos.entity(9)
+	world._add([51, 9, 20 * 256 + 128, 9 * 256 + 128, 12])  # a pipe-to-ground connected back (west)
+	var pipe_marks: Array = UndergroundPairs.held_marks(world, ptg, Vector2(24.5, 9.5), 4, 10)
+	check(pipe_marks.size() == 4 and pipe_marks.all(func(k: Dictionary) -> bool: return not bool(k["arrow"]))
+		and UndergroundPairs.held_join(world, ptg, Vector2(24.5, 9.5), 4, 10).get("k") == 4,
+		"J24: a pipe-to-ground facing on from one facing back joins it (no arrows, as Factorio draws pipes): %s" % [pipe_marks])
+	world._remove(51)
+	var tunnel_overlay := CursorOverlay.new()
+	tunnel_overlay.show_marks(UndergroundPairs.held_marks(world, under, Vector2(14.5, 5.5), 4, 5))
+	# Each tile: 4 dashes and the arrow's 3 edges, 2 triangles each.
+	check(tunnel_overlay._mesh.get_surface_count() == 1 and (tunnel_overlay._mesh.surface_get_arrays(0)[Mesh.ARRAY_VERTEX] as PackedVector3Array).size() == 6 * 7 * 6,
+		"J24: the overlay draws each tunnel tile's dashes and arrow")
+	tunnel_overlay.free()
 	check(ModelLibrary.turn_dir("underground-belt", 4, {"u": "o"}) == 12 and ModelLibrary.turn_dir("underground-belt", 4, {"u": "i"}) == 4,
 		"an exit's model is turned round (its direction is the way items go, its model faces its entrance)")
 	check(ModelLibrary.turn_dir("furnace", 8, {}, "crusher") == 0 and ModelLibrary.turn_dir("furnace", 12, {}, "crusher") == 0
@@ -6312,12 +9803,263 @@ func _world_marks(hud: Hud) -> void:
 	world.free()
 
 
+## K11 (the owner: "blueprints don't show the models on hover"): a held blueprint shows its buildings'
+## models at the cursor (blueprint_preview.gd: one MultiMesh per model, Factorio's ghost blue) where
+## the mod is told to put them (#21's clipboard rule), turned with R, flipped with H, red over what is
+## in the way as Factorio's build modes have it; a big blueprint is laid out a slice a frame and
+## moving the cursor lays nothing out again; and a blueprint's tooltip (an inventory slot's, asked of
+## the bridge as it opens; a library record's) has its picture under the title.
+func _blueprint_preview(hud: Hud) -> void:
+	PlayerInput.define_actions()
+	var ui = hud.ui
+	var m: UiModel = ui.model
+	var pl = ui.planners
+	check(GhostShader.get_shader_uniform_list().any(func(u: Dictionary) -> bool: return u["name"] == "instance_tint")
+		and GhostShader.get_shader_uniform_list().any(func(u: Dictionary) -> bool: return u["name"] == "bad_tint"),
+		"K11: ghost.gdshader has its per-instance red (instance_tint, bad_tint)")
+	var world := WorldMirror.new()
+	world.protos.add_entities([
+		[1, "transport-belt", "transport-belt", -0.4, -0.4, 0.4, 0.4, 200, 180, 0, 1, 1],
+		[2, "inserter", "inserter", -0.15, -0.15, 0.15, 0.15, 200, 180, 0, 1, 1],
+		[3, "iron-chest", "container", -0.35, -0.35, 0.35, 0.35, 120, 120, 120, 1, 1],
+		[4, "wooden-chest", "container", -0.35, -0.35, 0.35, 0.35, 150, 110, 60, 1, 1],
+		[5, "tree-01", "tree", -0.4, -0.4, 0.4, 0.4, 40, 110, 40, 1, 1],
+		[6, "small-lamp", "lamp", -0.15, -0.15, 0.15, 0.15, 120, 120, 120, 1, 1],
+	])
+	world.protos.add_tiles([[1, "stone-path", 120, 110, 100]])
+	world.chunks[Vector2i.ZERO] = ChunkView.new()
+	var input := PlayerInput.new()
+	input.world = world
+	input.hud = hud
+	input.tile_brush.pi = input
+	input.drag.pi = input
+	var bp: Node3D = input.bp_preview
+	bp.world = world
+	bp.replace_groups = PlayerInput.REPLACE_GROUPS
+	add_child(bp)
+	var record := BpString.decode(FACTORIO_STRING)
+	var had_slots: Array = m.main_slots
+	var had_has := m.has_slots
+	var had_counts: Dictionary = m.counts.duplicate()
+	m.set_inventory_slots([["blueprint", 1], ["blueprint", 1]], 80)
+	input.hold("blueprint", 1)
+	pl.held_slot = 1
+	pl.held_record = record
+	input.has_ground = true
+	input.ground = Vector2(10.3, 5.2)
+	input.build_dir = 0
+	sent()
+	var settle := func() -> bool:
+		var until := Time.get_ticks_msec() + 60000
+		while Time.get_ticks_msec() < until:
+			input._update_paste_preview()
+			if bp.settled():
+				return true
+			ModelLibrary.poll()
+			await get_tree().process_frame
+		return false
+	var settled: bool = await settle.call()
+	var items: Array = bp.shown_items()
+	var mesh_of := func(i: int) -> Mesh: return items[i][3] if i < items.size() else null
+	var chest_mesh := ModelLibrary.mesh_for_entity("iron-chest", "container", {}, 0)
+	var belt_mesh := ModelLibrary.mesh_for_entity("transport-belt", "transport-belt", {"s": "s"}, 4)
+	check(settled and bp.visible and items.size() == 5 and bp.tile_count() == 2 and chest_mesh != null and belt_mesh != null
+		and mesh_of.call(4) == chest_mesh and mesh_of.call(0) == belt_mesh and mesh_of.call(2) == belt_mesh
+		and items.all(func(it: Array) -> bool: return it[3] != null and it[3] != Visuals.box_mesh())
+		and bp.multimesh_of(belt_mesh).instance_count == 3 and bp.bad_count() == 0,
+		"K11: a held blueprint is drawn as its buildings' models (three belts in one MultiMesh, the inserter, the iron chest) and its two tiles: %s" % [items.map(func(it: Array) -> String: return "%s %s" % [(it[0] as ProtoDB.EntityProto).name, it[3]])])
+	# Where: the mouse moved as little as puts it on the grid, its middle sent to the mod as drawn.
+	var where := func(i: int) -> Vector2:
+		var o: Vector3 = bp.instance_transform(i).origin + bp.position
+		return Vector2(o.x, o.z)
+	# The chest's row in its MultiMesh's buffer, where the renderer keeps one (the dummy one may not).
+	var chest_mm: MultiMesh = bp.multimesh_of(items[4][3])
+	var chest_buf: PackedFloat32Array = chest_mm.buffer if chest_mm != null else PackedFloat32Array()
+	var row_ok := chest_buf.size() != chest_mm.instance_count * 16 or Vector3(chest_buf[3], chest_buf[7], chest_buf[11]).is_equal_approx(
+		bp.instance_transform(4).origin)
+	print("K11: the chest's MultiMesh buffer %s" % ("checked" if chest_buf.size() == chest_mm.instance_count * 16 else "not kept by this renderer (%d floats)" % chest_buf.size()))
+	var anchor: Vector2 = input.blueprint_anchor(input.ground)
+	input.place_blueprint(anchor, 0)
+	var placed := sent_one("blueprint")
+	check(anchor.is_equal_approx(Vector2(10.5, 5.0)) and Vector2(bp.position.x, bp.position.z).is_equal_approx(anchor)
+		and where.call(4).is_equal_approx(Vector2(12.5, 4.5)) and where.call(0).is_equal_approx(Vector2(8.5, 4.5))
+		and placed.get("x") == 2688 and placed.get("y") == 1280 and row_ok,
+		"K11: the preview's middle on the grid nearest the mouse, the chest at 12.5, 4.5, and the mod told that middle: %s %s %s" % [anchor, where.call(4), placed])
+	# Moving the cursor moves the node; nothing is laid out again.
+	var laid := int(bp.laid_out)
+	input.ground = Vector2(11.4, 5.2)
+	input._update_paste_preview()
+	check(bp._stage == 0 and int(bp.laid_out) == laid and is_equal_approx(bp.position.x, 11.5),
+		"K11: moving the cursor a tile moves the preview without laying it out again")
+	input.ground = Vector2(10.3, 5.2)
+	# R turns it a quarter clockwise round its middle, every entity turned with it.
+	input._rotate(false)
+	settled = await settle.call()
+	items = bp.shown_items()
+	var belt_turned: Transform3D = bp.instance_transform(0)
+	check(settled and input.build_dir == 4 and (items[4][1] as Vector2).is_equal_approx(Vector2(0.5, 2.0))
+		and belt_turned.basis.is_equal_approx(ModelLibrary.placed("transport-belt", "transport-belt", 8, {"s": "s"}, Vector3.ZERO).basis)
+		and Vector2(bp.position.x, bp.position.z).is_equal_approx(input.blueprint_anchor(input.ground)),
+		"K11: R turns the held blueprint: the chest from 2, -0.5 to %s, the belts east to south" % [items[4][1]])
+	# H flips it east-west first (the mod's mirrored copy), then the turn.
+	input._flip(false)
+	settled = await settle.call()
+	items = bp.shown_items()
+	# The inserter faced west (12): mirrored east (4), turned south (8), Factorio's south picture.
+	check(settled and input.build_mirror and (items[4][1] as Vector2).is_equal_approx(Vector2(0.5, -2.0))
+		and items[3][3] == ModelLibrary.mesh_for_entity("inserter", "inserter", {}, 8)
+		and items[3][3] != ModelLibrary.mesh_for_entity("inserter", "inserter", {}, 0),
+		"K11: H flips the held blueprint (the chest to %s, the inserter west to east, then turned south)" % [items[4][1]])
+	input._flip(false)
+	input._rotate(true)
+	settled = await settle.call()
+	# In the way: a lamp on the inserter's tile (not what an inserter replaces), a tree on the first
+	# belt's; a wooden chest on the iron chest's is fast-replaced, as in Factorio.
+	world._add([90, 6, 11 * 256 + 128, 4 * 256 + 128, 0])
+	world._add([0, 5, 8 * 256 + 128, 4 * 256 + 128, 0])
+	world._add([91, 4, 12 * 256 + 128, 4 * 256 + 128, 0])
+	world.entities_changed.emit(Vector2i.ZERO)
+	settled = await settle.call()
+	items = bp.shown_items()
+	var ins_mm: MultiMesh = bp.multimesh_of(items[3][3])
+	# The red goes to the shader as the instance's custom data (not kept by the headless dummy renderer).
+	var tinted := DisplayServer.get_name() == "headless" or is_equal_approx(ins_mm.get_instance_custom_data(int(items[3][4])).r, 1.0)
+	check(settled and bp.is_bad(3) and bp.is_bad(0) and not bp.is_bad(4) and bp.bad_count() == 2 and tinted,
+		"K11: red where it can't go: the inserter over a lamp and the belt over a tree, not the chest over a chest it replaces (%d red)" % bp.bad_count())
+	# Shift (forced): the tree is marked for deconstruction instead; Ctrl+Shift: nothing stands in the way.
+	var tiles: Array = pl.held_preview_tiles()
+	var at_mode := func(mode: int) -> bool:
+		var until := Time.get_ticks_msec() + 10000
+		while Time.get_ticks_msec() < until:
+			bp.show_blueprint(["bp", pl.preview_version], pl.held_preview(world.protos), tiles, anchor, 0, false, mode)
+			if bp.settled():
+				return true
+			await get_tree().process_frame
+		return false
+	var forced_ok: bool = await at_mode.call(1)
+	var forced := [bp.is_bad(0), bp.is_bad(3)]
+	var super_ok: bool = await at_mode.call(2)
+	check(forced_ok and super_ok and forced == [false, true] and bp.bad_count() == 0,
+		"K11: Shift: the tree no longer red, the lamp still; Ctrl+Shift: none red (%s)" % [forced])
+	world._remove(90)
+	world.entities_changed.emit(Vector2i.ZERO)
+	settled = await settle.call()
+	check(settled and not bp.is_bad(3) and bp.is_bad(0), "K11: the lamp mined: the inserter no longer red")
+
+	# A big blueprint: 4,000 entities laid out a slice a frame; then a tile's move only checks them.
+	var ents: Array = []
+	var kinds := ["transport-belt", "inserter", "iron-chest", "transport-belt"]
+	for y in 50:
+		for x in 80:
+			ents.append({"entity_number": ents.size() + 1, "name": kinds[y % 4], "position": {"x": x + 0.5, "y": y + 0.5}, "direction": 4 if y % 4 != 1 else 8})
+	pl.held_record = {"blueprint": {"item": "blueprint", "entities": ents}}
+	var frames := 0
+	var worst := 0
+	var worst_preview := 0  # of that, blueprint_preview.gd's own slice (the rest: the entries listed, once)
+	var until_big := Time.get_ticks_msec() + 60000
+	var t_big := Time.get_ticks_msec()
+	while Time.get_ticks_msec() < until_big:
+		var t0 := Time.get_ticks_usec()
+		var spent0: int = bp.usec_spent
+		input._update_paste_preview()
+		worst = maxi(worst, Time.get_ticks_usec() - t0)
+		worst_preview = maxi(worst_preview, int(bp.usec_spent) - spent0)
+		frames += 1
+		if bp.settled():
+			break
+		await get_tree().process_frame
+	var big_ms := Time.get_ticks_msec() - t_big
+	var big_settled: bool = bp.settled()
+	var big_items := (bp.shown_items() as Array).size()
+	var move_frames := 0
+	var move_worst := 0
+	input.ground += Vector2(1, 0)
+	while Time.get_ticks_msec() < until_big + 30000:
+		var t0 := Time.get_ticks_usec()
+		input._update_paste_preview()
+		move_worst = maxi(move_worst, Time.get_ticks_usec() - t0)
+		move_frames += 1
+		if bp.settled():
+			break
+		await get_tree().process_frame
+	print("K11 big blueprint: %d entities laid out and checked in %d frames (%d ms), the slowest frame's share %.1f ms (the preview's slice at most %.1f ms); a tile's move checked in %d frames, slowest %.1f ms" % [
+		big_items, frames, big_ms, worst / 1000.0, worst_preview / 1000.0, move_frames, move_worst / 1000.0])
+	check(big_settled and big_items == 4000 and frames > 1 and worst < 25000 and bp.settled() and move_worst < 25000,
+		"K11: a 4,000-entity blueprint is laid out over %d frames (slowest %.1f ms), a tile's move checked over %d (slowest %.1f ms)" % [
+			frames, worst / 1000.0, move_frames, move_worst / 1000.0])
+	pl.held_record = record
+
+	# The tooltip: the held stack's record at once, another inventory blueprint's once the bridge sends it.
+	var tip_of := func(s: Control) -> Control:
+		add_child(s)
+		var tip: Control = s._make_custom_tooltip("")
+		add_child(tip)
+		return tip
+	var held_slot := Slot.new()
+	held_slot.slot_role = "main"
+	held_slot.slot_index = 1
+	held_slot.set_stack("blueprint", 1)
+	held_slot.set_tip("Blueprint", [])
+	var tip1: Control = tip_of.call(held_slot)
+	await get_tree().process_frame
+	var pic1 = tip1.find_child("BlueprintPicture", true, false) if tip1 != null else null
+	check(pic1 != null and tip1.get_child(1) == pic1 and pic1.item_count() == 7 and pic1.custom_minimum_size.x > 0,
+		"K11: an inventory blueprint's tooltip has its picture under the title (5 entities, 2 tiles)")
+	sent()
+	var other := Slot.new()
+	other.slot_role = "main"
+	other.slot_index = 2
+	other.set_stack("blueprint", 1)
+	other.set_tip("Blueprint", [])
+	var tip2: Control = tip_of.call(other)
+	await get_tree().process_frame
+	var pic2 = tip2.find_child("BlueprintPicture", true, false) if tip2 != null else null
+	var asks: Array = sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "bp_get" and c.get("i") == 2)
+	var asked: Dictionary = asks[0] if not asks.is_empty() else {}
+	var before := int(pic2.item_count()) if pic2 != null else -1
+	m.handle({"t": "bp", "q": int(asked.get("q", 0)), "part": 1, "parts": 1, "s": FACTORIO_STRING, "item": "blueprint", "i": 2})
+	await get_tree().process_frame
+	check(pic2 != null and asked.get("i") == 2 and before == 0 and pic2.item_count() == 7,
+		"K11: another inventory blueprint's picture is asked for as its tooltip opens (bp_get %s) and drawn when it comes" % [asked])
+	var lib := PlannerSlot.new()
+	lib.set_record(record)
+	var tip3: Control = tip_of.call(lib)
+	var pic3 = tip3.find_child("BlueprintPicture", true, false) if tip3 != null else null
+	await get_tree().process_frame
+	check(pic3 != null and pic3.item_count() == 7, "K11: a library record's tooltip has its picture")
+	var plate := Slot.new()
+	plate.slot_role = "main"
+	plate.slot_index = 3
+	plate.set_stack("iron-plate", 10)
+	plate.set_tip("Iron plate", [])
+	var tip4: Control = tip_of.call(plate)
+	check(tip4 != null and tip4.find_child("BlueprintPicture", true, false) == null, "K11: an item's tooltip has none")
+	for n in [held_slot, tip1, other, tip2, lib, tip3, plate, tip4]:
+		if n != null:
+			n.queue_free()
+
+	input.hold("")
+	input._update_paste_preview()
+	check(not bp.visible, "K11: put away, the preview goes")
+	bp.queue_free()
+	input.free()
+	world.chunks[Vector2i.ZERO].free()
+	world.free()
+	pl.held_record = {}
+	pl.held_slot = 0
+	m.main_slots = had_slots
+	m.counts = had_counts
+	m.has_slots = had_has
+	sent()
+
+
 ## Tiles in the cursor, capsules, the rail planner and drag building (tile_brush.gd,
 ## capsule_aim.gd, rail_planner.gd, drag_build.gd), on a world of the test's own.
 func _build_tools(hud: Hud) -> void:
 	PlayerInput.define_actions()
 	var m: UiModel = hud.ui.model
 	var world := WorldMirror.new()
+	world.pick_build_usec = 1 << 40  # the whole pick index at once (see _predictions)
 	world.protos.add_entities([
 		[1, "transport-belt", "transport-belt", -0.5, -0.5, 0.5, 0.5, 200, 180, 0, 1, 1],
 		[2, "underground-belt", "underground-belt", -0.5, -0.5, 0.5, 0.5, 200, 180, 0, 1, 1],
@@ -6390,6 +10132,29 @@ func _build_tools(hud: Hud) -> void:
 	input.hovered_mover = []
 	input.movers = null
 	mine_movers.queue_free()
+	# J26: sweeping the mouse over belts with the button held sends each new one under it at once (it
+	# waited for the next repeat, 0.15 s, so belts the sweep crossed went unsent), with where the cursor
+	# is from the character for the bridge's sweep; over nothing, only where it is.
+	world._add([9921, 1, 20 * 256 + 128, 28 * 256 + 128, 4])
+	world._add([9922, 1, 21 * 256 + 128, 28 * 256 + 128, 4])
+	sent()
+	input.character_at_for_test = Vector2(18, 30)
+	input._rmb_down = true
+	input._mine_timer = 0.0
+	for at in [Vector2(20.5, 28.5), Vector2(21.4, 28.6), Vector2(21.6, 28.4), Vector2(24.5, 28.5)]:
+		input.ground = at
+		input._update_mining(0.016)
+	var sweep_mines: Array = sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "mine")
+	input._rmb_down = false
+	input._update_mining(0.016)
+	var swept_stop := sent().any(func(c: Dictionary) -> bool: return c.get("t") == "mine_stop")
+	input.character_at_for_test = Vector2.INF
+	world._remove(9921)
+	world._remove(9922)
+	check(sweep_mines.size() == 3 and int(sweep_mines[0].get("u", 0)) == 9921 and int(sweep_mines[1].get("u", 0)) == 9922
+		and int(sweep_mines[0].get("ox", 0)) == 640 and int(sweep_mines[0].get("oy", 0)) == -384
+		and int(sweep_mines[2].get("n", 0)) == 1 and int(sweep_mines[2].get("ox", 0)) == 1664 and swept_stop,
+		"J26: a sweep sends each new belt under the mouse at once with the cursor's offset, then where it is over nothing: %s" % [sweep_mines])
 	check(int(train_mine.get("u", 0)) == 900 and int(train_mine.get("p", 0)) == 9901,
 		"#10: the right button mines the locomotive under the mouse by its unit number: %s" % [train_mine])
 	check(PlayerInput.MINEABLE_MOVERS.has("fluid-wagon") and PlayerInput.MINEABLE_MOVERS.has("cargo-wagon")
@@ -6538,6 +10303,18 @@ func _build_tools(hud: Hud) -> void:
 		"a powered machine's entity info ends with Consumes electricity and its Electricity bar (H20): %s" % etext)
 	check(EntityInfoScript.power_text(217000.0) == "217 kW" and EntityInfoScript.power_text(7000.0) == "7.0 kW"
 		and EntityInfoScript.power_text(1.2e6) == "1.2 MW", "power written as Factorio's entity info writes it")
+	# J15: a crafting machine's ingredients and products a second (`hinfo` io), under their headings.
+	m.handle({"t": "hinfo", "q": m._hinfo_q, "u": 97, "eff": {"sp": 3000, "co": 4200}, "b": 2,
+		"io": {"i": [["item", "iron-plate", 2500]], "o": [["item", "iron-gear-wheel", 1250], ["fluid", "steam", 60000]]}})
+	einfo.show_entity(arec)
+	var iotext := "|".join(PackedStringArray(_texts(einfo._lines)))
+	check(iotext.contains("Ingredients:") and iotext.contains("Products:") and iotext.contains("2.5/s") and iotext.contains("1.25/s")
+		and iotext.contains("60/s") and iotext.find("Ingredients:") < iotext.find("Products:")
+		and iotext.find("Products:") < iotext.find("Health"),
+		"J15: hovering a machine shows its ingredients and products a second: %s" % iotext)
+	check(EntityInfoScript.rate_text(2000) == "2/s" and EntityInfoScript.rate_text(750) == "0.75/s" and EntityInfoScript.rate_text(1500) == "1.5/s"
+		and EntityInfoScript.rate_text(4) == "<0.01/s" and EntityInfoScript.rate_text(16667) == "16.67/s",
+		"rates written as Factorio's tooltips write them: %s" % [[EntityInfoScript.rate_text(2000), EntityInfoScript.rate_text(750), EntityInfoScript.rate_text(16667)]])
 	m.pedia_pages.erase("entity/assembling-machine-2")
 	einfo.show_entity(null)
 	einfo.player = einfo_player
@@ -6725,14 +10502,107 @@ func _build_tools(hud: Hud) -> void:
 	# --- drag building ------------------------------------------------------------------------------
 	var belt: ProtoDB.EntityProto = world.protos.entity(1)
 	input.cursor_item = "transport-belt"
+	var lock_was: Variant = Settings.get_value("interface", "lock_belt_straight")
+	var belt_steps := func() -> Array: return input.drag.sent.map(func(c): return [int(c["x"]) / 256, int(c["y"]) / 256, int(c["d"])])
+	var steps: Array
+	# J25, the owner's motion through the build button: a belt held facing east (as an east drag
+	# leaves it) dragged west builds the line backwards, every belt facing east, as Factorio does. It
+	# built them facing west, the way of the drag.
+	Settings.set_value("interface", "lock_belt_straight", true, false)
+	input.build_dir = 4
+	input.has_ground = true
+	input._lmb_down = true
+	for x in [40.5, 39.5, 37.6, 36.5]:
+		input.ground = Vector2(x, 14.4)
+		input._update_building()
+	steps = belt_steps.call()
+	input._lmb_down = false
+	input.drag.end()
+	check(steps == [[40, 14, 4], [39, 14, 4], [38, 14, 4], [37, 14, 4], [36, 14, 4]] and input.build_dir == 4,
+		"J25: a belt held facing east dragged west builds the line backwards, facing east: %s" % [steps])
+	# Factorio 2.x keeps the drag to the held belt's line: forward ahead of the start, backwards behind
+	# it, nothing off the line, nothing going back over what was built.
+	input.drag.begin("transport-belt", belt, Vector2(10.5, 10.5), false)
+	input.drag.update(Vector2(13.5, 10.5))
+	input.drag.update(Vector2(13.5, 7.5))
+	input.drag.update(Vector2(11.5, 10.5))
+	input.drag.update(Vector2(8.5, 11.2))
+	steps = belt_steps.call()
+	input.drag.end()
+	check(steps == [[10, 10, 4], [11, 10, 4], [12, 10, 4], [13, 10, 4], [9, 10, 4], [8, 10, 4]],
+		"J25: a locked belt drag goes along the held belt's line both ways, facing the held way, nothing off it or back over it: %s" % [steps])
+	# R while dragging: the line turns at its last belt towards the cursor and is built out to it.
+	# Forward the last belt turns the new way; backwards it stays and the new belts flow into it.
+	input.drag.begin("transport-belt", belt, Vector2(40.5, 18.5), false)
+	input.drag.update(Vector2(44.5, 18.5))
+	input.ground = Vector2(44.5, 21.5)
+	input.drag.update(input.ground)
+	input._rotate(false)
+	steps = belt_steps.call()
+	var bent_dir := input.build_dir
+	input.drag.end()
+	check(steps.slice(5) == [[44, 18, 8], [44, 19, 8], [44, 20, 8], [44, 21, 8]] and steps.size() == 9 and bent_dir == 8,
+		"J25: R while dragging east with the cursor south turns the last belt south and builds to the cursor: %s" % [steps])
+	input.build_dir = 4
+	input.drag.begin("transport-belt", belt, Vector2(60.5, 18.5), false)
+	input.drag.update(Vector2(57.5, 18.5))
+	input.ground = Vector2(57.5, 15.5)
+	input._rotate(false)
+	steps = belt_steps.call()
+	bent_dir = input.build_dir
+	input.drag.end()
+	check(steps == [[60, 18, 4], [59, 18, 4], [58, 18, 4], [57, 18, 4], [57, 17, 8], [57, 16, 8], [57, 15, 8]] and bent_dir == 8,
+		"J25: R in a backwards drag leaves the last belt and builds the new ones flowing into it: %s" % [steps])
+	input.build_dir = 4
+	input.drag.begin("transport-belt", belt, Vector2(60.5, 22.5), false)
+	input.ground = Vector2(60.5, 22.5)
+	input._rotate(true)
+	steps = belt_steps.call()
+	input.drag.end()
+	check(steps == [[60, 22, 4], [60, 22, 0]] and input.build_dir == 0,
+		"J25: with the cursor on the line Shift+R turns the first belt a quarter back: %s" % [steps])
+	# Smart belt building backwards: the entrance goes past the obstacle (upstream), sent first, so the
+	# one replacing the last belt before it becomes the exit.
+	world._add([66, 6, 29 * 256 + 128, 6 * 256 + 128, 0])
+	input.build_dir = 4
+	input.drag.begin("transport-belt", belt, Vector2(31.5, 6.5), false)
+	input.drag.update(Vector2(27.5, 6.5))
+	steps = input.drag.sent.map(func(c): return [str(c["item"]), int(c["x"]) / 256, int(c["d"])])
+	input.drag.end()
+	world._remove(66)
+	check(steps == [["transport-belt", 31, 4], ["transport-belt", 30, 4], ["underground-belt", 28, 4], ["underground-belt", 30, 4],
+		["transport-belt", 27, 4]], "J25: a backwards drag jumps an obstacle with the entrance upstream: %s" % [steps])
+	# "Lock belt building to straight line" off: Zenith's own drag round corners (I12).
+	Settings.set_value("interface", "lock_belt_straight", false, false)
 	input.build_dir = 4
 	input.drag.begin("transport-belt", belt, Vector2(10.5, 10.5), false)
 	input.drag.update(Vector2(13.5, 10.5))
 	input.drag.update(Vector2(13.5, 7.5))
-	var steps := input.drag.sent.map(func(c): return [int(c["x"]) / 256, int(c["y"]) / 256, int(c["d"])])
+	steps = belt_steps.call()
 	check(steps == [[10, 10, 4], [11, 10, 4], [12, 10, 4], [13, 10, 4], [13, 10, 0], [13, 9, 0], [13, 8, 0], [13, 7, 0]],
 		"belts follow the cursor and turn the corner (the belt where it turns points the new way): %s" % [steps])
 	input.drag.end()
+	# Going back over the line changes nothing (J1's turning round is gone: Factorio doesn't).
+	input.build_dir = 4
+	input.drag.begin("transport-belt", belt, Vector2(10.5, 12.5), false)
+	input.drag.update(Vector2(13.5, 12.5))
+	input.drag.update(Vector2(9.5, 12.5))
+	steps = belt_steps.call()
+	input.drag.end()
+	check(steps == [[10, 12, 4], [11, 12, 4], [12, 12, 4], [13, 12, 4]], "J25: following the cursor, going back over the line builds nothing: %s" % [steps])
+	# Begun against the held way it goes backwards, round corners too, the new belts flowing in.
+	input.build_dir = 4
+	input.drag.begin("transport-belt", belt, Vector2(30.5, 12.5), false)
+	input.drag.update(Vector2(28.5, 12.5))
+	input.drag.update(Vector2(28.5, 9.5))
+	steps = belt_steps.call()
+	input.drag.end()
+	check(steps == [[30, 12, 4], [29, 12, 4], [28, 12, 4], [28, 11, 8], [28, 10, 8], [28, 9, 8]],
+		"J25: following the cursor, begun against the held way the belts face back along the drag: %s" % [steps])
+	check(DragBuildScript.follow_step(Vector2i(-2, 0), Vector2i(1, 0)) == Vector2i.ZERO
+		and DragBuildScript.follow_step(Vector2i(-2, 2), Vector2i(1, 0)) == Vector2i(0, 1),
+		"following the cursor: back along the line no step, TURN_SLACK off it a corner")
+	Settings.set_value("interface", "lock_belt_straight", lock_was, false)
 	world._add([61, 6, 22 * 256 + 128, 10 * 256 + 128, 0])  # a chest in the way
 	input.build_dir = 4
 	input.drag.begin("transport-belt", belt, Vector2(20.5, 10.5), false)
@@ -6792,9 +10662,13 @@ func _build_tools(hud: Hud) -> void:
 	m.eprops[9910] = {"wire": 30.0, "under": 0.0, "x": {}}
 	m.eprops[9911] = {"wire": 0.0, "under": 5.0, "x": {}}
 	m.eprops[9912] = {"wire": 0.0, "under": 11.0, "x": {}}
+	# In the inventory: a drag begun with none would build nothing (I5 stops it when they run out).
+	hud.set_inventory([["test-big-pole", 10], ["test-underground", 10], ["test-pipe-to-ground", 10], ["stone-furnace", 10]])
 	input.build_dir = 0
 	input.drag.begin("test-big-pole", world.protos.entity(9910), Vector2(120.7, 100.4), false)
-	for x in range(120, 89, -1):
+	# I13: the next pole goes once the cursor's path has passed the wire's reach, on its furthest
+	# free tile still in reach: the cursor goes two tiles past it.
+	for x in range(120, 87, -1):
 		input.drag.update(Vector2(x + 0.5, 100.4))
 	steps = input.drag.sent.map(func(c): return [float(c["x"]) / 256.0, float(c["y"]) / 256.0])
 	check(steps.size() == 2 and steps[1] == [91.0, 100.0], "P45: a two-wide pole's line starts on its grid corner (121), the next at its reach: %s" % [steps])
@@ -6813,8 +10687,11 @@ func _build_tools(hud: Hud) -> void:
 	input.drag.end()
 	check(input.drag.sent.size() == 5, "P45: letting go after a drag sends nothing more")
 	input.build_dir = 8
+	# Held (an emptied hand builds nothing on letting go, I5).
+	input.cursor_item = "test-underground"
 	input.drag.begin("test-underground", world.protos.entity(9911), Vector2(96.5, 108.5), false)
 	input.drag.end()
+	input.cursor_item = ""
 	check(under_steps.call() == [[96, 8]], "P45: a plain click builds one, as held: %s" % [under_steps.call()])
 	world._add([65, 6, 111 * 256 + 128, 112 * 256 + 128, 0])  # a chest where the exit would go
 	input.build_dir = 0
@@ -6835,12 +10712,64 @@ func _build_tools(hud: Hud) -> void:
 	steps = input.drag.sent.map(func(c): return float(c["x"]) / 256.0)
 	check(steps == [0.0, 2.0, 4.0, 6.0], "other buildings go one footprint after another along the line: %s" % [steps])
 	input.drag.end()
+	# J4: a pole held shows the supply areas of the poles round it and its own, one tint where they
+	# meet: two 5x5 areas three tiles apart (8 x 5) and the held one's 5 x 3 below them, no overlaps.
+	world._add([66, 5, 4 * 256 + 128, 30 * 256 + 128, 0])
+	world._add([67, 5, 7 * 256 + 128, 30 * 256 + 128, 0])
+	var cover := PoleCoverageScript.new()
+	cover.world = world
+	var held: Array = cover.held_marks(5, "normal", Vector2(4.5, 33.5), m.eprops)
+	var cover_rects: Array = held[0]["rects"] if held.size() == 1 and str(held[0]["k"]) == "cover" else []
+	var covered := 0.0
+	var overlaps := 0
+	for i in cover_rects.size():
+		covered += (cover_rects[i] as Rect2).get_area()
+		for j in range(i + 1, cover_rects.size()):
+			if (cover_rects[i] as Rect2).intersects(cover_rects[j]):
+				overlaps += 1
+	check(is_equal_approx(covered, 55.0) and overlaps == 0, "J4: the poles' areas and the held pole's, %s tiles in %d rectangles, %d overlapping" % [covered, cover_rects.size(), overlaps])
+	check(is_equal_approx(PoleCoverageScript.supply_of(5, "rare", m.eprops), 4.5) and PoleCoverageScript.supply_of(1, "normal", m.eprops) == 0.0,
+		"J4: a pole's supply area grows a tile each way per quality level; a belt supplies nothing")
+	var hover_cover := cover.area_of(world.entities[66], m.eprops)
+	check(hover_cover == Rect2(2, 28, 5, 5), "J4: a pole hovered shows its own area: %s" % [hover_cover])
+	world._remove(66)
+	world._remove(67)
+	# J9: the build cursor shows a splitter over belts as buildable (it replaces them), not red; the
+	# drag's own checks still see the belts.
+	world.protos.add_entities([[9913, "test-splitter", "splitter", -1, -0.5, 1, 0.5, 0, 0, 0, 2, 1]])
+	world._add([68, 1, 20 * 256 + 128, 2 * 256 + 128, 0])
+	world._add([69, 1, 21 * 256 + 128, 2 * 256 + 128, 0])
+	var splitter_proto: ProtoDB.EntityProto = world.protos.entity(9913)
+	check(input._blocked(splitter_proto, Vector2(21, 2.5), Vector2i(2, 1)) and not input._blocked(splitter_proto, Vector2(21, 2.5), Vector2i(2, 1), true),
+		"J9: belts under a splitter don't turn the build cursor red (it replaces them); the drag's checks still see them")
+	world._remove(68)
+	world._remove(69)
+	# J18: the right button over an item lying on the ground picks it up (`mine` gi, where it lies),
+	# hiding it at once; an item is found only within its selection box.
+	var gi_layer := GroundItemsScript.new()
+	gi_layer.protos = world.protos
+	add_child(gi_layer)
+	gi_layer.handle({"t": "gi", "k": 5, "part": 1, "parts": 1, "l": [1, 30 * 256 + 64, 40 * 256 + 64, 1, 31 * 256, 40 * 256]})
+	check(gi_layer.item_at(Vector2(30.3, 40.2)) == [Vector2i(30 * 256 + 64, 40 * 256 + 64), 1] and gi_layer.item_at(Vector2(30.6, 40.6)).is_empty(),
+		"J18: an item on the ground is found under the mouse within its selection box: %s" % [gi_layer.item_at(Vector2(30.3, 40.2))])
+	input.ground_items = gi_layer
+	input.ground = Vector2(30.3, 40.2)
+	input.has_ground = true
+	input.hovered_mover = []
+	sent()
+	var took: bool = input._take_ground_item()
+	var gi_mine := sent_one("mine")
+	check(took and int(gi_mine.get("gi", 0)) == 1 and int(gi_mine.get("x", 0)) == 30 * 256 + 64 and int(gi_mine.get("y", 0)) == 40 * 256 + 64
+		and gi_layer.item_at(Vector2(30.3, 40.2)).is_empty() and gi_layer.count() == 1,
+		"J18: the right button sends mine with gi for it and hides it at once: %s" % [gi_mine])
+	input.ground_items = null
+	gi_layer.queue_free()
 	sent()
 	m.has_slots = had_slots
 	for tool in [input.tile_brush, input.rail_planner, input.capsule_aim]:
 		tool.queue_free()
 	# PlayerInput's own previews, made before _ready (which a test doesn't run) adds them anywhere.
-	for n in [input._ghost, input._drag_box, input._reach_box, input._reach_lines, input._ghost_model, input._overlay]:
+	for n in [input._ghost, input._drag_box, input._reach_lines, input._ghost_model, input._overlay]:
 		n.free()
 	input.free()
 	cv.free()
@@ -7295,9 +11224,34 @@ func _antialiasing_look() -> void:
 	check(Settings.switch_msaa_for_look() and str(Settings.get_value("graphics", "antialiasing")) == "smaa",
 		"a look with passes turned on mid-run switches the saved MSAA to SMAA")
 	check(not Settings.switch_msaa_for_look(), "and only once")
-	# TAA from a look goes with SMAA: both stay on (Godot runs them together).
+	# TAA from a look over the setting's SMAA: the choice stays SMAA, drawn without it while TAA is on.
 	Settings.look_taa = true
-	check(Settings.taa_on() and Settings.antialiasing_in_effect() == "smaa", "a look's TAA stays on over SMAA")
+	check(Settings.taa_on() and Settings.antialiasing_in_effect() == "smaa", "a look's TAA is on; the choice in effect stays SMAA")
+	check(Settings.screen_space_aa_for("smaa", true) == Viewport.SCREEN_SPACE_AA_DISABLED
+		and Settings.screen_space_aa_for("smaa", false) == Viewport.SCREEN_SPACE_AA_SMAA
+		and Settings.screen_space_aa_for("fxaa", true) == Viewport.SCREEN_SPACE_AA_FXAA
+		and Settings.screen_space_aa_for("taa", true) == Viewport.SCREEN_SPACE_AA_DISABLED,
+		"no SMAA under TAA (TAA resolves the edges; SMAA's passes over it cost GPU for nothing); FXAA stays")
+	# A look's TAA turned on and off in a running game: SMAA goes and comes back with it, and only SMAA.
+	var vp := SubViewport.new()
+	add_child(vp)
+	vp.screen_space_aa = Viewport.SCREEN_SPACE_AA_SMAA
+	Settings.follow_taa(vp)
+	var with_taa := vp.use_taa and vp.screen_space_aa == Viewport.SCREEN_SPACE_AA_DISABLED
+	Settings.look_taa = false
+	Settings.follow_taa(vp)
+	var after := not vp.use_taa and vp.screen_space_aa == Viewport.SCREEN_SPACE_AA_SMAA
+	vp.screen_space_aa = Viewport.SCREEN_SPACE_AA_FXAA
+	Settings.look_taa = true
+	Settings.follow_taa(vp)
+	var fxaa_kept := vp.use_taa and vp.screen_space_aa == Viewport.SCREEN_SPACE_AA_FXAA
+	vp.screen_space_aa = Viewport.SCREEN_SPACE_AA_DISABLED
+	Settings.look_taa = false
+	Settings.follow_taa(vp)
+	var none_kept := not vp.use_taa and vp.screen_space_aa == Viewport.SCREEN_SPACE_AA_DISABLED
+	check(with_taa and after and fxaa_kept and none_kept,
+		"a look's TAA drops SMAA while it is on and gives it back after; FXAA and no anti-aliasing are left as they are (%s %s %s %s)" % [with_taa, after, fxaa_kept, none_kept])
+	vp.queue_free()
 	Settings.look_taa = taa_was
 	# A saved MSAA the start didn't switch (an add-on's look put on later) shows as SMAA when Settings opens.
 	Settings._cfg.set_value("graphics", "antialiasing", "msaa4")
@@ -7777,6 +11731,53 @@ func _user_data_layout() -> void:
 	_remove_tree(root)
 	check(saves == user.path_join("saves") and data == user.path_join("server-data") and copied and mods and left_out and kept and setting_wins and checkout,
 		"a download keeps saves and server data in the user folder, brings an old install's over once, a setting still wins (%s, %s; copied %s, mods %s, left out %s, kept %s)" % [saves, data, copied, mods, left_out, kept])
+	_download_saves_in_checkout()
+
+
+## A checkout lists a download's saves (the user folder's) beside its own server/saves, loads one
+## as a copy, and uses that copy again while it is unchanged (the owner's world from a dev build
+## wasn't in the source build's list).
+func _download_saves_in_checkout() -> void:
+	var root := OS.get_user_data_dir().path_join("ui-test-download-saves")
+	_remove_tree(root)
+	var user := root.path_join("user")
+	var server := root.path_join("server-saves")
+	DirAccess.make_dir_recursive_absolute(user.path_join("saves"))
+	DirAccess.make_dir_recursive_absolute(server)
+	_write(user.path_join("saves/playtest.zip"), "the dev build's world")
+	_write(server.path_join("old.zip"), "x")
+	var was: Array = [Paths.keep_in_user_data, Paths.user_data_dir]
+	Paths.keep_in_user_data = false
+	Paths.user_data_dir = user
+	Settings.set_value("factorio", "saves", server)
+	var sources: Array = Saves.roots().map(func(r: Array) -> String: return str(r[0]))
+	var listed := Saves.list().filter(func(s: Dictionary) -> bool: return s["source"] == "zenith").map(func(s: Dictionary) -> String: return str(s["name"]))
+	var fe: Node = FrontEndScript.new()
+	fe._list_worlds()
+	var picked := -1
+	for i in fe._saves.size():
+		if fe._saves[i]["name"] == "playtest":
+			picked = i
+	var heading: String = fe._source_heading("zenith")
+	fe.free()
+	var first := Saves.copy_to_server(user.path_join("saves/playtest.zip"))
+	var again := Saves.copy_to_server(user.path_join("saves/playtest.zip"))
+	_write(server.path_join("playtest.zip"), "played on since")
+	var after_play := Saves.copy_to_server(user.path_join("saves/playtest.zip"))
+	var original := FileAccess.get_file_as_string(user.path_join("saves/playtest.zip")) == "the dev build's world"
+	# A download itself has no second list, and a checkout whose saves are the user folder's neither.
+	Settings.set_value("factorio", "saves", user.path_join("saves"))
+	var same_folder := Paths.download_saves_dir()
+	Paths.keep_in_user_data = true
+	var in_download := Paths.download_saves_dir()
+	Settings.reset_value("factorio", "saves")
+	Paths.keep_in_user_data = was[0]
+	Paths.user_data_dir = was[1]
+	_remove_tree(root)
+	check(sources.slice(0, 2) == ["server", "zenith"] and listed == ["playtest"] and picked >= 0 and heading.contains("copy")
+		and first == server.path_join("playtest.zip") and again == first and after_play == server.path_join("playtest (2).zip")
+		and original and same_folder == "" and in_download == "",
+		"a checkout lists a download's saves and loads one as a copy, used again while unchanged (%s, %s; %s, %s, %s)" % [sources, listed, first.get_file(), again.get_file(), after_play.get_file()])
 
 
 func _remove_tree(path: String) -> void:
@@ -8014,10 +12015,18 @@ func _play(hud: Hud, player: Node) -> void:
 	await get_tree().process_frame
 	check(screen.is_open() and ui.window.is_open(), "a chest's screen opens beside the inventory")
 	screen.slot_clicked.emit("chest", 1, "coal", 10, MOUSE_BUTTON_LEFT, false, false)
-	check(player.cursor_item == "coal" and ui.hand.get("role") == "chest" and not ui.can_build_from_hand(), "click picks up a chest stack")
+	# I7: Factorio's cursor owns a stack taken from a chest (it stays held when the window closes);
+	# the bridge's character has no cursor, so the stack moves into the first free inventory slot at
+	# once and is held from there.
+	mv = sent_one("move")
+	check(player.cursor_item == "coal" and ui.hand.get("role") == "main" and int(ui.hand.get("index", 0)) == 1
+		and ui.can_build_from_hand(), "click picks up a chest stack, held from the first free inventory slot as an inventory stack (I7): %s" % [ui.hand])
+	check(mv.get("from") == "chest" and mv.get("fi") == 1 and mv.get("to") == "main" and mv.get("ti") == 1 and int(mv.get("u", 0)) == 77,
+		"and moves it into that slot at once: %s" % [mv])
 	click_main(ui, 7)
 	mv = sent_one("move")
-	check(mv.get("from") == "chest" and mv.get("to") == "main" and mv.get("ti") == 7 and int(mv.get("u", 0)) == 77, "and moves it into the inventory slot")
+	check(mv.get("from") == "main" and mv.get("fi") == 1 and mv.get("to") == "main" and mv.get("ti") == 7 and player.cursor_item == "",
+		"a click on another inventory slot puts it down there: %s" % [mv])
 	click_main(ui, 2, MOUSE_BUTTON_LEFT, true)
 	var put := sent_one("xfer")
 	check(put.get("from") == "main" and put.get("fi") == 2 and put.get("k") == "stack" and int(put.get("u", 0)) == 77,
@@ -8084,12 +12093,14 @@ func _play(hud: Hud, player: Node) -> void:
 	# The furnace's fuel picked up: a machine stack in the cursor.
 	screen.slot_clicked.emit("fuel", 1, "coal", 2, MOUSE_BUTTON_LEFT, false, false)
 	await get_tree().process_frame
-	var held_fuel: bool = player.cursor_item == "coal" and not ui.hand.is_empty()
+	var held_fuel: bool = player.cursor_item == "coal" and ui.hand.get("role") == "main"
 	key(KEY_ESCAPE)
 	await get_tree().process_frame
 	check(not screen.is_open() and not ui.is_open() and sent_one("close").size() > 0, "Esc closes the machine and the window and tells the mod")
-	check(held_fuel and player.cursor_item == "" and ui.hand.is_empty(),
-		"a machine stack in the cursor is dropped when its screen closes (held: %s)" % held_fuel)
+	# I7: moved into a free inventory slot as it was picked up, it stays in the hand.
+	check(held_fuel and player.cursor_item == "coal" and ui.hand.get("role") == "main",
+		"a machine stack in the cursor stays held when its screen closes (I7; held from the inventory: %s)" % held_fuel)
+	ui.clear_cursor()
 	player.cursor_item = ""
 
 	# --- production windows laid out as Factorio's (production_panels.gd) ----------------------
@@ -8142,7 +12153,7 @@ func _play(hud: Hud, player: Node) -> void:
 		chooser_search.text = "inserter"
 		chooser_search.text_changed.emit("inserter")
 	await get_tree().process_frame
-	check(_find_slot_tip(screen, Kit.recipe_name("inserter")) != null and _find_slot_tip(screen, Kit.recipe_name("electronic-circuit")) == null,
+	check(_find_slot_tip(screen, Kit.recipe_name("inserter") + " (Recipe)") != null and _find_slot_tip(screen, Kit.recipe_name("electronic-circuit") + " (Recipe)") == null,
 		"typing filters the recipes across every group")
 	if chooser_search != null:
 		var esc := InputEventKey.new()
@@ -8151,7 +12162,7 @@ func _play(hud: Hud, player: Node) -> void:
 		esc.pressed = true
 		chooser_search.gui_input.emit(esc)
 	await get_tree().process_frame
-	check(chooser_search != null and chooser_search.text == "" and _find_slot_tip(screen, Kit.recipe_name("electronic-circuit")) != null,
+	check(chooser_search != null and chooser_search.text == "" and _find_slot_tip(screen, Kit.recipe_name("electronic-circuit") + " (Recipe)") != null,
 		"Esc clears the search")
 	if chooser_search != null:
 		chooser_search.release_focus()
@@ -8159,7 +12170,7 @@ func _play(hud: Hud, player: Node) -> void:
 	if not uncommon.is_empty():
 		(uncommon[0] as Button).pressed.emit()
 	await get_tree().process_frame
-	var gear_slot := _find_slot_tip(screen, Kit.recipe_name("iron-gear-wheel"))
+	var gear_slot := _find_slot_tip(screen, Kit.recipe_name("iron-gear-wheel") + " (Recipe)")
 	if gear_slot != null:
 		gear_slot.clicked.emit(MOUSE_BUTTON_LEFT, false)
 	var sr := sent_one("set_recipe")
@@ -8800,6 +12811,8 @@ func _parity(hud: Hud, player: Node) -> void:
 	Settings.bind_slot("ui_test_binding", 1, ctrl_shift_v)
 	var test_keys := Settings.keys_for("ui_test_binding")
 	Settings.bind("ui_test_binding", [])
+	# Gone again, or _help (run after) finds a bound control the help doesn't name.
+	Settings.remove_action("ui_test_binding")
 	check(test_keys == [KEY_F12, ctrl_shift_v], "a binding with modifiers survives being saved as text: %s" % [test_keys])
 	check(ControlsInfo.name_of("drop_item") == "Drop item" and ControlsInfo.group_of("quickbar_page_3") == "Quickbar"
 		and ControlsInfo.name_of("give_blueprint") == "Blueprint",
@@ -8904,9 +12917,14 @@ func _parity(hud: Hud, player: Node) -> void:
 	m.handle({"t": "rs", "cur": "automation", "pr": 500, "q": []})
 	check(ui.research_hud.visible and _texts(ui.research_hud).size() > 0, "the research in progress shows (top right, in the side menu)")
 	ui.set_alt_mode(true)
-	check(sent_one("alt").is_empty() and ui.alt_overlay.on, "Alt-mode on asks the mod for nothing (the icons come with the records, #9)")
+	var alt_turn: int = Bridge.alt_contents
+	check(sent_one("alt").is_empty() and ui.alt_overlay.on and alt_turn > 0,
+		"Alt-mode on asks the mod for no icons (they come with the records, #9), only the chests' contents (altc, J6)")
 	ui.set_alt_mode(false)
-	check(not ui.alt_overlay.on, "and goes off")
+	ui.set_alt_mode(true)
+	check(Bridge.alt_contents > alt_turn, "J6: each turning on of Alt-mode is a new one for the chests' contents")
+	ui.set_alt_mode(false)
+	check(not ui.alt_overlay.on and Bridge.alt_contents == 0, "and goes off")
 	# Settings > Interface > Alt-mode switches it in the game too (it only saved the setting before).
 	Settings.set_value("interface", "alt_mode", true)
 	check(ui.alt_mode and ui.alt_overlay.on, "the Alt-mode setting turns Alt-mode on in the game")
@@ -8937,7 +12955,9 @@ func _parity(hud: Hud, player: Node) -> void:
 	crafting.search.text = ""
 	crafting.search.release_focus()
 	crafting._fill_grid()
-	check(_texts(ui.window._logistics).size() >= 1, "the Logistics part shows something (its switches and sections)")
+	ui.model.char_logistics = true  # researched (a `clog` came)
+	ui.window.show_tab("Logistics")
+	check(_texts(ui.window._logistics).size() >= 1, "the Logistics tab shows something (its switches and sections)")
 	ui.window.show_tab("Crafting")
 	ui.close_all()
 	await get_tree().process_frame
@@ -9305,6 +13325,11 @@ func _input_rules(hud: Hud, player: Node, screen: MachineScreen) -> void:
 	check(ui.pick_from_inventory("transport-belt") and ui.hand.get("index") == 3 and ui.hand_count() == 100,
 		"pipette: the biggest stack of the item, with its hand (2.1.23 takes a full stack)")
 	ui.clear_cursor()
+	# A full inventory: the chest's stack stays in the chest while held (with a free slot it would
+	# move into the inventory at once, I7, _play).
+	m.handle({"t": "slots", "l": {"main": [["iron-plate", 5], ["transport-belt", 30], ["transport-belt", 100], ["coal", 50],
+		["coal", 50], ["coal", 50], ["coal", 50], ["coal", 50], ["coal", 50], ["coal", 50]]}})
+	await get_tree().process_frame
 	screen.unit = 78
 	screen.handle({"t": "gui", "u": 78, "p": 0, "kind": "container", "inv": {"chest": [["coal", 10]]},
 		"slots": {"chest": [["coal", 10], 0, 0, 0]}, "status": "working"})
@@ -9828,12 +13853,16 @@ func _layout(hud: Hud) -> void:
 					% [where, hud.help.size, hud.help.get_theme_font_size("normal_font_size")])
 			var screen := Rect2(Vector2.ZERO, view)
 			var names: Array = rects.keys()
+			# Half a pixel in from each edge, never below nothing: a piece under a pixel wide grew
+			# a negative size, an engine error each time (87 a run).
+			var inner := func(r: Rect2) -> Rect2:
+				return Rect2(r.position + Vector2(0.5, 0.5), (r.size - Vector2.ONE).max(Vector2.ZERO))
 			for i in names.size():
 				var a: Rect2 = rects[names[i]]
-				check(screen.encloses(a.grow(-0.5)), "%s: %s %s on screen (%s)" % [where, names[i], a, view])
+				check(screen.encloses(inner.call(a)), "%s: %s %s on screen (%s)" % [where, names[i], a, view])
 				for j in range(i + 1, names.size()):
 					var b: Rect2 = rects[names[j]]
-					check(not a.grow(-0.5).intersects(b.grow(-0.5)), "%s: %s %s and %s %s apart" % [where, names[i], a, names[j], b])
+					check(not inner.call(a).intersects(inner.call(b)), "%s: %s %s and %s %s apart" % [where, names[i], a, names[j], b])
 			# F2: on a platform its panel sits right under the minimap, against the right edge, or
 			# beside it when the shortcut bar would have no room.
 			var side: Rect2 = ui.side_menu.get_global_rect()
@@ -9867,6 +13896,51 @@ func _layout(hud: Hud) -> void:
 		"the help (F1) names the keys bound now: %s, J once rebound, back after reset" % drop_was)
 	Settings.set_value("interface", "show_help", had_help)
 	ui.debug_overlay = false
+
+
+## The map view's title, the Remote view frame's caption, was half under the Show in Factorio button,
+## which stood at the top left over the title bar (found testing with the owner's settings): in the
+## remote view the button goes under the title bar, and the Surfaces panel and the logistic networks'
+## frames under the button, at every window size and UI scale (the root's size stands in for the scale,
+## as in _layout); outside the remote view it stays in the corner. Fails on the old layout.
+func _map_title(hud: Hud) -> void:
+	var ui = hud.ui
+	var root: Control = hud.get_child(0)
+	ui.close_all()
+	var show_was: Callable = ui.show_factorio
+	ui.show_factorio = func() -> void: pass
+	ui.model.handle({"t": "surfs", "l": [[1, "nauvis", "nauvis", "", 0], [3, "vulcanus", "vulcanus", "", 0], [5, "platform-1", "", "Orbiter", 1]]})
+	ui.open_map(true)
+	root.anchor_right = 0.0
+	root.anchor_bottom = 0.0
+	var button: Button = ui.factorio_button
+	var frame = ui.remote_frame
+	var inner := func(r: Rect2) -> Rect2:
+		return Rect2(r.position + Vector2(0.5, 0.5), (r.size - Vector2.ONE).max(Vector2.ZERO))
+	for window in [Vector2(1280, 720), Vector2(1600, 900), Vector2(1920, 1080), Vector2(2560, 1440)]:
+		for ui_scale in [0.75, Kit.scale_for(window.y), 1.5, 2.0]:
+			var view: Vector2 = (window / (ui_scale / Kit.scale)).floor()
+			root.size = view
+			for i in 3:
+				await get_tree().process_frame
+			var where := "%dx%d at %d%%" % [window.x, window.y, roundi(ui_scale * 100.0)]
+			var b: Rect2 = button.get_global_rect()
+			var title: Rect2 = frame.title_label.get_global_rect()
+			var bar: Rect2 = frame.title_bar.get_global_rect()
+			var surfaces: Rect2 = ui.map_view.surfaces_panel.get_global_rect()
+			var row_top: float = ui.networks._frames_row.global_position.y
+			check(button.visible and frame.visible and ui.map_view.surfaces_panel.visible
+				and not inner.call(b).intersects(inner.call(title)) and not inner.call(b).intersects(inner.call(bar))
+				and not inner.call(b).intersects(inner.call(surfaces)) and row_top >= b.end.y and b.position.x >= 0.0,
+				"%s: the map view's title %s and its bar %s clear of the Show in Factorio button %s, the Surfaces panel %s and the networks' frames (%.0f) under it (shown: %s %s %s)"
+				% [where, title, bar, b, surfaces, row_top, button.visible, frame.visible, ui.map_view.surfaces_panel.visible])
+	ui.open_map(false)
+	await get_tree().process_frame
+	await get_tree().process_frame
+	check(button.position.is_equal_approx(Kit.pxv(8, 8)) and not frame.visible, "out of the remote view the button is back in the corner")
+	root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	ui.show_factorio = show_was
+	await get_tree().process_frame
 
 
 ## F1's help (hud.gd): every control bound now is in it under its key; an add-on's controls under the
@@ -10206,7 +14280,7 @@ func _space(hud: Hud, player: Node) -> void:
 			uncommon = b
 	if uncommon != null:
 		uncommon.pressed.emit()
-	var belt_recipe := _find_slot_tip(screen, "Transport belt")
+	var belt_recipe := _find_slot_tip(screen, "Transport belt (Recipe)")
 	if belt_recipe != null:
 		belt_recipe.clicked.emit(MOUSE_BUTTON_LEFT, false)
 	var sr := sent_one("set_recipe")
@@ -10866,6 +14940,31 @@ func _icons(hud: Hud) -> void:
 	GroundHeightT.clear()
 	check(overlay.drawn == 2 and absf((hill_icon.position.y - flat_icon.position.y) / lifted - 1.0) < 0.2 and lifted < -5.0,
 		"Alt-mode icons rise with the hill under their building: %.1f px (the hill: %.1f)" % [hill_icon.position.y - flat_icon.position.y, lifted])
+	# J6: a chest's contents (`ac`) over it, smaller than a machine's icon (0.7, its prototype's
+	# icon_draw_specification); a machine with an icon of its own keeps that; an answer to another
+	# turning on of Alt-mode is dropped, and nothing is drawn once it is off.
+	w3.protos.add_entities([[9, "wooden-chest", "container", -0.35, -0.35, 0.35, 0.35, 150, 120, 80, 1, 1]])
+	w3._add([952, 9, 8 * 256 + 128, 5 * 256 + 128, 0])
+	var turns_before: int = Bridge.alt_contents
+	Bridge.set_alt_contents(true)
+	w3.handle({"t": "ac", "g": Bridge.alt_contents, "l": [[952, "stone"], [950, "wood"]]})
+	w3.handle({"t": "ac", "g": Bridge.alt_contents + 7, "l": [[952, "copper-plate"]]})
+	overlay.collect()
+	var chest_tiles: float = AltOverlay._tiles_for(w3, w3.entities[952])
+	var machine_tiles: float = AltOverlay._tiles_for(w3, w3.entities[950])
+	check(overlay.drawn == 3 and w3.alt_contents_now().get(952) == ["stone"] and overlay._icons.has(Kit.item_icon("stone"))
+		and not overlay._icons.has(Kit.item_icon("wood")) and is_equal_approx(chest_tiles, 0.84) and is_equal_approx(machine_tiles, 1.2),
+		"J6: a chest shows what it holds (ac) at a chest's icon size, a machine keeps its own icon: %d drawn, %.2f / %.2f tiles" % [overlay.drawn, chest_tiles, machine_tiles])
+	w3.handle({"t": "ac", "g": Bridge.alt_contents, "l": [[952]]})
+	overlay.collect()
+	var cleared := overlay.drawn
+	w3.handle({"t": "ac", "g": Bridge.alt_contents, "l": [[952, "coal", ["stone", "wood"]]]})
+	Bridge.set_alt_contents(false)
+	overlay.collect()
+	check(cleared == 2 and overlay.drawn == 2 and w3.alt_contents_now().is_empty(),
+		"J6: [unit] clears a chest's icons, and Alt-mode off draws none: %d %d" % [cleared, overlay.drawn])
+	if turns_before > 0:
+		Bridge.set_alt_contents(true)
 	overlay.on = false
 	overlay._process(0.0)
 	check(overlay._quads.all(func(q): return not q.visible), "and none are left in the world once Alt-mode is off")
@@ -11267,7 +15366,15 @@ func _icons(hud: Hud) -> void:
 		_bs_feed(far_items, 901 + f, {"fx": int(-40.0 * 256), "fy": int(55.0 * 256), "fr": 24}, 1)
 	var far_mmi: MultiMeshInstance3D = far_items._cards._kinds.get(1)
 	var far_ok := far_mmi != null and far_mmi.multimesh.visible_instance_count == 40
-	if far_ok:
+	if BeltItemsScript.Job.park_lat:
+		# (--belt-draw-park-lattice: the ten full lanes' items are parked and the lattice draws them, at the
+		# map's phase rather than where each was sent.)
+		var on_line := 0
+		for e in far_items.drawn_lattice(1):
+			if e != null and e[0].y > belt_top and absf(e[0].z - 56.5) < 0.01:
+				on_line += 1
+		far_ok = on_line == 40
+	elif far_ok:
 		var fb: Array = far_items.drawn(1)
 		far_ok = fb.size() == 40
 		var found := 0
@@ -11483,8 +15590,8 @@ func _icons(hud: Hud) -> void:
 	gs.reload()
 	var rig_node: Node3D = gs.new()
 	rig_node.target = follow
+	add_child(rig_node)  # first: a global position out of the tree is an error
 	rig_node.global_position = Vector3(0, 60, 0)  # the camera far from the character
-	add_child(rig_node)
 	decor.rig = rig_node
 	for c in [Vector2i(15, 15), Vector2i(19, 15), Vector2i(20, 15), Vector2i(22, 15), Vector2i(0, 0)]:
 		var n := Node3D.new()
@@ -11899,6 +16006,75 @@ func _icons(hud: Hud) -> void:
 	me.set_night(0.9)
 	check(off and me._flashlight.visible and me._flashlight.light_energy > 1.0 and me._flashlight.rotation.x < 0.0,
 		"the character's flashlight lights the ground ahead, from darkness 0.3 as in Factorio (B4)")
+	# Owner: "seems to be no flashlight" (V27). Factorio's is a light picture drawn over the world
+	# (light-cone.png, 25 tiles long, its middle 13 ahead), which no building stops: the beam is that
+	# picture projected from high over the character, nothing casting its shadow, and the ground gets
+	# the picture's own fade, from a tile ahead to its far end. Fails on 0.2.1's shadowed spot.
+	Avatar._beam_texture = null
+	var built_at := Time.get_ticks_usec()
+	Avatar.beam_texture()
+	var built_ms := (Time.get_ticks_usec() - built_at) / 1000.0
+	var cone_image: Image = Avatar.cone_picture()
+	var cone_data := cone_image.get_data()
+	var cone_side := cone_image.get_width()
+	var beam_off := 0.0
+	var beam_most := 0.0
+	for f in range(2, 23):
+		var lit: float = Avatar.beam_light_at(Vector3(0.0, 0.0, -f)) / Avatar.BEAM_PEAK
+		beam_off = maxf(beam_off, absf(lit - Avatar.cone_at(cone_data, cone_side, f, 0.0)))
+		beam_most = maxf(beam_most, lit)
+	check(me._flashlight.light_projector != null and me._flashlight.shadow_caster_mask == 0 and me._flashlight.shadow_enabled
+		and beam_off < 0.08 and beam_most > 0.85,
+		"the flashlight lands Factorio's cone on the ground, its fade within %.3f of light-cone.png's from 2 to 22 tiles ahead (brightest %.2f), no shadow casters (picture made in %.1f ms)"
+		% [beam_off, beam_most, built_ms])
+	var mid10: float = Avatar.beam_light_at(Vector3(0.0, 0.0, -10.0))
+	var side10: float = Avatar.beam_light_at(Vector3(2.0, 0.0, -10.0))
+	var out10: float = Avatar.beam_light_at(Vector3(-7.0, 0.0, -10.0))
+	var past: float = Avatar.beam_light_at(Vector3(0.0, 0.0, -27.0))
+	var behind: float = Avatar.beam_light_at(Vector3(0.0, 0.0, 3.0))
+	check(side10 > 0.5 * mid10 and out10 < 0.03 * Avatar.BEAM_PEAK and past < 0.03 * Avatar.BEAM_PEAK and behind == 0.0,
+		"its sides 25 degrees off the middle, nothing past 25 tiles or behind (10 ahead: %.2f, 2 across %.2f, 7 across %.3f; 27 ahead %.3f)" % [mid10, side10, out10, past])
+	var front: float = Avatar.beam_light_at(Vector3(0.0, 1.5, -12.0), Vector3.BACK)
+	var self_lit := 0.0
+	for h in [0.3, 0.9, 1.5, 2.0]:
+		for z in [-0.4, 0.0, 0.4]:
+			self_lit = maxf(self_lit, Avatar.beam_light_at(Vector3(0.0, h, z), Vector3(0.0, 0.5, -0.86).normalized()))
+	check(front > 0.3 * Avatar.BEAM_PEAK and self_lit < 0.01,
+		"a building's front 12 tiles ahead is lit (%.2f), the character itself isn't (%.3f)" % [front, self_lit])
+	# --flashlight=old: 0.2.1's spot, 3 tiles up, 14 degrees down, the buildings casting its shadows.
+	var mode_was: String = Avatar.flashlight_mode
+	Avatar.flashlight_mode = "old"
+	var old_me := Avatar.new()
+	add_child(old_me)
+	var beam_down := -old_me._flashlight.rotation.x
+	var beam_reach := old_me._flashlight.position.y / tan(beam_down)
+	check(beam_down >= deg_to_rad(12.0) and beam_reach > 8.0 and beam_reach < 16.0 and old_me._flashlight.spot_range > beam_reach * 1.5
+		and old_me._flashlight.light_projector == null and (1 & old_me._flashlight.shadow_caster_mask) != 0,
+		"--flashlight=old: the shadowed spot's beam meets the ground 8 to 16 tiles ahead (%.1f)" % beam_reach)
+	old_me.queue_free()
+	Avatar.flashlight_mode = mode_was
+	# K3: in first person the flashlight turns to where the camera (the crosshair) looks while the body
+	# faces elsewhere; out of first person it faces with the body.
+	var cam_was := get_viewport().get_camera_3d()
+	var aim_cam := Camera3D.new()
+	add_child(aim_cam)
+	aim_cam.make_current()
+	aim_cam.global_transform = Transform3D(Basis(Vector3.UP, deg_to_rad(-90.0)) * Basis(Vector3.RIGHT, deg_to_rad(-20.0)), Vector3(0.0, 1.6, 0.0))
+	me.rotation.y = 0.0
+	me.set_first_person(true)
+	me._aim_flashlight()
+	var beam_dir := -me._flashlight.global_transform.basis.z
+	var cam_dir := -aim_cam.global_transform.basis.z
+	var fp_off := absf(wrapf(atan2(-beam_dir.x, -beam_dir.z) - atan2(-cam_dir.x, -cam_dir.z), -PI, PI))
+	me.set_first_person(false)
+	me._aim_flashlight()
+	var body_dir := -me._flashlight.global_transform.basis.z
+	var body_off := absf(wrapf(atan2(-body_dir.x, -body_dir.z) - me.rotation.y, -PI, PI))
+	aim_cam.queue_free()
+	if cam_was != null:
+		cam_was.make_current()
+	check(fp_off < 0.01 and body_off < 0.01 and absf(atan2(-cam_dir.x, -cam_dir.z)) > 1.0,
+		"K3: in first person the flashlight turns where the crosshair looks (%.3f off), else with the body (%.3f off)" % [fp_off, body_off])
 	# F7: the character's own body and tools cast no shadow from its lights (its head and arms
 	# crossed the flashlight while running), and the facing, which the flashlight follows, keeps an
 	# angled walk's line through a message without the angle and on stopping.
@@ -11910,6 +16086,9 @@ func _icons(hud: Hud) -> void:
 			self_shadow = true
 	check(self_meshes > 0 and not self_shadow and me._flashlight.shadow_enabled,
 		"the character's lights cast no shadows of the character itself (F7): %d meshes" % self_meshes)
+	check((ItemCardsScript.BELT_LAYER & me._flashlight.shadow_caster_mask) == 0 and (ItemCardsScript.BELT_LAYER & me._lantern.shadow_caster_mask) == 0
+		and (1 & me._lantern.shadow_caster_mask) != 0,
+		"nor of the items on belts (their own layer); buildings still cast the lantern's")
 	var line_yaw := -56 / 1000.0 * TAU
 	var yaws: Array[float] = []
 	for msg in [{"k": 2, "d": 0, "w": 1, "a": 56}, {"k": 4, "d": 2, "w": 1}, {"k": 6, "d": 0, "w": 1, "a": 56},

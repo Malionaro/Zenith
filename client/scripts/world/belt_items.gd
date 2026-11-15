@@ -45,12 +45,14 @@ const ProtoDB := preload("res://scripts/world/protos.gd")
 const ItemCards := preload("res://scripts/world/item_cards.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const GameClock := preload("res://scripts/world/game_clock.gd")
+const InserterArms := preload("res://scripts/world/inserter_arms.gd")
 const MomentHold := preload("res://scripts/world/moment_hold.gd")
 const BeltPaths := preload("res://scripts/world/belt_paths.gd")
 const BeltRecords := preload("res://scripts/world/belt_records.gd")
 const BeltSim := preload("res://scripts/world/belt_sim.gd")
 const ViewPriority := preload("res://scripts/world/view_priority.gd")
 const BeltLattice := preload("res://scripts/world/belt_lattice.gd")
+const Probing := preload("res://scripts/debug/probing.gd")
 
 ## The C++ simulation's class (the same API as belt_sim.gd), used when its extension is loaded.
 const NATIVE_SIM := "BeltSimNative"
@@ -72,6 +74,10 @@ const LAYERS := 4
 const DRAW_MARGIN := 2.0
 const JOB_MARGIN_MAX := 30.0
 static var margin_jobs := 1.5
+## --inserter-handoff-margin=N (0): with the hand-off, the drawn clock is held N jobs' ticks further behind
+## the game, so the job that learns of a take (its event comes a tick or two after it) is drawn before the
+## take's tick and the item leaves the belt as the hand closes, not a job later.
+static var handoff_margin := 0.0
 ## --belt-draw-margin=N: the most ticks the drawn clock is held behind the game's for the jobs (the
 ## margin grows to 1.5 jobs' ticks). 30 as before: a job longer than 20 ticks (a third of a second
 ## at 60 UPS; -62,-26's take about a second) then ends past the drawn clock, and its records are
@@ -85,11 +91,12 @@ static var margin_max := 120.0
 ## about twice its own time late, the next stepped more ticks, and the drawn clock sat 120 ticks behind.
 static var job_high := true
 ## Tiles from the camera to the items' square within which item models cast shadows, by Settings >
-## Graphics > Shadows (sun_shadows.gd QUALITY "items": Low 30, Medium 45, High 60, Ultra 80). It was a
-## fixed 16, so items lost their shadows a step out from the closest zoom; now they keep them from the
-## default zoom (about 30) to about twice it. Past that an item's shadow is a pixel or two and every
-## item's triangles go through the shadow pass for it.
-static var shadows_within := 60.0
+## Graphics > Shadows (sun_shadows.gd QUALITY "items": Low 0, Medium 30, High 45, Ultra 60). It was a
+## fixed 16, so items lost their shadows a step out from the closest zoom; now they keep them at the
+## default zoom (about 30) from Medium up, a little further on High and Ultra. Past that an item's
+## shadow is a pixel or two and every item's triangles go through the shadow pass for it (up to 20,500
+## items of about 46 triangles; 0.2.0's 30/45/60/80 had every 3D item cast at the default zoom on Low).
+static var shadows_within := 45.0
 ## Lanes are known this far past the square (an item's line can lead out of it).
 const INDEX_MARGIN := 14.0
 ## The paths' texture: this many points a row, rows a power of two, at most MAX_ROWS (the code in a
@@ -101,6 +108,8 @@ const SPACING := 0.15
 const MAX_POINTS := 64
 ## An item kept outside the square for its chunk's far icons goes after this many jobs anyway.
 const KEEP_UPDATES := 40
+## (removed_now) A removed belt's lanes are passed over in the bridge's updates this long after (or until its `dl`).
+const REMOVED_KEEP_MSEC := 10000
 ## Items in 3D's cap is worked out again when the square moves, else every this many jobs (a job a frame).
 const CAP_EVERY := 30
 const MAX_STACK := 4
@@ -120,6 +129,19 @@ const MIN_PACE := 0.25
 const HOLD_USEC := 400000
 ## A lane whose drift check failed is asked for again (`bre`) at most this often (ms).
 const ASK_AGAIN_MSEC := 3000
+## (--belt-sim-ask=view) A lane the lattice draws whose count is wrong, at most this often (front, back and
+## ids drifting on a full lane are what the lattice ignores: never for those alone); one out of the planned
+## view this often at first, doubling to ASK_OUT_MAX_MSEC while it keeps failing.
+const ASK_LATTICE_MSEC := 30000
+const ASK_OUT_MSEC := 12000
+const ASK_OUT_MAX_MSEC := 60000
+## A tick (or msec) no clock reaches.
+const NEVER := 1 << 62
+## (park_lat) How far lattice lanes go on past a ring of them (no end ahead).
+const LAT_FAR := 1 << 40
+## The counters that walk every slot and item (slots in use, those the lattice's mask hides, parked items
+## by why) are taken every this many jobs.
+const GAUGE_EVERY := 16
 ## The simulation is stepped this many ticks past where the drawn clock will be (when the updates
 ## reach that far): a record is written from the motion the simulation has worked out, and an item's
 ## motion over a tick is only known once that tick is stepped (a lane read, an item put on or moved
@@ -134,6 +156,27 @@ const AHEAD := 24
 const VIEW_MARGIN := 4.0
 const VIEW_KEEP := 10.0
 const VIEW_FAR := 160.0
+## --belt-draw-view-ground=off: the view is cut VIEW_FAR along each corner ray, as before. On (the
+## default): each ray is followed to the ground however far it goes (up to VIEW_GROUND_FAR) and the view
+## is cut to the simulated square instead (no simulated item lies outside it). Zoomed out over -62,-26
+## (camera 140 tiles out at 40 degrees) the view cut at 160 tiles ended 31 tiles north of the character
+## while the screen showed 112. The belts in between are inside the square, where lane icons are left
+## out, so they were drawn empty: the mid-range gap, 6.25% of the game's items on screen within the
+## 128-tile belt distance (12.4% at 64-96 tiles, 46% at 96-128), 0.09% with it on.
+static var view_ground := true
+const VIEW_GROUND_FAR := 4000.0
+## --belt-draw-view-lead=on: the job's view stretched ahead of the camera's own motion as far as it goes in two
+## jobs' time (the job, and its result's time on screen), VIEW_LEAD_MAX tiles at most. Off (the default): the
+## camera's ground view as the job starts, as before. Walking close up at -62,-26 (the camera 12 tiles out, the
+## character running some 30 tiles a second, jobs of 0.1-1.3 s) the screen's leading edge ran past the records
+## planned for it in two runs of three: 1.65% and 2.37% of the game's items on screen had neither an item nor an
+## icon (5.6% of those 32-64 tiles out), 0.02% in the third; on, 0.12% and 0.04%. But on, 14-22% more records
+## a job and more counted jumps (32 -> 58, 30 -> 49 a second): left off until the gap is caught again.
+static var view_lead := false
+const VIEW_LEAD_MAX := 48.0
+var _lead_pos := Vector2.ZERO
+var _lead_usec := 0
+var _lead_vel := Vector2.ZERO
 ## Ticks a job may step at most: further behind, the simulation jumps ahead and every lane is asked
 ## for again (Job.run()).
 const MAX_BEHIND := 180
@@ -180,6 +223,19 @@ class Item:
 	var kept := 0
 	## (view) Out of the camera's view: its motion is kept, but it has no slot and no record.
 	var parked := false
+	## (park_lat) Parked because its motion lies on lanes the lattice draws, all along.
+	var lat := false
+	## (later_tick) Changes of it wait (State.waiting); ver changes whenever anything Job._apply_early reads
+	## of it may have.
+	var waits := false
+	var ver := 0
+	## (--inserter-handoff) The tick an inserter's hand took it (its record's texel 3 w: the shader hides it
+	## from then, exactly as the hand closes; it goes from the records in the job whose drawn tick is past
+	## it, as any item gone), -1 none.
+	var hide_at := -1.0
+	## (--inserter-handoff) The tick a hand put it on its belt: made at once (the job before), its record's
+	## texel 3 w (negative) keeps it hidden till then, so it shows as the hand lets go, not a job later.
+	var show_at := -1.0
 
 
 ## A pile's copy: the k'th above its item, in a slot of its own; its record points at the item's.
@@ -188,6 +244,15 @@ class Layer:
 	var k := 1
 	var slot := -1
 	var stamp := 0
+
+
+## (later_tick) One item's waiting changes in order (from `head`), and when the first was last tried early.
+class Waiting:
+	var q: Array = []
+	var head := 0
+	var tried := -2  # the item's ver at the first's last failed try (-1: no item then; -2: not tried)
+	var retry_at := NEVER  # (a start waiting for the item's t0) tried again once the drawn tick is there
+	var filed := -NEVER  # the tick it was last filed under in State.due
 
 
 class Kind:
@@ -229,10 +294,47 @@ class State:
 	## What happened after the drawn tick, for the next job, in order: changes [0, uid, tick, item,
 	## stack, key, pos, speed, reach, run] and items gone [1, uid, tick].
 	var later: Array = []
+	## (later_tick, --belt-draw-later-tick) The same kept by item (uid -> Waiting) and by tick (tick -> uids
+	## whose first waiting change takes effect, or is tried again, then): a job takes only the items filed up
+	## to the drawn tick, those whose item changed since their first was tried (retry: uids), or every one when
+	## the lanes' links may have moved; the list walked every waiting change every job (half the worker's time
+	## at the owner's base, with about 35,000 waiting).
+	var waiting := {}
+	var due := {}
+	var retry: Array = []
+	var ver_seq := 0
+	var later_n := 0
+	var lanes_moved := true  # a lane's meta changed, or one was dropped, since the last job
+	var links_seen := -1
+	## Lanes the lattice draws (its update's lanes added and removed), and for each how far lattice lanes go
+	## on past its exit (1/256): an item whose motion ends within that is hidden by the mask all along
+	## (park_lat parks it; the counters count it). lat_items: items parked for it.
+	var lat := {}
+	var lat_ahead := {}
+	var lat_ahead_dirty := false
+	var lat_items := {}
+	## (ask view) Lattice lanes whose checks failed in places or ids alone since last asked (asked the moment
+	## they leave the lattice); out-of-view lanes' intervals now (ms).
+	var lat_pend := {}
+	var out_every := {}
+	var jobs_n := 0
+	var gauges := [0, 0, 0, 0]  # slots in use, of them on lattice lanes all along, parked out of view, for the lattice
 	var kept := {}  # Item -> chunk: kept standing for its chunk's far icons
 	var held_chunks := {}
 	var asked := {}  # lane key -> msec it was last asked for
 	var last_read := {}  # lane key -> its last read's items (`sl`; for `sh`)
+	## (replace_at) [tick, lane key]: lanes the bridge dropped (`dl`) in the update that brought a lane of the same
+	## place (`lm`, read on that tick): dropped when the simulation reaches that tick, as the new one takes over.
+	var drop_at: Array = []
+	## (removed_now) Lanes of belts Zenith took away -> msec: the bridge's reads and checks of them still on their
+	## way are passed over (they would put the items back till its `dl`), until that `dl` or REMOVED_KEEP_MSEC.
+	var removed_keys := {}
+	## (--inserter-handoff) The `ie` records handled (each comes a few times): "kind:unit:tick:a" -> tick;
+	## and each hand's count as its last record said (a take's size: what a pick added).
+	var ie_seen := {}
+	var ie_swept := 0
+	var hand_count := {}
+	var peeks := {}  # Vector2i(inserter, tick) -> PackedInt64Array: the uids its take was guessed to take (Job.peek_u)
 	var debug_msec := 0
 	var skipped_at := -1000000000
 	var capped_square := Vector3(0.0, 0.0, -2.0)
@@ -270,9 +372,15 @@ class State:
 		if draw_native and not (sim is BeltSim) and ClassDB.class_exists(NATIVE_DRAW):
 			draw = ClassDB.instantiate(NATIVE_DRAW)
 			draw.set_sim(sim)
+			if draw.has_method("set_small_pages"):
+				draw.set_small_pages(BeltRecords.small)
 		if lattice_native and not (sim is BeltSim) and ClassDB.class_exists(NATIVE_LATTICE):
 			lattice = ClassDB.instantiate(NATIVE_LATTICE)
 			lattice.set_sim(sim)
+			if lattice.has_method("set_small_pages"):
+				lattice.set_small_pages(BeltRecords.small)
+			if lattice.has_method("set_item_turns"):
+				lattice.set_item_turns(BeltLattice.item_turns)
 		# A lane leading nowhere loaded stops its items at its end: at the square's edge the game's are
 		# often backed up behind what is outside (a lane that doesn't change is never sent again, and
 		# running off would drain it and everything behind it); the bridge sends an edge lane again
@@ -286,8 +394,25 @@ class State:
 		sim.read_forward = Job.read_forward
 		sim.shift_keep = Job.shift_keep
 		sim.read_skip_same = Job.read_skip_same
+		sim.take_first = Job.take_first
+		# (set(): a library built before the switch has no such property and runs as before.)
+		sim.set("take_line", Job.take_line)
+		sim.set("take_edge", Job.take_edge)
+		sim.set("ug_guard", Job.ug_guard)
 		sim.hold_inputs = Job.hold
 		sim.split_wake = Job.split_wake
+		sim.set("dead_walls", Job.dead_walls)
+
+	## The waiting changes, each item's in its order (tests: the list, or later_tick's by item; an item's
+	## own order is all that counts).
+	func later_entries() -> Array:
+		if waiting.is_empty():
+			return later
+		var out: Array = []
+		for uid in waiting:
+			var w: Waiting = waiting[uid]
+			out.append_array(w.q.slice(w.head))
+		return out
 
 
 ## One job: the messages queued since the last, applied on a worker thread.
@@ -362,6 +487,9 @@ class Job:
 	## a run starting between jobs stood then jumped. The simulation is stepped AHEAD ticks past the drawn
 	## tick (never past the newest update) so such changes are known in time.
 	static var early := true
+	## --inserter-handoff-slack=N (3): with the hand-off, the simulation is stepped at most to N ticks short
+	## of the newest update (never short of the drawn tick), so the hands' events for those ticks are in.
+	static var handoff_slack := 3
 	static var gone_order := true
 	static var lead_on := true
 	## Reads applied as of their tick (--belt-sim-read-apply=off: as before): a lane's meta takes effect
@@ -382,10 +510,33 @@ class Job:
 	## skipped (BeltSim.read_skip_same); at -62,-26 half the bridge's reads were such, and applying reads was
 	## 80% of the simulation's time.
 	static var read_skip_same := true
+	## --belt-sim-take-first=off: an inserter's take (`ie`) and the read of its lane on the same tick (or a tick or
+	## two before the pick's stamp) are applied in the order they came, as before: the read first pushed the
+	## taken item back to the start of the belt, and the items behind it (K9). On (the default): the read makes
+	## the take first (BeltSim.take_first).
+	static var take_first := true
+	## --belt-sim-take-line=off: as before, an inserter's take on the tick the bridge read the lanes round it came
+	## after those reads, found its belt read and the item moved a step onto the next belt, and did nothing: the
+	## taken item stayed and long runs then jumped a quarter tile with every read until they agreed again
+	## (K19). On (the default): a tick's takes before its reads, of the item the belt's next read hasn't
+	## (BeltSim.take_line).
+	static var take_line := true
+	## --belt-sim-take-edge=off: a take looks for its item only on its belt's own lanes, as before: one made
+	## late at the belt's front edge found nothing (the item had run on onto the next belt) and the next lane's
+	## read put it back at that lane's entry, a phantom. On (the default): past the front edge too, as far as
+	## the lanes ran since the take (BeltSim.take_edge).
+	static var take_edge := true
+	## --belt-sim-ug-guard=off: an underground's hidden lane with no next from the bridge links by geometry like a
+	## belt, side-loading onto a belt beside its exit (BeltSim.ug_guard), as before.
+	static var ug_guard := true
 	## --belt-sim-hold=off: the bridge's `sh` (splitter inputs that stood as their last read left them)
 	## ignored. On: such a lane is put back as that read had it and its items don't cross into the
 	## outputs until its next read (BeltSim.hold_input).
 	static var hold := true
+	## --belt-sim-dead-walls=on: a lane leading nowhere in the simulation that the bridge didn't say leads out
+	## is walled by two reads finding its front where it was, as a lane leading out (BeltSim.dead_walls). Off
+	## (the default): its front runs to its end, as before.
+	static var dead_walls := false
 	## --belt-sim-split-wake=off: splitters let items through whenever the belt rules say (BeltSim.split_wake).
 	static var split_wake := true
 	## --belt-sim-ask-unknown=off: a lane read (`sl`) or checked (`pc`) whose meta (`lm`) never came is left
@@ -393,6 +544,17 @@ class Job:
 	## answers with its meta. The bridge sends a lane's meta once, when it loads it: an update lost (UDP, or
 	## dropped before the world was ready) left such lanes unsimulated for good.
 	static var ask_unknown := true
+	## --belt-sim-replace-at=off: a lane the bridge drops (`dl`) goes the moment its update comes, as before. On
+	## (the default; with read_apply): one dropped in the update that brings a lane of the same place (exit and
+	## entry: a belt fast-replaced, say yellow by red, whose items stay where they are in the game) goes at that
+	## lane's read tick, when the simulation gets there: before, the update came a few ticks ahead of the
+	## simulation, so the replaced belt's items left the simulation then, stood in the drawing and came back on
+	## the new lanes at their read, a few ticks further on (K16).
+	static var replace_at := true
+	var new_geo := {}  # (replace_at) Vector4i(exit, entry) -> the lane key this job's messages set (`lm`) there
+	var replaced_n := 0  # (replace_at) lanes dropped on a replacing lane's read tick, not at once, this job
+	var removed_lanes_n := 0  # (removed_now) lanes of removed belts taken out this job, and their items
+	var removed_items_n := 0
 	## --belt-draw-coalesce=off: every change the simulation emitted in the job's ticks is made into a
 	## record, one after another (as before). On (the default): only an item's last change at or before
 	## the drawn tick is (the earlier ones would be overwritten before anything is drawn); a job that
@@ -408,6 +570,28 @@ class Job:
 	## --belt-draw-pile=off: each copy of a pile gets a full record of its own, written again whenever its
 	## item moves (as before). On (the default): a copy's record only points at its item's (texel 3).
 	static var pile_one := true
+	## --belt-draw-dump-parks=off: the draw dump (--belt-draw-dump) leaves a parked item's record out, as before, so
+	## its readers kept drawing the record the GPU had hidden, standing where its motion ended, and counted its next
+	## record a jump. On (the default): a park is dumped as the record's going (dump_gone).
+	static var dump_parks := true
+	## --belt-draw-later-tick=off: the changes after the drawn tick wait in one list (State.later), every one
+	## looked at (and tried early) every job, as before. On (the default): kept by item and tick
+	## (State.waiting, due): a job takes the items whose first waiting change is due and tries early only those
+	## whose item changed since their last try (or all when the lanes' links may have moved); the same takes,
+	## item by item, as the list's.
+	static var later_tick := true
+	## --belt-draw-park-lattice=on: an item whose motion lies on lanes the lattice draws all along (its place
+	## and its reach ahead) is parked as one out of view is: its motion kept, no slot, no record (the mask
+	## hid it in every frame of that motion). Off (the default for now): drawn and masked, as before.
+	static var park_lat := false
+	## --belt-sim-ask=view (the default): lanes asked for again by what shows (lattice lanes only when their
+	## count is wrong, out of view rarely). Live on the owner's base: 45-75% fewer asks, the job 15-25% cheaper,
+	## as many of the game's items drawn and fewer phantoms (art-src/perf-plans/after.md 6).
+	## --belt-sim-ask=all: every failing lane every ASK_AGAIN_MSEC, as before.
+	static var ask_view := true
+	## --belt-sim-ask-near=off: a job's asks in the simulation's order. On (the default): nearest the view's
+	## middle first (the bridge reads them in the order asked, bre_cap an update).
+	static var ask_near := true
 	var view := Rect2()  # the camera's ground view (x, z tiles), from the main thread
 	var view_all := true  # no camera (tests, replays): everything is in view
 	var parked := 0  # items parked after this job
@@ -441,13 +625,80 @@ class Job:
 	var lat_mask: Image = null
 	var lat_lanes := 0
 	var lat_usec := 0
+	## (--inserter-handoff) What the inserters' takes and puts did in this job's ticks, for the arms:
+	## [why (BeltSim.HAND_*), inserter, tick, uid, x, z (the item's place then, tiles; NAN unknown)].
+	var hands: Array = []
+	var holes: Array = []  # [lane, tick, line position] of the items taken: their lattice's hole (BeltLattice.hole)
+	var _puts := {}  # uid -> tick: the items hands put on belts in this job's changes (Item.show_at)
+	## (handoff) The items a take still to come will take (BeltSim.peek_take, as the messages are handled):
+	## uid, the take's tick, the inserter. Their records hide on that tick at once (the take itself may come
+	## only after the drawn clock passes it); the take on its tick puts right a wrong guess.
+	var peek_u := PackedInt64Array()
+	var peek_t := PackedInt64Array()
+	var peek_i := PackedInt64Array()
+	var ie_n := 0  # `ie` records handed to the simulation (takes, puts)
 	var later_n := 0  # State.later.size(), kept.size(), lanes.size() after the job (either path)
 	var kept_n := 0
 	var lanes_n := 0
+	## The lattice's update (run before the records' side): the lanes it began and stopped drawing, its kinds
+	## not dressed yet and its dump, merged into this job's after the records' side.
+	var lat_add := PackedInt64Array()
+	var lat_del := PackedInt64Array()
+	var lat_unknown: Array = []
+	var lat_dump: Array = []
+	## (Counters, belt_items.gd stats: join.belt_stats.) Early tries; items whose waiting changes were looked
+	## at (later_tick); asks by why (in view, the lattice's, out of view) and asks not made for their
+	## interval; items parked for the lattice and planned again; waiting items; the gauges (State.gauges).
+	var early_tries := 0
+	var drained := 0
+	var ask_view_n := 0
+	var ask_lat_n := 0
+	var ask_out_n := 0
+	var ask_held_n := 0
+	var lat_parks := 0
+	var lat_unparks := 0
+	var lat_lanes_n := 0
+	var waiting_n := -1
+	var gauges := [0, 0, 0, 0]
+	## (A4) The kinds' looks and the far icons' chunks changed since the last job (given to the native
+	## records only then).
+	var known_new := true
+	var far_new := true
+	## (later_tick) This job: the lanes' links may have moved since the last; a start waiting for its
+	## item's t0 (_apply_early sets it: when to try again).
+	var graph_now := true
+	var _early_wait := NEVER
+	## Lanes dropped in this job's messages, as they were: [meta, arc] (an item parked on the lattice's lanes
+	## there stands where it is for the far icons' hand-over).
+	var dropped_meta := {}
 
 	func run() -> void:
 		var t0 := Time.get_ticks_usec()
 		var sim := state.sim
+		# (removed_now) Belts Zenith took away: their lanes out of the simulation before anything else, their items
+		# gone at the drawn tick (not the simulation's, a lead ahead), their lanes' meta forgotten once drawn.
+		var pre := {}
+		var rm_keys: Array = []
+		if not state.removed_keys.is_empty():
+			_prune_removed()
+		for msg: Dictionary in msgs:
+			if msg.get("t") == "brm":
+				for u in msg.get("u", PackedInt64Array()):
+					for line in range(1, 9):
+						var key := int(u) * 8 + line
+						if state.lanes.has(key) and not rm_keys.has(key):
+							rm_keys.append(key)
+						elif not state.lanes.has(key):
+							state.removed_keys[key] = now_msec  # (its meta may still be on its way)
+		if not rm_keys.is_empty():
+			if int(sim.tick) >= 0:
+				pre = _remove_lanes(rm_keys)
+			else:
+				# (Nothing stepped yet: nothing drawn to take away.)
+				for key: int in rm_keys:
+					_drop_now(key)
+					state.removed_keys[key] = now_msec
+				rm_keys = []
 		if read_apply:
 			_read_ticks()
 		for msg: Dictionary in msgs:
@@ -464,23 +715,47 @@ class Job:
 			# time; the simulation jumps there instead, its items standing, and every lane is asked for
 			# again (in the bridge's next updates).
 			var to := mini(floori(fold_tick) + ahead, state.data_tick)
+			if handoff_slack > 0 and InserterArms.wants_handoff():
+				# (--inserter-handoff) A few ticks short of the newest update, never short of the drawn tick:
+				# the hands' events for those ticks (`ie`, every 2 ticks, each sent again twice) come after
+				# the update that covers them as often as before it, and a take the simulation learns after
+				# stepping past its tick goes from the drawing only a job late.
+				to = maxi(mini(to, state.data_tick - handoff_slack), mini(floori(fold_tick) + 1, state.data_tick))
 			if to - int(sim.tick) > MAX_BEHIND and int(sim.tick) >= 0 and to - state.skipped_at > SKIP_EVERY:
 				state.skipped_at = to
+				for e: Array in state.drop_at:
+					_drop_now(int(e[1]))
+				state.drop_at = []
 				sim.skip_to(to)
 				skipped = true
 				for key in state.lanes:
 					resend.append(key)
 			elif to > int(sim.tick):
-				sim.step_to(to)
+				_step_to(to)
 		ticks = int(sim.tick) - t_start
 		var ch: Dictionary = sim.take_changes()
+		if not pre.is_empty():
+			ch = _merge_changes(pre, ch)
+		if not peek_u.is_empty():
+			ch["peek_uid"] = peek_u
+			ch["peek_tick"] = peek_t
+			ch["peek_ins"] = peek_i
 		sim_usec = Time.get_ticks_usec() - ts
+		_take_holes(ch)
+		# (The lattice first: the records' side parks and counts the items on the lanes it draws.)
+		if BeltLattice.on or state.lattice.has_drawn():
+			_lattice()
 		if state.draw != null:
 			_run_native(ch)
+			_hands(ch, false)
 		else:
 			var ta := Time.get_ticks_usec()
+			graph_now = state.lanes_moved or int(sim.links_ver) != state.links_seen or sim.links_pending()
+			state.lanes_moved = false
 			var view_moved := _set_view()
+			_relattice()
 			_apply_changes(ch)
+			_hands(ch, true)
 			if view_moved:
 				_replan_parked()
 			var tr := Time.get_ticks_usec()
@@ -502,19 +777,45 @@ class Job:
 			var tw := Time.get_ticks_usec()
 			_write()
 			write_usec = Time.get_ticks_usec() - tw
+			state.links_seen = int(sim.links_ver)
+			# (Walking every item in GDScript costs; only for probes here.)
+			if state.jobs_n % GAUGE_EVERY == 0 and (Probing.on or dump != null):
+				_gauges()
+			state.jobs_n += 1
+			gauges = state.gauges.duplicate()
 			count = state.items.size()
 			held_chunks = state.held_chunks.duplicate()
+			var now_t := floori(fold_tick)
 			for uid in (state.items.keys() if watch_all else watch):
 				var it: Item = state.items.get(uid)
-				if it != null:
+				if it == null:
+					continue
+				if it.lat:
+					# (Parked on the lattice's lanes: no record; where its motion has it, in a straight line.)
+					var d := mini(it.v * (now_t - it.t0), it.reach) if it.v > 0 and now_t > it.t0 else 0
+					var a := _advance(it.lane, it.pos, d) if d > 0 else Vector2i(it.lane, it.pos)
+					var q := _point(a.x, a.y)
+					var from := Vector3(q.x, q.y, q.z)
+					var step := Vector3.ZERO
+					var t_to := float(now_t)
+					if it.v > 0 and it.reach > d:
+						var b := _advance(it.lane, it.pos, it.reach)
+						var r := _point(b.x, b.y)
+						step = Vector3(r.x, r.y, r.z) - from
+						t_to = float(it.t0) + float(it.reach) / float(it.v)
+					positions[uid] = [from, step, PackedFloat32Array(), float(now_t), t_to, false]
+				else:
 					positions[uid] = [it.from, it.step, it.path, it.t_from, it.t_to, it.hidden]
-			later_n = state.later.size()
+			later_n = state.later_n if later_tick else state.later.size()
+			waiting_n = state.waiting.size() if later_tick else -1
+			lat_lanes_n = state.lat.size()
 			kept_n = state.kept.size()
 			lanes_n = state.lanes.size()
 			if dump != null and paths != null:
 				dump_paths = state.path_tex
-		if BeltLattice.on or state.lattice.has_drawn():
-			_lattice()
+		_lattice_merge()
+		if not rm_keys.is_empty():
+			_forget_lanes(rm_keys)
 		square = state.square
 		if debug and stale_reads > 0 and now_msec - stale_msec > STALE_REPORT_MSEC:
 			stale_msec = now_msec
@@ -535,29 +836,75 @@ class Job:
 			_dump_write()
 
 	## (--belt-draw-lattice) The packed lanes' lattice after the simulation (belt_lattice.gd): the same for
-	## both records paths.
+	## both records paths, which it runs before (its lanes added and removed go to them: lat_add, lat_del).
 	func _lattice() -> void:
 		if int(state.sim.tick) < 0 or state.records.base < 0.0:
 			return
 		var tl := Time.get_ticks_usec()
+		# (The holes' records go to the dump with the lattice's own, after the records side's: written to the
+		# job's dump here they were lost when that side set its own, and a dump showed no take's hole.)
+		var hole_ids := PackedInt64Array()
+		var hole_recs := PackedFloat32Array()
+		for h: Array in holes:
+			var hr: Dictionary = state.lattice.hole(int(h[0]), int(h[1]), int(h[2]), dump != null)
+			if dump != null:
+				hole_ids.append_array(hr["dump_ids"])
+				hole_recs.append_array(hr["dump_recs"])
 		var lr: Dictionary
+		# (When these records are first drawn: a lane's items are matched to the old lattice's as drawn then.)
 		if state.lattice is BeltLattice:
+			state.lattice.shown = fold_tick
+		elif state.lattice.has_method("set_shown"):
+			state.lattice.set_shown(fold_tick)
+		if state.lattice is BeltLattice:
+			state.lattice.drawn_tick = floori(fold_tick)
 			lr = state.lattice.update(state, state.sim, int(state.sim.tick), view, view_all, known, model_cap, full, dump != null)
 		else:
+			# (A library built before the switch has no such method and runs as before.)
+			if state.lattice.has_method("set_settle"):
+				state.lattice.set_settle(BeltLattice.settle)
+				state.lattice.set_drawn_tick(floori(fold_tick))
+			if state.lattice.has_method("set_creep"):
+				state.lattice.set_creep(BeltLattice.creep)
+			if state.lattice.has_method("set_creep_flow"):
+				state.lattice.set_creep_flow(BeltLattice.creep_flow)
 			lr = state.lattice.update(int(state.sim.tick), view, view_all, known, model_cap, full, dump != null, state.records.base,
-				state.height, BeltLattice.on, BeltLattice.world, BeltLattice.piles, BeltLattice.unison)
+				state.height, BeltLattice.on, BeltLattice.world, BeltLattice.piles, BeltLattice.unison, BeltLattice.world_all,
+				BeltLattice.standing_obs)
 		lat_written = lr["written"]
 		lat_pages = lr["pages"]
 		lat_mask = lr["mask"]
 		lat_lanes = state.lattice.lanes_n
-		for kk in lr["unknown"]:
+		lat_add = lr.get("added", PackedInt64Array())
+		lat_del = lr.get("removed", PackedInt64Array())
+		lat_unknown = lr["unknown"]
+		if dump != null:
+			# (A lane's slots written again in the update come after its holes: the newer record stands; a
+			# hole in a lane the update stopped drawing isn't written: its slot went with the lane.)
+			var went := {}
+			for u in (lr["dump_gone"] as PackedInt64Array):
+				went[u] = true
+			var ids := PackedInt64Array()
+			var recs := PackedFloat32Array()
+			for k in hole_ids.size() / 8:
+				if not went.has(hole_ids[k * 8]):
+					ids.append_array(hole_ids.slice(k * 8, k * 8 + 8))
+					recs.append_array(hole_recs.slice(k * BeltRecords.FLOATS, (k + 1) * BeltRecords.FLOATS))
+			ids.append_array(lr["dump_ids"])
+			recs.append_array(lr["dump_recs"])
+			lat_dump = [ids, recs, lr["dump_gone"]]
+		lat_usec = Time.get_ticks_usec() - tl
+
+	## The lattice's kinds not dressed yet and its dump, after the records side's (in that order, as when the
+	## lattice ran after it).
+	func _lattice_merge() -> void:
+		for kk in lat_unknown:
 			if not unknown.has(kk):
 				unknown.append(kk)
-		if dump != null:
-			dump_ids.append_array(lr["dump_ids"])
-			dump_recs.append_array(lr["dump_recs"])
-			dump_gone.append_array(lr["dump_gone"])
-		lat_usec = Time.get_ticks_usec() - tl
+		if dump != null and not lat_dump.is_empty():
+			dump_ids.append_array(lat_dump[0])
+			dump_recs.append_array(lat_dump[1])
+			dump_gone.append_array(lat_dump[2])
 
 	## (--belt-draw-native) The job from the changes on in BeltDrawNative (belt_draw_native.cpp: the same
 	## as _set_view .. _write below, item for item); its results into this job's fields.
@@ -565,8 +912,15 @@ class Job:
 		var params := {"fold": fold_tick, "lead": lead, "now_msec": now_msec, "full": full, "model_cap": model_cap,
 			"square": state.square, "base": state.records.base, "height": state.height, "dump": dump != null,
 			"coalesce": coalesce, "view_cull": view_cull, "lead_on": lead_on, "gone_order": gone_order, "early": early,
-			"view_all": view_all, "view": view, "known": known, "far_built": far_built, "watch": watch, "watch_all": watch_all,
-			"pile_one": pile_one, "cam_led": cam_led, "cam_pos": cam_pos, "cam_dir": cam_dir, "cam_planes": cam_planes}
+			"view_all": view_all, "view": view, "watch": watch, "watch_all": watch_all,
+			"pile_one": pile_one, "dump_parks": dump_parks, "cam_led": cam_led, "cam_pos": cam_pos, "cam_dir": cam_dir, "cam_planes": cam_planes,
+			"later_tick": later_tick, "park_lat": park_lat, "ask": 1 if ask_view else 0, "ask_near": ask_near,
+			"lat_add": lat_add, "lat_del": lat_del}
+		# (The looks and the far icons' chunks only when they changed: the native side keeps the last.)
+		if known_new:
+			params["known"] = known
+		if far_new:
+			params["far_built"] = far_built
 		var res: Dictionary = state.draw.run_job(ch, params)
 		apply_usec = int(res.get("apply_usec", 0))
 		renew_usec = int(res.get("renew_usec", 0))
@@ -589,6 +943,18 @@ class Job:
 		kept_n = int(res.get("kept", 0))
 		later_n = int(res.get("later", 0))
 		lanes_n = int(res.get("lanes", 0))
+		early_tries = int(res.get("early_tries", 0))
+		drained = int(res.get("drained", 0))
+		waiting_n = int(res.get("waiting", -1))
+		ask_view_n = int(res.get("ask_view", 0))
+		ask_lat_n = int(res.get("ask_lat", 0))
+		ask_out_n = int(res.get("ask_out", 0))
+		ask_held_n = int(res.get("ask_held", 0))
+		lat_parks = int(res.get("lat_parks", 0))
+		lat_unparks = int(res.get("lat_unparks", 0))
+		lat_lanes_n = int(res.get("lat_lanes", 0))
+		gauges = [int(res.get("slots", 0)), int(res.get("slots_hidden", 0)), int(res.get("parked_view", 0)),
+			int(res.get("parked_lat", 0))]
 		paths = res.get("paths")
 		pages = res.get("pages", {})
 		if dump != null:
@@ -616,21 +982,59 @@ class Job:
 		var p := _point(key, float(pos))
 		return state.planned_view.grow(VIEW_MARGIN + float(maxi(reach, 0)) / 256.0).has_point(Vector2(p.x, p.z))
 
+	## (lattice) Whether a motion from line position `pos` of lane `key` over `reach` stays on lanes the
+	## lattice draws: the lanes ahead of its lane's exit that the lattice draws go on that far.
+	func _on_lat(key: int, pos: int, reach: int) -> bool:
+		var ahead = state.lat_ahead.get(key)
+		return ahead != null and maxi(reach, 0) <= pos + int(ahead)
+
+	## Why an item's motion isn't drawn: 0 it is, 1 out of the planned view, 2 (park_lat) on the lattice's lanes
+	## all along, so its mask hides it there anyway.
+	func _hide_why(key: int, pos: int, reach: int, v: int) -> int:
+		if not _in_view(key, pos, reach):
+			return 1
+		if park_lat and not state.lat_ahead.is_empty() and _on_lat(key, pos, reach if v > 0 else 0):
+			return 2
+		return 0
+
+	func _set_lat(it: Item, on: bool) -> void:
+		if it.lat == on:
+			return
+		it.lat = on
+		if on:
+			state.lat_items[it] = true
+		else:
+			state.lat_items.erase(it)
+
+	## (later_tick) Something _apply_early reads of the item may have changed: its waiting changes are tried again.
+	func _touch(it: Item) -> void:
+		state.ver_seq += 1
+		it.ver = state.ver_seq
+		if it.waits:
+			state.retry.append(it.uid)
+
 	func _park(it: Item) -> void:
 		if it.slot >= 0:
+			# (dump_parks) Its record hidden, as the GPU's: the draw dump says so (as gone), so what reads it
+			# (tools/belt_view_check.py's DrawState) doesn't keep drawing the old record until the next one.
+			if dump != null and dump_parks:
+				dump_gone.append(it.uid)
 			_unplace(it)
 		it.parked = true
 		it.renew = -1.0
 		state.renewing.erase(it)
 		it.path = PackedFloat32Array()
 		_mark(it)  # (its path's run is let go)
+		_touch(it)
 
 	func _unpark(it: Item) -> void:
 		it.parked = false
+		_set_lat(it, false)
 		_place(it)
 		var n := it.count
 		it.count = 1
 		_set_count(it, n)
+		_touch(it)
 
 	## (view) The view moved: parked items now in it get their records, from where their motion has them.
 	func _replan_parked() -> void:
@@ -640,7 +1044,9 @@ class Job:
 				continue
 			var d := mini(it.v * (now - it.t0), it.reach) if it.v > 0 and now > it.t0 else 0
 			var at := _advance(it.lane, it.pos, d) if d > 0 else Vector2i(it.lane, it.pos)
-			if not _in_view(at.x, at.y, it.reach - d):
+			var why := _hide_why(at.x, at.y, it.reach - d, it.v)
+			if why != 0:
+				_set_lat(it, why == 2)
 				continue
 			if d > 0:
 				it.lane = at.x
@@ -652,6 +1058,191 @@ class Job:
 			_unpark(it)
 			_plan(it)
 			unparked += 1
+
+	## The lattice's update (run before this) added and removed lanes (lat_add, lat_del): how far lattice
+	## lanes go on past each worked out again; (ask view) lanes leaving it whose checks failed in places alone
+	## asked for now; (park_lat) items no longer on its lanes all along planned again from their motion as
+	## _replan_parked does (an item on a lane dropped from the square stands where it is, for the far icons'
+	## hand-over), and placed items now on them all along let go of their slots. With graph_now (the lanes'
+	## links may have moved) every lane is looked at.
+	func _relattice() -> void:
+		for key in lat_del:
+			state.lat.erase(key)
+		for key in lat_add:
+			state.lat[key] = true
+		var changed := not lat_add.is_empty() or not lat_del.is_empty()
+		if not changed and not (graph_now and not state.lat.is_empty()):
+			return
+		state.lat_ahead_dirty = true  # (worked out when parking or the counters need it)
+		for key in lat_del:
+			if state.lat_pend.has(key):
+				state.lat_pend.erase(key)
+				if not state.lat.has(key) and state.lanes.has(key) and not dropped.has(key):
+					state.asked[key] = now_msec
+					resend.append(key)
+					ask_lat_n += 1
+		if not park_lat:
+			return
+		_lat_ahead()
+		var now := floori(fold_tick)
+		if not lat_del.is_empty() or graph_now:
+			for it: Item in state.lat_items.keys():
+				if dropped.has(it.lane) or dropped_meta.has(it.lane):
+					_stand_dropped(it, now)
+					continue
+				var d := mini(it.v * (now - it.t0), it.reach) if it.v > 0 and now > it.t0 else 0
+				var at := _advance(it.lane, it.pos, d) if d > 0 else Vector2i(it.lane, it.pos)
+				var why := _hide_why(at.x, at.y, it.reach - d, it.v)
+				if why == 2:
+					continue
+				_set_lat(it, false)
+				if why == 1:
+					continue  # (out of view: parked as anything out of it is)
+				if d > 0:
+					it.lane = at.x
+					it.pos = at.y
+					it.reach -= d
+					var m: PackedInt32Array = state.lanes.get(it.lane, PackedInt32Array())
+					it.run = it.pos + int(state.sim.run_of(it.lane)) if not m.is_empty() and m[0] == BeltSim.STRAIGHT else 0
+					it.t0 = now
+				_unpark(it)
+				_plan(it)
+				lat_unparks += 1
+		if not lat_add.is_empty() or graph_now:
+			var cand: Array[Item] = []
+			for kk in state.kinds:
+				for e in (state.kinds[kk] as Kind).slots:
+					if e is Item and not (e as Item).parked and state.lat.has((e as Item).lane):
+						cand.append(e)
+			for it: Item in cand:
+				var d := mini(it.v * (now - it.t0), it.reach) if it.v > 0 and now > it.t0 else 0
+				var at := _advance(it.lane, it.pos, d) if d > 0 else Vector2i(it.lane, it.pos)
+				if not _on_lat(at.x, at.y, it.reach - d if it.v > 0 else 0):
+					continue
+				_park(it)
+				_set_lat(it, true)
+				lat_parks += 1
+
+	## For each lane the lattice draws, how far (1/256) lattice lanes go on past its exit: its next's length
+	## and that one's own, to the first lane that isn't the lattice's (a ring of them: LAT_FAR).
+	func _lat_ahead() -> void:
+		state.lat_ahead_dirty = false
+		var ahead := {}
+		state.lat_ahead = ahead
+		for start in state.lat:
+			if ahead.has(start):
+				continue
+			var path: Array[int] = []
+			var on_path := {}
+			var k: int = start
+			var tail := 0
+			var last := 0
+			var none := false
+			while true:
+				on_path[k] = path.size()
+				path.append(k)
+				var nx: int = state.sim.next_of(k)
+				if nx == 0 or not state.lanes.has(nx) or not state.lat.has(nx):
+					last = path.size() - 1
+					tail = 0
+					break
+				if ahead.has(nx):
+					last = path.size() - 1
+					tail = mini(LAT_FAR, (state.lanes[nx] as PackedInt32Array)[1] + int(ahead[nx]))
+					break
+				if on_path.has(nx):
+					var s: int = on_path[nx]
+					for j in range(s, path.size()):
+						ahead[path[j]] = LAT_FAR
+					none = s == 0
+					last = 0 if none else s - 1
+					tail = LAT_FAR
+					break
+				k = nx
+			if none:
+				continue
+			ahead[path[last]] = tail
+			for j in range(last - 1, -1, -1):
+				var nxt := path[j + 1]
+				var m: PackedInt32Array = state.lanes.get(nxt, PackedInt32Array())
+				ahead[path[j]] = mini(LAT_FAR, (m[1] if not m.is_empty() else 0) + int(ahead[nxt]))
+
+	## (park_lat) An item parked on the lattice's lanes whose lane was dropped from the square in this job's
+	## messages: placed standing where its motion has it now (the dropped lanes' meta as they were), so its
+	## going keeps it for the far icons (_go) and the belt is never bare; out of view it stays parked (it goes).
+	func _stand_dropped(it: Item, now: int) -> bool:
+		_set_lat(it, false)
+		var d := mini(it.v * (now - it.t0), it.reach) if it.v > 0 and now > it.t0 else 0
+		var k := it.lane
+		var p := it.pos
+		var left := d
+		var stuck := false
+		var guard := 0
+		while left > p and guard < 4096:
+			left -= p
+			var nx: int = state.sim.next_of(k)
+			var nm := _meta_any(nx) if nx != 0 else PackedInt32Array()
+			if nm.is_empty():
+				stuck = true
+				break
+			k = nx
+			p = nm[1]
+			guard += 1
+		var m := _meta_any(k)
+		if m.is_empty():
+			return false
+		var arc: PackedFloat64Array = state.arcs.get(k, PackedFloat64Array())
+		if arc.is_empty() and dropped_meta.has(k):
+			arc = dropped_meta[k][1]
+		var q := _point_m(m, arc, float(0 if stuck else p - left))
+		if view_cull and not view_all and not state.planned_view.grow(VIEW_MARGIN).has_point(Vector2(q.x, q.z)):
+			return false
+		_unpark(it)
+		it.v = 0
+		it.from = Vector3(q.x, q.y, q.z)
+		it.step = Vector3.ZERO
+		it.path = PackedFloat32Array()
+		it.t_from = fold_tick
+		it.t_to = fold_tick
+		it.hidden = q.w < 0.5
+		it.renew = -1.0
+		state.renewing.erase(it)
+		_mark(it)
+		lat_unparks += 1
+		return true
+
+	## A lane's meta, or (a lane dropped in this job's messages) what it was.
+	func _meta_any(key: int) -> PackedInt32Array:
+		var m: PackedInt32Array = state.lanes.get(key, PackedInt32Array())
+		if m.is_empty() and dropped_meta.has(key):
+			m = dropped_meta[key][0]
+		return m
+
+	## The counters that walk every slot and item (State.gauges): slots in use and those of items on lattice
+	## lanes all along (which the mask hides), parked items out of view and for the lattice.
+	func _gauges() -> void:
+		if state.lat_ahead_dirty:
+			_lat_ahead()
+		var slots := 0
+		var hidden := 0
+		for kk in state.kinds:
+			for e in (state.kinds[kk] as Kind).slots:
+				if not (e is Item):
+					continue
+				var it: Item = e
+				var n := 1 + it.layers.size()
+				slots += n
+				if not state.lat_ahead.is_empty() and _on_lat(it.lane, it.pos, it.reach if it.v > 0 else 0):
+					hidden += n
+		var pv := 0
+		var pl := 0
+		for it: Item in state.items.values():
+			if it.parked:
+				if it.lat:
+					pl += 1
+				else:
+					pv += 1
+		state.gauges = [slots, hidden, pv, pl]
 
 	## (--belt-draw-dump) This job's line and blobs (Job.dump); on the worker, jobs one after another.
 	func _dump_write() -> void:
@@ -666,6 +1257,8 @@ class Job:
 			"recs": records_written, "changes": changes, "coalesced": coalesced, "early": early_n, "renewed": renewed, "gone": gone_n, "ticks": ticks, "skipped": skipped,
 			"msgs": msgs.size(), "updates": ks, "items": count, "lanes": lanes_n, "asked": resend.size(),
 			"later": later_n, "kept": kept_n, "full": full, "parked": parked, "unparked": unparked,
+			"early_tries": early_tries, "drained": drained, "waiting": waiting_n, "lat_parks": lat_parks, "lat_unparks": lat_unparks,
+			"asks": [ask_view_n, ask_lat_n, ask_out_n, ask_held_n, unknown_asked], "gauges": gauges,
 			"view": [view.position.x, view.position.y, view.size.x, view.size.y] if not view_all else null,
 			"native": state.draw != null, "lat_lanes": lat_lanes, "lat_ms": lat_usec / 1000.0,
 			"lat_native": not (state.lattice is BeltLattice), "lat_slots": state.lattice.slots_n,
@@ -690,7 +1283,18 @@ class Job:
 	## then, not when the message comes (BeltSim.set_lane_at).
 	func _read_ticks() -> void:
 		read_at.clear()
+		new_geo.clear()
+		# (replace_at: the places of the lanes set, when some lane is dropped; the parts of an update come together.)
+		var drops := false
+		if replace_at:
+			for msg: Dictionary in msgs:
+				drops = drops or msg.get("dl") is Array
 		for msg: Dictionary in msgs:
+			var lm = msg.get("lm")
+			if drops and lm is Array:
+				var a: Array = lm
+				for i in range(0, a.size() - 11, 12):
+					new_geo[Vector4i(int(a[i + 4]), int(a[i + 5]), int(a[i + 8]), int(a[i + 9]))] = int(a[i])
 			var sl = msg.get("sl")
 			if not (sl is Array):
 				continue
@@ -703,8 +1307,138 @@ class Job:
 					read_at[key] = at
 				i += 3 + clampi(int(a2[i + 2]), 0, (a2.size() - i - 3) / 4) * 4
 
+	## (--inserter-handoff) An `ie` message (inserters.lua: [kind, unit, tick, a, b, c, hand x, hand y, belt]
+	## x n, delta-coded with z 1): a hand's pick from a belt (picked, with its belt) becomes the simulation's
+	## take of the items nearest the hand on that tick (as many as the pick added to the hand), an item put
+	## on a belt (placed: [6, unit, tick, lane, line position, uid, item, stack, belt]) its put; each record
+	## once (the mod sends each a few times).
+	func _handle_ie(msg: Dictionary) -> void:
+		var list = msg.get("l")
+		if not (list is Array):
+			return
+		var a: Array = list
+		var deltas := int(msg.get("z", 0)) == 1
+		var v := PackedInt64Array([0, 0, 0, 0, 0, 0, 0, 0, 0])
+		var sim := state.sim
+		var k := int(msg.get("k", 0))
+		var i := 0
+		while i + 8 < a.size():
+			for j in 9:
+				v[j] = v[j] + int(a[i + j]) if deltas else int(a[i + j])
+			i += 9
+			var kind := v[0]
+			var unit := v[1]
+			var t := v[2]
+			var seen := "%d:%d:%d:%d" % [kind, unit, t, v[3] if kind != InserterArms.EV_PLACED else v[5]]
+			if state.ie_seen.has(seen):
+				continue
+			state.ie_seen[seen] = t
+			if kind == InserterArms.EV_PICKED:
+				var last: int = state.hand_count.get(unit, -1)
+				state.hand_count[unit] = v[3]
+				if v[8] != 0:
+					var n := v[3] - last if last >= 0 and v[3] > last else 1
+					sim.take_at(t, v[8], v[4], n, v[6], v[7], unit)
+					ie_n += 1
+					if t > int(sim.tick) and int(sim.tick) >= 0:
+						for pu in sim.peek_take(t, v[8], v[4], n, v[6], v[7]):
+							peek_u.append(pu)
+							peek_t.append(t)
+							peek_i.append(unit)
+			elif kind == InserterArms.EV_PLACED:
+				sim.put_at(t, v[3], v[5], v[6], v[7], v[4], unit)
+				ie_n += 1
+			elif kind == InserterArms.EV_GONE:
+				state.hand_count.erase(unit)
+			else:
+				state.hand_count[unit] = v[3]
+		if k - state.ie_swept >= 300:
+			state.ie_swept = k
+			for key: String in state.ie_seen.keys():
+				if int(state.ie_seen[key]) < k - 600:
+					state.ie_seen.erase(key)
+
+	## (--inserter-handoff) The holes the simulation's takes leave in the lattice's lanes (`holes`), from the
+	## changes before the lattice's update, which runs ahead of the records' side.
+	func _take_holes(ch: Dictionary) -> void:
+		var hw: PackedInt32Array = ch.get("hand_why", PackedInt32Array())
+		if hw.is_empty():
+			return
+		var ht: PackedInt64Array = ch["hand_tick"]
+		var hk: PackedInt64Array = ch["hand_key"]
+		var hp: PackedInt32Array = ch["hand_pos"]
+		for j in hw.size():
+			if hw[j] == BeltSim.HAND_TAKEN:
+				holes.append([hk[j], ht[j], hp[j]])
+
+	## (--inserter-handoff) The simulation's takes and puts: a taken item's record hides on the take's tick
+	## (the shader; it goes from the records as any item gone, in the job whose drawn tick passes it), and
+	## each is told to the arms (where the item is then) for the hand to meet it.
+	func _hands(ch: Dictionary, hide: bool) -> void:
+		# (Only a take after the drawn tick hides a record: one at or before it went from the records in this
+		# job already, and an item there now under that uid is one a read put back since: the game kept it.)
+		var now := floori(fold_tick)
+		if hide:
+			var pu: PackedInt64Array = ch.get("peek_uid", PackedInt64Array())
+			for j in pu.size():
+				var pit: Item = state.items.get(pu[j])
+				if pit != null and pit.hide_at < 0.0 and int(ch["peek_tick"][j]) > now:
+					pit.hide_at = float(ch["peek_tick"][j])
+					_mark(pit)
+				var pk := Vector2i(int(ch["peek_ins"][j]), int(ch["peek_tick"][j]))
+				var lst: PackedInt64Array = state.peeks.get(pk, PackedInt64Array())
+				lst.append(pu[j])
+				state.peeks[pk] = lst
+		var hu: PackedInt64Array = ch.get("hand_uid", PackedInt64Array())
+		if hu.is_empty():
+			return
+		var ht: PackedInt64Array = ch["hand_tick"]
+		var hi: PackedInt64Array = ch["hand_ins"]
+		var hk: PackedInt64Array = ch["hand_key"]
+		var hp: PackedInt32Array = ch["hand_pos"]
+		var hw: PackedInt32Array = ch["hand_why"]
+		for j in hu.size():
+			var x := NAN
+			var z := NAN
+			if hw[j] == BeltSim.HAND_TAKEN or hw[j] == BeltSim.HAND_PUT:
+				var p := _point(int(hk[j]), float(hp[j]))
+				x = p.x
+				z = p.z
+			hands.append([hw[j], hi[j], ht[j], hu[j], x, z])
+			if hide and hw[j] == BeltSim.HAND_TAKEN and ht[j] > now:
+				var it: Item = state.items.get(hu[j])
+				if it != null and it.hide_at < 0.0:
+					it.hide_at = float(ht[j])
+					_mark(it)
+		if hide and not state.peeks.is_empty():
+			# (A guess the take didn't make: shown again.)
+			var taken := {}
+			for j in hu.size():
+				var pk := Vector2i(int(hi[j]), int(ht[j]))
+				if state.peeks.has(pk):
+					var got: PackedInt64Array = taken.get(pk, PackedInt64Array())
+					if hw[j] == BeltSim.HAND_TAKEN:
+						got.append(hu[j])
+					taken[pk] = got
+			for pk: Vector2i in taken:
+				for p in (state.peeks[pk] as PackedInt64Array):
+					if not (taken[pk] as PackedInt64Array).has(p):
+						var wit: Item = state.items.get(p)
+						if wit != null and wit.hide_at == float(pk.y):
+							wit.hide_at = -1.0
+							_mark(wit)
+				state.peeks.erase(pk)
+			if state.peeks.size() > 512:
+				for pk: Vector2i in state.peeks.keys():
+					if pk.y < now - 600:
+						state.peeks.erase(pk)
+
 	## One part of an update (`bs`): lanes' meta first, then their items, checks, drops, switches.
 	func _handle(msg: Dictionary) -> void:
+		if msg.get("t") == "ie":
+			if InserterArms.handoff:
+				_handle_ie(msg)
+			return
 		if msg.get("t") != "bs":
 			return
 		var sim := state.sim
@@ -725,8 +1459,16 @@ class Job:
 			var a: Array = lm
 			for i in range(0, a.size() - 11, 12):
 				var key := int(a[i])
+				if not state.removed_keys.is_empty() and state.removed_keys.has(key):
+					continue  # (removed_now: a belt Zenith took away, read before it went)
 				var meta := PackedInt32Array([int(a[i + 1]), int(a[i + 2]), int(a[i + 3]), int(a[i + 4]), int(a[i + 5]),
 					int(a[i + 6]), int(a[i + 7]), int(a[i + 8]), int(a[i + 9])])
+				if not state.lanes.has(key) or (state.lanes[key] as PackedInt32Array) != meta:
+					state.lanes_moved = true
+				dropped_meta.erase(key)
+				if not state.drop_at.is_empty():
+					# (Sent again: no longer dropped later.)
+					state.drop_at = state.drop_at.filter(func(e: Array) -> bool: return int(e[1]) != key)
 				state.lanes[key] = meta
 				if meta[0] == BeltSim.CURVE:
 					state.arcs[key] = _arc(meta)
@@ -748,14 +1490,12 @@ class Job:
 		var dl = msg.get("dl")
 		if dl is Array:
 			for key in dl:
-				dropped[int(key)] = true
-				sim.drop_lane(int(key))
-				if state.draw != null:
-					state.draw.drop_lane(int(key))
-				state.lanes.erase(int(key))
-				state.last_read.erase(int(key))
-				state.arcs.erase(int(key))
-				state.lattice.drop(int(key))
+				if not state.removed_keys.is_empty() and state.removed_keys.erase(int(key)):
+					_drop_now(int(key))  # (removed_now: gone already; nothing of it left to stand)
+					continue
+				if not new_geo.is_empty() and _drop_later(int(key)):
+					continue
+				_drop_now(int(key))
 		var sl = msg.get("sl")
 		if sl is Array:
 			var a2: Array = sl
@@ -767,6 +1507,9 @@ class Job:
 				var key := int(a2[i])
 				var at := int(a2[i + 1])
 				var n := clampi(int(a2[i + 2]), 0, (a2.size() - i - 3) / 4)  # (never more than the list holds)
+				if not state.removed_keys.is_empty() and state.removed_keys.has(key):
+					i += 3 + n * 4  # (removed_now: a belt Zenith took away)
+					continue
 				first_tick = at if first_tick < 0 else mini(first_tick, at)
 				var items := PackedInt64Array()
 				items.resize(n * 4)
@@ -817,6 +1560,8 @@ class Job:
 				for i in range(0, a5.size() - 2, 3):
 					ids[int(a5[i])] = [int(a5[i + 1]), int(a5[i + 2])]
 			for i in range(0, a3.size() - 4, 5):
+				if not state.removed_keys.is_empty() and state.removed_keys.has(int(a3[i])):
+					continue  # (removed_now)
 				if ask_unknown and not state.lanes.has(int(a3[i])):
 					_ask(int(a3[i]))
 				var u: Array = ids.get(int(a3[i]), [0, 0])
@@ -830,6 +1575,123 @@ class Job:
 			for i in range(0, a4.size() - 1, 2):
 				sim.set_off(int(a4[i]), int(a4[i + 1]) == 1, k)
 		# (qu: items' quality names; quality marks come from `bq`, not drawn from here.)
+
+	## (replace_at) A lane dropped where this job's messages set another of the same place, read after the
+	## simulation's tick: dropped then (State.drop_at). Returns whether it waits.
+	func _drop_later(key: int) -> bool:
+		var m: PackedInt32Array = state.lanes.get(key, PackedInt32Array())
+		if m.is_empty():
+			return false
+		var nk: int = new_geo.get(Vector4i(m[3], m[4], m[7], m[8]), 0)
+		if nk == 0 or nk == key:
+			return false
+		var at: int = read_at.get(nk, -1)
+		if at <= int(state.sim.tick):
+			return false
+		state.drop_at.append([at, key])
+		replaced_n += 1
+		return true
+
+	## A lane the bridge no longer sends: out of the simulation, the drawing and the lattice; its items go.
+	func _drop_now(key: int) -> void:
+		dropped[key] = true
+		state.sim.drop_lane(key)
+		if state.draw != null:
+			state.draw.drop_lane(key)
+		if state.lanes.has(key):
+			state.lanes_moved = true
+			dropped_meta[key] = [state.lanes[key], state.arcs.get(key, PackedFloat64Array())]
+		state.lanes.erase(key)
+		state.last_read.erase(key)
+		state.arcs.erase(key)
+		state.lattice.drop(key)
+
+	## (removed_now) A removed belt's lanes out of the simulation and the lattice now: the changes the simulation had
+	## not given yet (none, normally: the last job took them), then the items it dropped with them, gone at the drawn
+	## tick. Not marked dropped (`dropped`), so the drawing removes those items rather than standing them for far
+	## icons; their meta goes after the job (_forget_lanes). The bridge's later reads of them are passed over
+	## (State.removed_keys).
+	func _remove_lanes(keys: Array) -> Dictionary:
+		var sim := state.sim
+		var before: Dictionary = sim.take_changes()
+		for key: int in keys:
+			sim.drop_lane(key)
+			state.lattice.drop(key)
+			state.removed_keys[key] = now_msec
+		if not state.drop_at.is_empty():
+			state.drop_at = state.drop_at.filter(func(e: Array) -> bool: return not keys.has(int(e[1])))
+		var rm: Dictionary = sim.take_changes()
+		var gt: PackedInt64Array = rm.get("gone_tick", PackedInt64Array())
+		var now := floori(fold_tick)
+		for i in gt.size():
+			gt[i] = now
+		rm["gone_tick"] = gt
+		removed_lanes_n += keys.size()
+		removed_items_n += (rm.get("gone", PackedInt64Array()) as PackedInt64Array).size()
+		return _merge_changes(before, rm)
+
+	## (removed_now) The removed lanes' meta forgotten, once this job has drawn their items' going.
+	func _forget_lanes(keys: Array) -> void:
+		for key: int in keys:
+			if state.draw != null:
+				state.draw.drop_lane(key)
+			if state.lanes.has(key):
+				state.lanes_moved = true
+			state.lanes.erase(key)
+			state.last_read.erase(key)
+			state.arcs.erase(key)
+
+	## (removed_now) Removed lanes the bridge hasn't said are gone (`dl`) forgotten after REMOVED_KEEP_MSEC.
+	func _prune_removed() -> void:
+		var old: Array = []
+		for key: int in state.removed_keys:
+			if now_msec - int(state.removed_keys[key]) > REMOVED_KEEP_MSEC:
+				old.append(key)
+		for key: int in old:
+			state.removed_keys.erase(key)
+
+	## Two take_changes() results as one, a's first (b's gone_at counted past a's changes).
+	static func _merge_changes(a: Dictionary, b: Dictionary) -> Dictionary:
+		var n := 0
+		if a.has("uid"):
+			n = (a["uid"] as PackedInt64Array).size()
+		var out := {}
+		for k in b:
+			var vb = b[k]
+			if str(k) == "gone_at" and n > 0:
+				var ga := PackedInt32Array(vb)
+				for i in ga.size():
+					ga[i] += n
+				vb = ga
+			if a.has(k):
+				var m = a[k].duplicate()
+				m.append_array(vb)
+				out[k] = m
+			else:
+				out[k] = vb
+		for k in a:
+			if not out.has(k):
+				out[k] = a[k]
+		return out
+
+	## The simulation stepped to `to`, the lanes waiting to be dropped (replace_at) dropped on their ticks on the way.
+	func _step_to(to: int) -> void:
+		var sim := state.sim
+		if state.drop_at.is_empty():
+			sim.step_to(to)
+			return
+		state.drop_at.sort_custom(func(x: Array, y: Array) -> bool: return int(x[0]) < int(y[0]) or int(x[0]) == int(y[0]) and int(x[1]) < int(y[1]))
+		var rest: Array = []
+		for e: Array in state.drop_at:
+			if int(e[0]) <= to:
+				if int(e[0]) > int(sim.tick):
+					sim.step_to(int(e[0]))
+				_drop_now(int(e[1]))
+			else:
+				rest.append(e)
+		state.drop_at = rest
+		if to > int(sim.tick):
+			sim.step_to(to)
 
 	## A curve lane's circle through its three points: [cx, cy, r, angle at its exit, angle turned
 	## to its entry] (1/256 tile, radians).
@@ -857,11 +1719,14 @@ class Job:
 		var m: PackedInt32Array = state.lanes.get(key, PackedInt32Array())
 		if m.is_empty():
 			return Vector4(0.0, state.height, 0.0, 0.0)
+		return _point_m(m, state.arcs.get(key, PackedFloat64Array()) if m[0] == BeltSim.CURVE else PackedFloat64Array(), pos)
+
+	## _point from a lane's meta and (a curve's) arc.
+	func _point_m(m: PackedInt32Array, arc: PackedFloat64Array, pos: float) -> Vector4:
 		var f := clampf(pos / float(maxi(m[1], 1)), 0.0, 1.0)
 		var x: float
 		var y: float
-		if m[0] == BeltSim.CURVE and state.arcs.has(key) and not (state.arcs[key] as PackedFloat64Array).is_empty():
-			var arc: PackedFloat64Array = state.arcs[key]
+		if m[0] == BeltSim.CURVE and not arc.is_empty():
 			var a := arc[3] + arc[4] * f
 			x = arc[0] + cos(a) * arc[2]
 			y = arc[1] + sin(a) * arc[2]
@@ -891,6 +1756,14 @@ class Job:
 	## to ask for again.
 	func _apply_changes(ch: Dictionary) -> void:
 		var uids: PackedInt64Array = ch["uid"]
+		_puts.clear()
+		var hw: PackedInt32Array = ch.get("hand_why", PackedInt32Array())
+		if not hw.is_empty():
+			var hu: PackedInt64Array = ch["hand_uid"]
+			var ht: PackedInt64Array = ch["hand_tick"]
+			for j in hw.size():
+				if hw[j] == BeltSim.HAND_PUT:
+					_puts[hu[j]] = ht[j]
 		changes = uids.size()
 		var items: PackedInt32Array = ch["item"]
 		var stacks: PackedInt32Array = ch["stack"]
@@ -923,13 +1796,17 @@ class Job:
 			for v in last_i.values():
 				idx.append(v)
 			idx.sort()
-		if not state.later.is_empty():
+		if later_tick:
+			_drain_due(now)
+		elif not state.later.is_empty():
 			var later := state.later
 			state.later = []
 			for e: Array in later:
 				if int(e[2]) > now or held.has(e[1]):
-					if early and int(e[0]) == 0 and not held.has(e[1]) and _apply_early(e[1], e[3], e[4], e[5], e[6], e[2], e[7], e[8], e[9], now):
-						continue
+					if early and int(e[0]) == 0 and not held.has(e[1]):
+						early_tries += 1
+						if _apply_early(e[1], e[3], e[4], e[5], e[6], e[2], e[7], e[8], e[9], now):
+							continue
 					held[e[1]] = true
 					state.later.append(e)
 				elif int(e[0]) == 0:
@@ -946,21 +1823,214 @@ class Job:
 				_go_or_hold(gone[gi], gone_ticks[gi], now, held)
 				gi += 1
 			var uid: int = uids[i]
-			if ticks[i] > now or not held.is_empty() and held.has(uid):
-				if early and not held.has(uid) and _apply_early(uid, items[i], stacks[i], keys[i], poss[i], ticks[i], speeds[i], reaches[i], runs[i], now):
-					continue
-				held[uid] = true
-				state.later.append([0, uid, ticks[i], items[i], stacks[i], keys[i], poss[i], speeds[i], reaches[i], runs[i]])
+			var h := _held(uid, held)
+			if ticks[i] > now or h:
+				var tried := false
+				_early_wait = NEVER
+				if early and not h:
+					early_tries += 1
+					tried = true
+					if _apply_early(uid, items[i], stacks[i], keys[i], poss[i], ticks[i], speeds[i], reaches[i], runs[i], now):
+						continue
+				_hold([0, uid, ticks[i], items[i], stacks[i], keys[i], poss[i], speeds[i], reaches[i], runs[i]], held, tried, _early_wait)
 				continue
 			_apply_one(uid, items[i], stacks[i], keys[i], poss[i], ticks[i], speeds[i], reaches[i], runs[i])
 		while gi < ng:
 			_go_or_hold(gone[gi], gone_ticks[gi] if timed else now, now, held)
 			gi += 1
-		for key in ch["mismatch"]:
-			var last: int = state.asked.get(key, -ASK_AGAIN_MSEC)
-			if now_msec - last >= ASK_AGAIN_MSEC:
-				state.asked[key] = now_msec
-				resend.append(key)
+		_ask_mismatches(ch)
+
+	## Whether changes of the item wait (taken after them, in order).
+	func _held(uid: int, held: Dictionary) -> bool:
+		if later_tick:
+			return not state.waiting.is_empty() and state.waiting.has(uid)
+		return not held.is_empty() and held.has(uid)
+
+	## A change (or a going, [1, uid, tick]) to wait for the next jobs: in the list, or (later_tick) behind the
+	## item's others, its first filed by tick (`tried`: it was just tried early and wasn't taken; retry_at: a
+	## start, tried again once the drawn tick reaches the item's t0).
+	func _hold(e: Array, held: Dictionary, tried: bool, retry_at: int) -> void:
+		if not later_tick:
+			held[e[1]] = true
+			state.later.append(e)
+			return
+		state.later_n += 1
+		var uid: int = e[1]
+		var w: Waiting = state.waiting.get(uid)
+		if w == null:
+			w = Waiting.new()
+			state.waiting[uid] = w
+		var first := w.head >= w.q.size()
+		w.q.append(e)
+		if not first:
+			return
+		var it: Item = state.items.get(uid)
+		if it != null:
+			it.waits = true
+		w.tried = (it.ver if it != null else -1) if tried else -2
+		w.retry_at = retry_at if tried else NEVER
+		_file(uid, w)
+
+	## (later_tick) Files the item under the tick its first waiting change takes effect at (or is tried again).
+	func _file(uid: int, w: Waiting) -> void:
+		if w.head >= w.q.size():
+			return
+		var t := mini(int(w.q[w.head][2]), w.retry_at)
+		if t != w.filed:
+			var lst: Array = state.due.get(t, [])
+			lst.append(uid)
+			state.due[t] = lst
+			w.filed = t
+
+	## (later_tick) The waiting changes this job can take: those of the items filed up to the drawn tick and of
+	## the items that changed since their first was tried; of every waiting item when the lanes' links may
+	## have moved (a lane set or dropped, a relink since the last job or one pending: an early take walks the
+	## lanes ahead). Anything else would be tried as it was last time and stay. Same takes as the list's, item
+	## by item.
+	func _drain_due(now: int) -> void:
+		var work: Array = []
+		var ticks_due: Array = []
+		for t in state.due:
+			if int(t) <= now:
+				ticks_due.append(t)
+		for t in ticks_due:
+			for uid in state.due[t]:
+				var wt: Waiting = state.waiting.get(uid)
+				if wt != null and wt.filed == int(t):
+					wt.filed = -NEVER
+			work.append_array(state.due[t])
+			state.due.erase(t)
+		var all := graph_now and early
+		if all:
+			work = state.waiting.keys()
+		else:
+			work.append_array(state.retry)
+			var seen := {}
+			for uid in work:
+				seen[uid] = true
+			work = seen.keys()
+		# (By uid, as the C++ twin: the order hands out slots, so both compact a kind in the same job.)
+		work.sort()
+		state.retry = []
+		var lv := int(state.sim.links_ver)
+		for uid in work:
+			_drain(uid, now, all)
+		drained += work.size()
+		if early and not all and int(state.sim.links_ver) != lv:
+			# (Links worked out again on the way: every first change tried again, with them.)
+			work = state.waiting.keys()
+			work.sort()
+			for uid in work:
+				_drain(uid, now, true)
+			drained += work.size()
+
+	## (later_tick) One item's waiting changes, in order: those due taken, then the first tried early (when
+	## anything it reads may have changed since its last try), until one stays.
+	func _drain(uid: int, now: int, all: bool) -> void:
+		var w: Waiting = state.waiting.get(uid)
+		if w == null:
+			return
+		while w.head < w.q.size():
+			var e: Array = w.q[w.head]
+			if int(e[2]) <= now:
+				w.head += 1
+				state.later_n -= 1
+				w.tried = -2
+				w.retry_at = NEVER
+				if int(e[0]) == 0:
+					_apply_one(e[1], e[3], e[4], e[5], e[6], e[2], e[7], e[8], e[9])
+				else:
+					_go(e[1])
+				continue
+			if early and int(e[0]) == 0:
+				var it: Item = state.items.get(uid)
+				if it == null:
+					w.tried = -1
+				elif all or it.ver != w.tried or now >= w.retry_at:
+					early_tries += 1
+					_early_wait = NEVER
+					if _apply_early(e[1], e[3], e[4], e[5], e[6], e[2], e[7], e[8], e[9], now):
+						w.head += 1
+						state.later_n -= 1
+						w.tried = -2
+						w.retry_at = NEVER
+						continue
+					w.tried = it.ver
+					w.retry_at = _early_wait
+			break
+		if w.head >= w.q.size():
+			var it: Item = state.items.get(uid)
+			if it != null:
+				it.waits = false
+			state.waiting.erase(uid)
+			return
+		if w.head >= 32 and w.head * 2 >= w.q.size():
+			w.q = w.q.slice(w.head)
+			w.head = 0
+		if w.retry_at <= now:
+			w.retry_at = NEVER  # (not tried, no item: nothing to try again for)
+		_file(uid, w)
+
+	## The lanes whose drift check failed, asked for again (`bre`), each at most every ASK_AGAIN_MSEC, as
+	## before; (ask_view, --belt-sim-ask=view) a lane the lattice draws only when its count is wrong (every
+	## ASK_LATTICE_MSEC at most; asked the moment it leaves the lattice), one out of the planned view every
+	## ASK_OUT_MSEC, doubling to ASK_OUT_MAX_MSEC while it keeps failing. (ask_near) Nearest the view's middle
+	## first: the bridge reads them in the order asked, bre_cap an update.
+	func _ask_mismatches(ch: Dictionary) -> void:
+		var mism: PackedInt64Array = ch["mismatch"]
+		if mism.is_empty():
+			return
+		var mn: PackedInt32Array = ch.get("mismatch_n", PackedInt32Array())
+		var c := Vector2(state.square.x, state.square.y) if view_all else view.get_center()
+		var out: Array = []  # [distance squared, key]
+		for i in mism.size():
+			var key: int = mism[i]
+			var count := mn[i] != 0 if i < mn.size() else true
+			var m: PackedInt32Array = state.lanes.get(key, PackedInt32Array())
+			var cls := 0  # 0 in view, 1 the lattice's, 2 out of view
+			if state.lat.has(key):
+				cls = 1
+			elif not m.is_empty() and not _in_view(key, m[1] / 2, 0):
+				cls = 2
+			var every := ASK_AGAIN_MSEC
+			if ask_view:
+				if cls == 1:
+					if not count:
+						state.lat_pend[key] = true
+						ask_held_n += 1
+						continue
+					every = ASK_LATTICE_MSEC
+				elif cls == 2:
+					every = int(state.out_every.get(key, ASK_OUT_MSEC))
+				else:
+					state.out_every.erase(key)
+			var last: int = state.asked.get(key, -LAT_FAR)
+			if now_msec - last < every:
+				ask_held_n += 1
+				continue
+			state.asked[key] = now_msec
+			if ask_view and cls == 2:
+				# (Failing again after a quiet spell: from ASK_OUT_MSEC again.)
+				var fresh: bool = not state.out_every.has(key) or now_msec - last > 2 * every
+				state.out_every[key] = ASK_OUT_MSEC if fresh else mini(every * 2, ASK_OUT_MAX_MSEC)
+			if cls == 1:
+				state.lat_pend.erase(key)
+				ask_lat_n += 1
+			elif cls == 2:
+				ask_out_n += 1
+			else:
+				ask_view_n += 1
+			var d2 := 0.0
+			if not m.is_empty():
+				var p := _point(key, m[1] * 0.5)
+				var dx := float(p.x) - float(c.x)
+				var dz := float(p.z) - float(c.y)
+				d2 = dx * dx + dz * dz
+			out.append([d2, key])
+		if ask_near:
+			out.sort_custom(func(x: Array, y: Array) -> bool: return x[0] < y[0] or x[0] == y[0] and x[1] < y[1])
+		for e: Array in out:
+			resend.append(e[1])
 
 	## A lane to ask the bridge for again (`bre`), at most every ASK_AGAIN_MSEC.
 	func _ask(key: int) -> void:
@@ -979,9 +2049,8 @@ class Job:
 			var it: Item = state.items.get(uid)
 			if it != null and dropped.has(it.lane):
 				t = now
-		if t > now or not held.is_empty() and held.has(uid):
-			held[uid] = true
-			state.later.append([1, uid, t])
+		if t > now or _held(uid, held):
+			_hold([1, uid, t], held, false, NEVER)
 			return
 		_go(uid)
 
@@ -1010,6 +2079,7 @@ class Job:
 				state.renewing.erase(it)
 				state.kept[it] = c
 				_mark(it)
+				_touch(it)
 				return
 		_remove(uid)
 
@@ -1018,16 +2088,29 @@ class Job:
 	## continuation of a moving item's record (it reaches the change's lane and place at the change's tick
 	## at the same speed): the item goes on from where its record has it now, the rest of its reach and the
 	## change's beyond, through the lanes ahead, instead of standing at the cut till the next job. Items of
-	## another look (item, stack) or out of view are left to the next job. Returns true when taken.
+	## another look (item, stack) or out of view are left to the next job. Returns true when taken; not
+	## taken only for want of time (a start whose item stands there from a later tick), _early_wait says
+	## that tick.
 	func _apply_early(uid: int, item: int, stack: int, key: int, pos: int, t0: int, v: int, reach: int, _run: int, now: int) -> bool:
 		var it: Item = state.items.get(uid)
+		if it == null and _puts.has(uid) and int(_puts[uid]) == t0:
+			# (--inserter-handoff) An item a hand puts on its belt: made now, hidden till the put's tick.
+			_apply_one(uid, item, stack, key, pos, t0, v, reach, _run)
+			var nit: Item = state.items.get(uid)
+			if nit != null:
+				nit.show_at = float(t0)
+				_mark(nit)
+			early_n += 1
+			return true
 		if it == null or it.parked or it.item_id != item or it.count != clampi(stack, 1, MAX_STACK) or state.kept.has(it):
 			return false
 		if it.v <= 0:
-			if v > 0 and it.lane == key and it.pos == pos and it.t0 <= now:
-				_apply_one(uid, item, stack, key, pos, t0, v, reach, _run)
-				early_n += 1
-				return true
+			if v > 0 and it.lane == key and it.pos == pos:
+				if it.t0 <= now:
+					_apply_one(uid, item, stack, key, pos, t0, v, reach, _run)
+					early_n += 1
+					return true
+				_early_wait = it.t0
 			return false
 		if v != it.v:
 			return false
@@ -1047,8 +2130,10 @@ class Job:
 		it.reach = (d - d0) + reach
 		var m: PackedInt32Array = state.lanes.get(it.lane, PackedInt32Array())
 		it.run = it.pos + int(state.sim.run_of(it.lane)) if not m.is_empty() and m[0] == BeltSim.STRAIGHT else 0
-		if not _in_view(it.lane, it.pos, it.reach):
+		var why := _hide_why(it.lane, it.pos, it.reach, it.v)
+		if why != 0:
 			_park(it)
+			_set_lat(it, why == 2)
 			parked += 1
 			return true
 		_plan(it)
@@ -1067,6 +2152,7 @@ class Job:
 			it.c = cos(a)
 			it.s = sin(a)
 			it.parked = true
+			it.waits = later_tick and not state.waiting.is_empty() and state.waiting.has(uid)
 			state.items[uid] = it
 		elif it.item_id != item:
 			it.item_id = item
@@ -1079,9 +2165,12 @@ class Job:
 		it.v = v
 		it.reach = reach
 		it.run = run
-		if not _in_view(key, pos, reach):
+		_touch(it)
+		var why := _hide_why(key, pos, reach, v)
+		if why != 0:
 			if not it.parked:
 				_park(it)
+			_set_lat(it, why == 2)
 			parked += 1
 			return
 		if it.parked:
@@ -1100,6 +2189,7 @@ class Job:
 		it.path = PackedFloat32Array()
 		it.hidden = p0.w < 0.5
 		_mark(it)
+		_touch(it)
 		# Past its lane's back end (a read pushed it back off the line): in the game it is on a lane
 		# behind, outside what is sent; hidden until it gets to the lane's entry, then on along it.
 		var lm: PackedInt32Array = state.lanes.get(it.lane, PackedInt32Array())
@@ -1304,6 +2394,7 @@ class Job:
 		_free_path(it)
 		state.renewing.erase(it)
 		state.kept.erase(it)
+		state.lat_items.erase(it)
 
 	func _free_path(it: Item) -> void:
 		if it.path_at < 0:
@@ -1532,6 +2623,7 @@ class Job:
 		recs.data = PackedFloat32Array()
 		var base := recs.base
 		var dirty := recs.dirty
+		var per_page := recs.per_page
 		var n := 0
 		for e in batch:
 			if e.slot < 0 or e.stamp == writing:
@@ -1552,7 +2644,7 @@ class Job:
 				d[o + 12] = float(it.slot - e.slot)
 				d[o + 13] = float((e as Layer).k)
 				d[o + 14] = kind.pile
-				dirty[r / BeltRecords.PER_PAGE] = true
+				dirty[r / per_page] = true
 				continue
 			# Every item turns, models, icon cards and blocks alike (ItemCards.turn_for): a lone card
 			# left square stood straight beside turned models and the far icons (owner).
@@ -1585,8 +2677,8 @@ class Job:
 			d[o + 12] = 0.0
 			d[o + 13] = 0.0
 			d[o + 14] = 0.0
-			d[o + 15] = 0.0
-			dirty[r / BeltRecords.PER_PAGE] = true
+			d[o + 15] = it.hide_at - base if it.hide_at >= 0.0 else (base - it.show_at if it.show_at >= 0.0 else 0.0)
+			dirty[r / per_page] = true
 			if dump != null and e is Item:
 				dump_ids.append_array(PackedInt64Array([it.uid, it.item_id, it.count, it.lane, it.pos, it.t0, it.v, it.reach]))
 				dump_recs.append_array(d.slice(o, o + BeltRecords.FLOATS))
@@ -1625,6 +2717,11 @@ var protos: ProtoDB:
 ## world.gd (main.gd sets it; lanes come from the bridge now, so nothing is read from it).
 var world = null
 
+## (The debug menu's update overlays, update_overlay.gd) Called with each job once it is applied: no job runs
+## then, the one moment the main thread may read the simulation's and the lattice's state. Reads only. Unset
+## (the default) it costs one check a job.
+var debug_tap: Callable
+
 ## The bridge sent `bi`: it is older than `bs` and nothing near is drawn from it (handle(); once a
 ## connection, main.gd shows the player a message).
 signal old_bridge
@@ -1656,10 +2753,33 @@ var _inbox: Array = []
 ## a job together, once all have come (or the next update does).
 var _parts: Array = []
 var _parts_tick := -1
+## (K22, --belt-sim-removed-now=off: as before) Belts Zenith has taken away (`mnd`, `del`: main.gd), unit -> the
+## tile it stood on, and the tiles a belt was built on meanwhile (`add`). The next job takes a removed belt's lanes
+## out of the simulation and its items out of the drawing there and then (an internal `brm` message, first in the
+## job); one with a belt built on its tile since is left to the bridge's `bs` (a fast-replace: `add` and `del`
+## come together, the game keeps the items and the new lanes take them over, replace_at). Before, the lanes stayed
+## until the bridge's `dl`, and a dropped lane's items stood up to KEEP_UPDATES jobs for far icons that never come
+## inside the square: a belt mined with items left them drawn for a while.
+static var removed_now := true
+var _removed := {}
+var _built_tiles := {}
 var _job: Job = null
 var _task := -1
 var _known := {}  # item id -> [lift, turns, pile step], kinds item_cards.gd has dressed
 var _dressing := {}  # item id -> true: kinds made, their looks still being read
+## (A4) _known's changes counted; the copy the jobs read and the count it was made at; the far icons' chunks
+## as last listed and belt_lanes.gd's count of their changes then (-2: far icons off).
+var _known_ver := 0
+var _known_copy = null
+var _known_sent := -1
+var _far_copy = null
+var _far_ver := -3
+## --belt-draw-skip-same=off: every job gets a fresh copy of the looks and of the far icons' chunks, the far
+## icons are handed the square every result and the lattice's switch set every result, as before. On (the
+## default): only when they changed.
+static var skip_same := true
+var _ho_last: Array = []  # what lanes.hand_over was last given
+var _lat_on_set := -1.0
 var _rewrite := false
 ## Items are drawn on the game's clock (the messages' ticks, run on at its measured rate), one gap
 ## between updates and a margin for the jobs behind it.
@@ -1671,6 +2791,7 @@ var _count := 0
 var _square := Vector3(0.0, 0.0, -1.0)
 var _positions := {}
 var _watch := {}
+var _hands: Array = []  # (--inserter-handoff) Job.hands not yet taken by the arms
 var watch_all := false
 var _epoch := -1
 var _height_known := false
@@ -1704,7 +2825,6 @@ var stats := {"frames": 0, "main_usec": 0, "jobs": 0, "worker_usec": 0, "worst_j
 ## ticks msec; 0 while it hasn't (--stutter-probe's JOIN line).
 var load_done_msec := 0
 var _load_seen := false
-const Probing := preload("res://scripts/debug/probing.gd")
 
 
 ## Main-thread time by part of _apply into world.prof (--stutter-probe shows them as w_bi_<key>; kept
@@ -1736,18 +2856,36 @@ static func read_flags(args: PackedStringArray) -> void:
 			Job.shift_keep = a.substr(22) != "off"
 		elif a.begins_with("--belt-sim-read-skip-same="):
 			Job.read_skip_same = a.substr(26) != "off"
+		elif a.begins_with("--belt-sim-take-first="):
+			Job.take_first = a.substr(22) != "off"
+		elif a.begins_with("--belt-sim-take-line="):
+			Job.take_line = a.substr(21) != "off"
+		elif a.begins_with("--belt-sim-take-edge="):
+			Job.take_edge = a.substr(21) != "off"
+		elif a.begins_with("--belt-sim-ug-guard="):
+			Job.ug_guard = a.substr(20) != "off"
 		elif a.begins_with("--belt-sim-hold="):
 			Job.hold = a.substr(16) != "off"
+		elif a.begins_with("--belt-sim-dead-walls="):
+			Job.dead_walls = a.substr(22) == "on"
 		elif a.begins_with("--belt-sim-split-wake="):
 			Job.split_wake = a.substr(22) != "off"
 		elif a.begins_with("--belt-sim-ask-unknown="):
 			Job.ask_unknown = a.substr(23) != "off"
+		elif a.begins_with("--belt-sim-replace-at="):
+			Job.replace_at = a.substr(22) != "off"
+		elif a.begins_with("--belt-sim-removed-now="):
+			removed_now = a.substr(23) != "off"
 		elif a.begins_with("--belt-draw-coalesce="):
 			Job.coalesce = a.substr(21) != "off"
 		elif a.begins_with("--belt-draw-early="):
 			Job.early = a.substr(18) != "off"
 		elif a.begins_with("--belt-draw-view="):
 			Job.view_cull = a.substr(17) != "off"
+		elif a.begins_with("--belt-draw-view-ground="):
+			view_ground = a.substr(24) != "off"
+		elif a.begins_with("--belt-draw-view-lead="):
+			view_lead = a.substr(22) != "off"
 		elif a.begins_with("--belt-draw-margin="):
 			margin_max = maxf(DRAW_MARGIN, float(a.substr(19)))
 		elif a.begins_with("--belt-draw-native="):
@@ -1756,6 +2894,8 @@ static func read_flags(args: PackedStringArray) -> void:
 			State.force_gd = a.substr(18) == "off"
 		elif a.begins_with("--belt-draw-pile="):
 			Job.pile_one = a.substr(17) != "off"
+		elif a.begins_with("--belt-draw-dump-parks="):
+			Job.dump_parks = a.substr(23) != "off"
 		elif a.begins_with("--belt-job-high="):
 			job_high = a.substr(16) != "off"
 		elif a.begins_with("--belt-draw-lattice-pile="):
@@ -1767,31 +2907,66 @@ static func read_flags(args: PackedStringArray) -> void:
 			BeltLattice.world = a.substr(20) != "sim"
 		elif a.begins_with("--belt-draw-lattice-unison="):
 			BeltLattice.unison = a.substr(27) != "off"
+		elif a.begins_with("--belt-draw-lattice-settle="):
+			BeltLattice.settle = a.substr(27) != "off"
+		elif a.begins_with("--belt-draw-lattice-creep="):
+			BeltLattice.creep = a.substr(26) == "on" or a.substr(26) == "flow"
+			BeltLattice.creep_flow = a.substr(26) != "on"
+		elif a.begins_with("--belt-draw-lattice-world="):
+			BeltLattice.world_all = a.substr(26) != "straight"
+		elif a.begins_with("--belt-draw-lattice-standing="):
+			BeltLattice.standing_obs = a.substr(29) != "world"
+		elif a.begins_with("--belt-draw-lattice-turns="):
+			BeltLattice.item_turns = a.substr(26) != "slot"
 		elif a.begins_with("--belt-capture-thread="):
 			capture_thread = a.substr(22) == "on"
+		elif a.begins_with("--belt-draw-later-tick="):
+			Job.later_tick = a.substr(23) != "off"
+		elif a.begins_with("--belt-draw-park-lattice="):
+			Job.park_lat = a.substr(25) == "on"
+		elif a.begins_with("--belt-sim-ask="):
+			Job.ask_view = a.substr(15) != "all"
+		elif a.begins_with("--belt-sim-ask-near="):
+			Job.ask_near = a.substr(20) != "off"
+		elif a.begins_with("--belt-draw-skip-same="):
+			skip_same = a.substr(22) != "off"
+		elif a.begins_with("--belt-draw-small-pages="):
+			BeltRecords.small = a.substr(24) != "off"
+		elif a.begins_with("--inserter-handoff-slack="):
+			Job.handoff_slack = maxi(0, int(a.substr(25)))
+		elif a.begins_with("--inserter-handoff-margin="):
+			handoff_margin = maxf(0.0, float(a.substr(26)))
+	InserterArms.read_flags(args)
 
 
 static func flags_text() -> String:
-	return "ahead %d, gone order %s, lead %s, head move %s, read apply %s, read conserve %s, read forward %s, shift keep %s, read skip same %s, hold %s, split wake %s, coalesce %s, view %s, margin %.0f, native draw %s, pile %s, lattice %s%s, lattice unison %s, early %s, job %s" % [Job.ahead,
+	return "ahead %d, gone order %s, lead %s, head move %s, read apply %s, read conserve %s, read forward %s, shift keep %s, read skip same %s, take first %s, take line %s, take edge %s, ug guard %s, hold %s, dead walls %s, split wake %s, coalesce %s, view %s, margin %.0f, native draw %s, pile %s, lattice %s%s, lattice unison %s, lattice settle %s, early %s, job %s" % [Job.ahead,
 		"on" if Job.gone_order else "off", "on" if Job.lead_on else "off", "on" if State.head_move else "off",
 		"on" if Job.read_apply else "off", "on" if Job.read_conserve else "off", "on" if Job.read_forward else "off", "on" if Job.shift_keep else "off",
-		"on" if Job.read_skip_same else "off", "on" if Job.hold else "off",
-		"on" if Job.split_wake else "off", "on" if Job.coalesce else "off", "on" if Job.view_cull else "off", margin_max,
+		"on" if Job.read_skip_same else "off", "on" if Job.take_first else "off", "on" if Job.take_line else "off", "on" if Job.take_edge else "off", "on" if Job.ug_guard else "off", "on" if Job.hold else "off",
+		"on" if Job.dead_walls else "off", "on" if Job.split_wake else "off", "on" if Job.coalesce else "off", "on" if Job.view_cull else "off", margin_max,
 		"on" if State.draw_native and ClassDB.class_exists(NATIVE_DRAW) else "off", "one" if Job.pile_one else "each",
-		("world" if BeltLattice.world else "sim") if BeltLattice.on else "off",
-		(", lattice piles " + ("on" if BeltLattice.piles else "off") + ", lattice native " + ("on" if State.lattice_native
-			and ClassDB.class_exists(NATIVE_LATTICE) else "off")) if BeltLattice.on else "",
-		"on" if BeltLattice.unison else "off", "on" if Job.early else "off",
-		"high" if job_high else "low"]
+		(("world " + ("all" if BeltLattice.world_all else "straight")) if BeltLattice.world else "sim") if BeltLattice.on else "off",
+		(", lattice standing " + ("obs" if BeltLattice.standing_obs else "world") + ", lattice piles " + ("on" if BeltLattice.piles else "off")
+			+ ", lattice turns " + ("item" if BeltLattice.item_turns else "slot") + ", lattice creep " + (("flow" if BeltLattice.creep_flow else "on") if BeltLattice.creep else "off")
+			+ ", lattice native " + ("on" if State.lattice_native and ClassDB.class_exists(NATIVE_LATTICE) else "off")) if BeltLattice.on else "",
+		"on" if BeltLattice.unison else "off", "on" if BeltLattice.settle else "off", "on" if Job.early else "off",
+		"high" if job_high else "low"] + ", later %s, park lattice %s, ask %s%s, skip same %s, pages %s, replace at %s, removed now %s" % [
+		"tick" if Job.later_tick else "list", "on" if Job.park_lat else "off", "view" if Job.ask_view else "all",
+		" near" if Job.ask_near else "", "on" if skip_same else "off", "64 KB" if BeltRecords.small else "256 KB",
+		"on" if Job.replace_at else "off", "on" if removed_now else "off"] 		+ ", " + InserterArms.flags_text() + (" (slack %d, margin %.1f jobs)" % [Job.handoff_slack,
+		handoff_margin] if InserterArms.wants_handoff() else "")
 
 
 func _ready() -> void:
 	_clock.ease = 0.5
 	_cards.name = "Cards"
 	_cards.casts_shadow = false
+	_cards.render_layers = ItemCards.BELT_LAYER
 	add_child(_cards)
 	_lat_cards.name = "LatticeCards"
 	_lat_cards.casts_shadow = false
+	_lat_cards.render_layers = ItemCards.BELT_LAYER
 	_lat_cards.record_tex = 1
 	add_child(_lat_cards)
 	_bench = "--item-bench" in OS.get_cmdline_user_args()
@@ -1799,8 +2974,8 @@ func _ready() -> void:
 	_sync = _sync or "--belt-items-sync" in OS.get_cmdline_user_args() or Engine.get_write_movie_path() != ""
 	Job.debug = "--belt-sim-debug" in OS.get_cmdline_user_args()
 	read_flags(OS.get_cmdline_user_args())
-	if State.force_gd and not (_state.sim is BeltSim):
-		_state = State.new()  # (--belt-sim-native=off: the first was made before the flags were read)
+	if State.force_gd and not (_state.sim is BeltSim) or _state.records.rows != BeltRecords.new().rows:
+		_state = State.new()  # (--belt-sim-native=off, --belt-draw-small-pages: the first was made before the flags were read)
 	for a in OS.get_cmdline_user_args():
 		if a.begins_with("--belt-capture="):
 			_capture = FileAccess.open(a.substr(15), FileAccess.WRITE)
@@ -1866,11 +3041,21 @@ func reset() -> void:
 	_state.height = height
 	old_bridge_seen = false
 	_inbox.clear()
+	_removed.clear()
+	_built_tiles.clear()
 	_cards.reset()
 	_lat_cards.reset()
 	_lat_records = null
 	RenderingServer.global_shader_parameter_set("f3d_belt_lattice_on", 0.0)
+	_lat_on_set = 0.0
 	_known.clear()
+	_known_ver += 1
+	# (A new State: its records start with no looks and no far icons' chunks.)
+	_known_sent = -1
+	_known_copy = null
+	_far_copy = null
+	_far_ver = -3
+	_ho_last = []
 	_dressing.clear()
 	_positions.clear()
 	_count = 0
@@ -1881,6 +3066,18 @@ func reset() -> void:
 	_records = null
 	_record_pages = 0
 	_clock_base = -1.0
+
+
+## The game tick the items are drawn at (the clock less the update gap and the jobs' margin), -1
+## before the first update; inserter_arms.gd draws the arms at the same tick.
+func drawn_tick() -> float:
+	return _drawn
+
+
+## Where items ride on the belts drawn (their base above the ground: the belt model's top), for an
+## inserter's grip to close on them there (inserter_arms.gd --inserter-grip).
+func item_height() -> float:
+	return _state.height
 
 
 func count() -> int:
@@ -1894,6 +3091,12 @@ func covered() -> Vector3:
 
 
 func handle(msg: Dictionary) -> void:
+	if msg.get("t") == "ie":
+		# (--inserter-handoff: the hands' picks and puts, for the simulation; captured with the updates.)
+		if _capture != null:
+			_capture_line(msg)
+		_inbox.append(msg)
+		return
 	if msg.get("t") != "bs":
 		# `bi`, from a bridge older than `bs` (main's 0.1.4 mod, which doesn't know our hello's `bs`):
 		# not drawn. Said once a connection (main.gd tells the player), else the belts stand empty in silence.
@@ -1928,6 +3131,22 @@ func handle(msg: Dictionary) -> void:
 	_parts.append(msg)
 	if _parts.size() >= parts:
 		_flush_parts()
+
+
+## (removed_now) A belt Zenith takes away (`mnd` with g 1, `del`; x, y its place in 1/256 tile): its lanes and
+## their items leave in the next job.
+func belt_removed(unit: int, x: int, y: int) -> void:
+	if removed_now and unit > 0:
+		_removed[unit] = Vector2i(floori(x / 256.0), floori(y / 256.0))
+
+
+## (removed_now) A belt built (`add`) at x, y (1/256 tile): a belt removed on its tiles before the next job was
+## replaced, its items kept. A splitter (centred on a tile's edge) covers both tiles either side.
+func belt_built(x: int, y: int) -> void:
+	if not removed_now:
+		return
+	for d: Vector2i in [Vector2i(-125, -125), Vector2i(125, -125), Vector2i(-125, 125), Vector2i(125, 125)]:
+		_built_tiles[Vector2i(floori((x + d.x) / 256.0), floori((y + d.y) / 256.0))] = true
 
 
 func _flush_parts() -> void:
@@ -1965,7 +3184,7 @@ func _process(delta: float) -> void:
 	_clock.advance(delta)
 	var step := 0.0 if MomentHold.on else delta * _clock.rate  # a screenshot's moment: items stand still
 	if not _sync:
-		var want := clampf(_job_ticks * margin_jobs + 1.0, DRAW_MARGIN, margin_max)
+		var want := clampf(_job_ticks * (margin_jobs + (handoff_margin if InserterArms.wants_handoff() else 0.0)) + 1.0, DRAW_MARGIN, margin_max)
 		_margin = move_toward(_margin, want, step * (0.5 if want > _margin else 0.05))
 	if _clock.tick >= 0.0:
 		var drawn := _clock.tick - _clock.gap - _margin
@@ -1980,6 +3199,7 @@ func _process(delta: float) -> void:
 		_epoch = _cards.epoch
 		_wait()
 		_known.clear()
+		_known_ver += 1
 		_dressing.clear()
 		_rewrite = true
 	if _task >= 0 and WorkerThreadPool.is_task_completed(_task):
@@ -2041,17 +3261,36 @@ func _dressed() -> void:
 		if _cards.dressed(item_id) and _lat_cards.dressed(item_id):
 			_dressing.erase(item_id)
 			_known[item_id] = _look(item_id)
+			_known_ver += 1
 			_rewrite = true
 
 
 func _start(delta: float) -> void:
 	var job := Job.new()
 	job.state = _state
+	# (removed_now) Belts taken away since the last job, but those with a belt built on their tile since.
+	if not _removed.is_empty():
+		var gone := PackedInt64Array()
+		for u: int in _removed:
+			if not _built_tiles.has(_removed[u]):
+				gone.append(u)
+		if not gone.is_empty():
+			_inbox.push_front({"t": "brm", "u": gone})
+		_removed.clear()
+	_built_tiles.clear()
 	job.msgs = _inbox
 	_inbox = []
 	job.full = _rewrite
 	_rewrite = false
-	job.known = _known.duplicate()
+	# (A4, --belt-draw-skip-same) The looks copied, and the far icons' chunks listed, only when they changed:
+	# a job only reads them, so the last copy serves (and the native records keep theirs).
+	if not skip_same or _known_sent != _known_ver or _known_copy == null:
+		_known_copy = _known.duplicate()
+		_known_sent = _known_ver
+		job.known_new = true
+	else:
+		job.known_new = false
+	job.known = _known_copy
 	job.model_cap = ItemCards.model_cap
 	var cam := get_viewport().get_camera_3d() if view_led and is_inside_tree() else null
 	if cam != null:
@@ -2064,7 +3303,18 @@ func _start(delta: float) -> void:
 	job.now_msec = Time.get_ticks_msec()
 	_watch.clear()
 	if lanes != null and is_instance_valid(lanes) and lanes.distance > 0:
-		job.far_built = lanes.built_chunks()
+		var ver: int = lanes.chunks_ver if "chunks_ver" in lanes else -1
+		if not skip_same or ver < 0 or ver != _far_ver or _far_copy == null:
+			_far_copy = lanes.built_chunks()
+			_far_ver = ver
+			job.far_new = true
+		else:
+			job.far_new = false
+		job.far_built = _far_copy
+	else:
+		job.far_new = not skip_same or _far_copy != null or _far_ver != -2
+		_far_copy = null
+		_far_ver = -2
 	var vr := _view_rect()
 	if vr.size.x > 0.0:
 		job.view = vr
@@ -2085,7 +3335,8 @@ func _start(delta: float) -> void:
 
 
 ## (view) The ground rectangle (x, z tiles) the camera sees: its four corner rays meeting the items'
-## height, each cut VIEW_FAR tiles out when it reaches no further (or looks up). Empty with no camera.
+## height, each cut VIEW_FAR tiles out when it reaches no further (or looks up); with view_ground,
+## VIEW_GROUND_FAR, and the rectangle cut to the simulated square. Empty with no camera.
 func _view_rect() -> Rect2:
 	var cam := get_viewport().get_camera_3d()
 	if cam == null:
@@ -2093,18 +3344,45 @@ func _view_rect() -> Rect2:
 	var vp := get_viewport().get_visible_rect().size
 	var y := _state.height
 	var o := cam.global_position
+	var far := VIEW_GROUND_FAR if view_ground else VIEW_FAR
 	var r := Rect2(Vector2(o.x, o.z), Vector2.ZERO)
 	for c in [Vector2.ZERO, Vector2(vp.x, 0.0), Vector2(0.0, vp.y), vp]:
 		var ro := cam.project_ray_origin(c)
 		var n := cam.project_ray_normal(c)
 		var hit: Vector3
-		if n.y < -1e-4 and (y - ro.y) / n.y <= VIEW_FAR:
+		if n.y < -1e-4 and (y - ro.y) / n.y <= far:
 			hit = ro + n * ((y - ro.y) / n.y)
 		else:
 			var h := Vector2(n.x, n.z)
 			h = h.normalized() if h.length() > 1e-6 else Vector2(1.0, 0.0)
-			hit = Vector3(ro.x + h.x * VIEW_FAR, y, ro.z + h.y * VIEW_FAR)
+			hit = Vector3(ro.x + h.x * far, y, ro.z + h.y * far)
 		r = r.expand(Vector2(hit.x, hit.z))
+	if view_lead:
+		# (view_lead) The camera's ground speed, smoothed over the jobs; the view joined with itself that far on.
+		var now := Time.get_ticks_usec()
+		var at := Vector2(o.x, o.z)
+		var gone_s := (now - _lead_usec) / 1.0e6
+		if _lead_usec > 0 and gone_s > 0.0 and gone_s < 2.0:
+			_lead_vel = _lead_vel.lerp((at - _lead_pos) / gone_s, 0.5)
+		else:
+			_lead_vel = Vector2.ZERO
+		_lead_pos = at
+		_lead_usec = now
+		var ahead := 2.0 * maxf(_job_ticks, 1.0) / maxf(_clock.rate, 1.0)
+		var shift := (_lead_vel * ahead).limit_length(VIEW_LEAD_MAX)
+		if shift.length() > 0.5:
+			r = r.merge(Rect2(r.position + shift, r.size))
+	if view_ground and _square.z >= 0.0:
+		# (view_ground) Cut to the simulated square: the loaded edge, or the client's belt item distance
+		# while the square still loads out to it, with the records' margin.
+		var half := _square.z
+		if lanes != null and is_instance_valid(lanes):
+			half = maxf(half, float(lanes.near))
+		half += INDEX_MARGIN
+		var cut := r.intersection(Rect2(_square.x - half, _square.y - half, 2.0 * half, 2.0 * half))
+		# (A view wholly outside the square: a sliver there, which nothing is in; an empty rectangle
+		# would mean no camera, everything in view.)
+		return cut if cut.has_area() else Rect2(r.get_center(), Vector2(0.01, 0.01))
 	return r
 
 
@@ -2138,6 +3416,7 @@ func _apply(job: Job) -> void:
 		_cards.prepare(item_id)
 		_lat_cards.prepare(item_id)
 		_known[item_id] = _look(item_id)
+		_known_ver += 1
 		if not (_cards.dressed(item_id) and _lat_cards.dressed(item_id)):
 			_dressing[item_id] = true
 	_prof("prepare", t1)
@@ -2149,9 +3428,19 @@ func _apply(job: Job) -> void:
 		var unknown_items := {}
 		for key in job.unknown:
 			unknown_items[ItemCards.item_of(int(key))] = true
-		lanes.hand_over(job.square, job.held_chunks, unknown_items.keys())
+		# (skip_same: the same square, held chunks and kinds as last time set every icon material's
+		# parameters to what they are.)
+		var ho := [job.square, job.held_chunks, unknown_items.keys()]
+		if not skip_same or ho != _ho_last:
+			_ho_last = ho
+			lanes.hand_over(job.square, job.held_chunks, ho[2])
 	_prof("handover", t1)
 	_positions = job.positions
+	if not job.hands.is_empty():
+		_hands.append_array(job.hands)
+		if _hands.size() > 4096:
+			_hands = _hands.slice(_hands.size() - 4096)
+	stats["ie"] = int(stats.get("ie", 0)) + job.ie_n
 	t1 = Time.get_ticks_usec()
 	if job.paths != null:
 		_paths_image = job.paths
@@ -2175,6 +3464,9 @@ func _apply(job: Job) -> void:
 	stats["renew_usec"] = int(stats.get("renew_usec", 0)) + job.renew_usec
 	stats["cap_usec"] = int(stats.get("cap_usec", 0)) + job.cap_usec
 	stats["ticks"] = int(stats.get("ticks", 0)) + job.ticks
+	stats["replaced"] = int(stats.get("replaced", 0)) + job.replaced_n
+	stats["removed_lanes"] = int(stats.get("removed_lanes", 0)) + job.removed_lanes_n
+	stats["removed_items"] = int(stats.get("removed_items", 0)) + job.removed_items_n
 	var sim = _state.sim
 	if "us_step" in sim:
 		stats["sim_step_usec"] = sim.us_step
@@ -2189,11 +3481,29 @@ func _apply(job: Job) -> void:
 		stats["skips"] = int(stats.get("skips", 0)) + 1
 	stats["records_written"] += job.records_written
 	stats["worst_job_usec"] = maxi(stats["worst_job_usec"], job.usec)
+	# (0.2.1's counters: sums over the jobs, and the last job's levels.)
+	var sums := {"early": job.early_n, "early_tries": job.early_tries, "drained": job.drained, "ask_view": job.ask_view_n,
+		"ask_lat": job.ask_lat_n, "ask_out": job.ask_out_n, "ask_held": job.ask_held_n, "ask_unknown": job.unknown_asked,
+		"lat_parks": job.lat_parks, "lat_unparks": job.lat_unparks}
+	for k: String in sums:
+		stats[k] = int(stats.get(k, 0)) + int(sums[k])
+	stats["later"] = job.later_n
+	stats["later_max"] = maxi(int(stats.get("later_max", 0)), job.later_n)
+	stats["waiting"] = job.waiting_n
+	stats["slots"] = job.gauges[0]
+	stats["slots_hidden"] = job.gauges[1]
+	stats["parked_view"] = job.gauges[2]
+	stats["parked_lat"] = job.gauges[3]
+	stats["lat_lanes"] = job.lat_lanes_n
+	stats["lat_slots"] = _state.lattice.slots_n
+	stats["items"] = job.count
 	_bench_worker_usec += job.usec
 	_bench_jobs += 1
 	if not _sync:
 		var took := ((job.done_usec if job.done_usec > 0 else Time.get_ticks_usec()) - job.started_usec) / 1000000.0 * _clock.rate
 		_job_ticks = took if took > _job_ticks else lerpf(_job_ticks, took, 0.1)
+	if debug_tap.is_valid():
+		debug_tap.call(job)
 
 
 ## (--belt-draw-lattice) The lattice's record pages (f3d_belt_lattice), kinds and mask (f3d_belt_mask).
@@ -2218,7 +3528,10 @@ func _apply_lattice(job: Job, aabb: AABB) -> void:
 			RenderingServer.global_shader_parameter_set("f3d_belt_mask", _lat_mask)
 		else:
 			_lat_mask.update(job.lat_mask)
-	RenderingServer.global_shader_parameter_set("f3d_belt_lattice_on", 1.0 if job.lat_lanes > 0 and _lat_mask != null else 0.0)
+	var on := 1.0 if job.lat_lanes > 0 and _lat_mask != null else 0.0
+	if not skip_same or on != _lat_on_set:
+		_lat_on_set = on
+		RenderingServer.global_shader_parameter_set("f3d_belt_lattice_on", on)
 
 
 func _upload(p: Dictionary) -> void:
@@ -2337,11 +3650,26 @@ func drawn_lattice(key: int) -> Array:
 			out.append(null)
 			continue
 		var g := clampf((t - d[o + 3]) / (d[o + 7] - d[o + 3]), 0.0, 1.0) if d[o + 7] > d[o + 3] else 1.0
+		var slid := 0
 		if d[o + 13] < 0.5 and d[o + 14] > 0.5 and d[o + 15] > 0.0:
-			g = fposmod((t - d[o + 3]) / d[o + 15], 1.0)
+			var q := (t - d[o + 3]) / d[o + 15]
+			g = q - floorf(q)
+			slid = floori(q)
 		var at := Vector3(d[o], d[o + 1], d[o + 2]) + Vector3(d[o + 4], d[o + 5], d[o + 6]) * g
-		out.append([at + Vector3(0.0, d[o + 10] + lift_k, 0.0), own_c if k > 0.5 else d[o + 8]])
+		var c := own_c if k > 0.5 else d[o + 8]
+		if d[o + 13] < 0.5 and d[o + 14] > 1.5:
+			# (Who the slot's item is now: belt_path.gdshaderinc's belt_lattice_turn.)
+			c = cos(ItemCards.lattice_turn(roundi(d[o + 8]) + slid, roundi(d[o + 9]), roundi(k) if k > 0.5 else 0))
+		out.append([at + Vector3(0.0, d[o + 10] + lift_k, 0.0), c])
 	return out
+
+
+## (--inserter-handoff) The inserters' takes and puts the jobs found since the last call (Job.hands), oldest
+## first: [why (BeltSim.HAND_*), inserter, tick, uid, x, z].
+func take_hands() -> Array:
+	var h := _hands
+	_hands = []
+	return h
 
 
 ## The simulation (tests, probes; only while no job runs).

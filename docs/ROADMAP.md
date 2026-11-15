@@ -94,3 +94,12 @@ Real Factorio 2.1 (with or without Space Age) played in 3D: a model for every ba
 Space Age entity, Factorio's own interface and hotkeys, your own saves, space platforms and the
 other planets, add-ons. Hotfixes on 0.1 (0.1.1, 0.1.2) fixed the bugs players reported and made
 big bases faster.
+
+### 0.2: Zenith runs the belts
+
+Zenith runs Factorio's belt logic itself, so items on belts move exactly as the game moves them
+and full belts are drawn full. Textured belts, undergrounds, splitters, inserters and the burner
+drill by David (Vasillo), the Cinematic look in the download, shading round every building, 3D
+grass and screenshots up to 8K. 0.2.1 brought big bases back to 60 UPS, with the next round of
+play-test fixes: mining and picking up as in Factorio, belt drags and undergrounds as in Factorio
+2.x, biters, pentapods and trees from Factorio's own pictures, and a server on another PC.

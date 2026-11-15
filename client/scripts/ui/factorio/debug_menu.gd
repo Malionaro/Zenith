@@ -18,6 +18,11 @@ extends Control
 ##   frame-time graph, counters, chunk borders), the debug probes run in the game (terrain, robots,
 ##   belt items' cost, flicker frames), the effects demo, redrawing chunks, and spots to move the
 ##   character to (a game change, under the same rule as Time).
+## - Updates: where and when the bridge updates the world (update_overlay.gd): each kind of update
+##   (chunk snapshots, entity changes, belt lanes read, checked and asked for, hands, movers, power,
+##   alerts...) outlined on the ground as it arrives, fading over a second, each its own switch and
+##   colour, a legend with its updates a second; and three states (the subscription, how each lane is
+##   drawn, the lattice against the simulation). The overlay node exists only while a kind is on.
 ## Esc cancels a running benchmark, then closes the report, then the menu.
 
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
@@ -27,6 +32,7 @@ const GamePause := preload("res://scripts/net/game_pause.gd")
 const BenchRunner := preload("res://scripts/debug/bench_runner.gd")
 const DebugOverlay := preload("res://scripts/debug/debug_overlay.gd")
 const ChunkGrid := preload("res://scripts/debug/chunk_grid.gd")
+const UpdateOverlay := preload("res://scripts/debug/update_overlay.gd")
 const RobotProbe := preload("res://scripts/debug/robot_probe.gd")
 const FlickerProbe := preload("res://scripts/debug/flicker_probe.gd")
 const BeltPathProbe := preload("res://scripts/debug/belt_path_probe.gd")
@@ -35,7 +41,7 @@ const FxDemo := preload("res://scripts/fx/fx_demo.gd")
 const Sfx := preload("res://scripts/fx/sfx.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
 
-const TABS := ["Time", "Benchmarks", "Tests"]
+const TABS := ["Time", "Benchmarks", "Tests", "Updates"]
 ## Factorio's day: 0 is noon, dusk 0.25, evening (darkest from) 0.45, morning 0.55, dawn 0.75.
 const DAY_PRESETS := [["Dawn", 0.65], ["Noon", 0.0], ["Sunset", 0.35], ["Night", 0.5]]
 const SPEEDS := [0.25, 0.5, 1.0, 2.0, 4.0]
@@ -120,6 +126,10 @@ var _grid: ChunkGrid
 var _terrain: Node
 var _probe: Node
 var _fx_demo: Node
+## The update overlays (update_overlay.gd), made with the first kind switched on, freed with the last.
+var _updates: UpdateOverlay = null
+var _update_boxes := {}  # kind id -> CheckBox
+var _updates_note: Label
 
 
 func _ready() -> void:
@@ -167,7 +177,7 @@ func _ready() -> void:
 	scroll.add_child(pad)
 	var pages := VBoxContainer.new()
 	pad.add_child(pages)
-	for page in [_time_page(), _bench_page(), _tests_page()]:
+	for page in [_time_page(), _bench_page(), _tests_page(), _updates_page()]:
 		page.visible = false
 		pages.add_child(page)
 		_pages.append(page)
@@ -204,6 +214,7 @@ func open(on: bool) -> void:
 		_refresh = 0.0
 		_ask("/f3d-debug", "state")
 		_show_bench_lasts()
+		_sync_updates()
 
 
 ## Esc: a running benchmark stops, then the report closes, then the menu. False when none was open.
@@ -1032,3 +1043,110 @@ func teleport(spot: String) -> void:
 		return
 	_back = here
 	_ask("/f3d-debug teleport %.1f %.1f" % [to.x, to.y], "teleport")
+
+
+# --- Updates -------------------------------------------------------------------------------------
+
+func _updates_page() -> Control:
+	var page := VBoxContainer.new()
+	page.name = "UpdatesPage"
+	page.add_theme_constant_override("separation", Kit.px(6))
+	var about := MenuKit.paragraph("Where and when the bridge updates the world: each kind outlines, on the ground and over the buildings, what it touched as it arrives, fading over a second, in its own colour, with a legend of its updates a second at the left. The states show how things are now instead. Nothing runs with every kind off.", 660)
+	about.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
+	page.add_child(about)
+	_updates_note = Kit.label("")
+	_updates_note.name = "UpdatesNote"
+	_updates_note.add_theme_color_override("font_color", Kit.RED_TEXT)
+	_updates_note.visible = false
+	page.add_child(_updates_note)
+	var all := HBoxContainer.new()
+	all.add_theme_constant_override("separation", Kit.px(8))
+	for b in [["All on", true], ["All off", false]]:
+		var button := MenuKit.button(str(b[0]))
+		button.name = "Updates_" + ("on" if b[1] else "off")
+		button.custom_minimum_size.x = Kit.px(110)
+		var on: bool = b[1]
+		button.pressed.connect(func() -> void:
+			for id: String in UpdateOverlay.kind_ids():
+				set_update_kind(id, on))
+		all.add_child(button)
+	page.add_child(all)
+	for k in UpdateOverlay.KINDS:
+		if k.size() <= 2:
+			page.add_child(Kit.label(str(k[1]), "FHeading"))
+			continue
+		var id: String = k[0]
+		var row := HBoxContainer.new()
+		row.add_theme_constant_override("separation", Kit.px(10))
+		var swatch := ColorRect.new()
+		swatch.color = k[2]
+		swatch.custom_minimum_size = Kit.pxv(14, 14)
+		swatch.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+		row.add_child(swatch)
+		var box := MenuKit.checkbox(str(k[1]), false)
+		box.name = "Upd_" + id
+		box.custom_minimum_size.x = Kit.px(250)
+		box.toggled.connect(func(on: bool) -> void: set_update_kind(id, on))
+		row.add_child(box)
+		var what := MenuKit.paragraph(str(k[3]), 380)
+		what.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
+		row.add_child(what)
+		page.add_child(row)
+		_update_boxes[id] = box
+	return page
+
+
+## A kind of the update overlays on or off (update_overlay.gd). False when it can't be: a public build (no
+## dev tools) or no game. The overlay is made for the first kind on and freed with the last, so with none
+## on there is no node and nothing runs.
+func set_update_kind(id: String, on: bool) -> bool:
+	if on and (not Settings.dev_tools() or main == null or main.get("world") == null):
+		_set_update_box(id, false)
+		if _updates_note != null:
+			_updates_note.text = "These need a game: connect first" if Settings.dev_tools() else "Dev builds only"
+			_updates_note.visible = true
+		return false
+	if _updates_note != null:
+		_updates_note.visible = false
+	if on:
+		if _updates == null or not is_instance_valid(_updates):
+			_updates = UpdateOverlay.new()
+			_updates.name = "UpdateOverlay"
+			_updates.world = main.world
+			_updates.belt_items = main.get("belt_items")
+			_updates.belt_lanes = main.get("belt_lanes")
+			main.world.add_child(_updates)
+		_updates.set_kind(id, true)
+	elif _updates != null and is_instance_valid(_updates):
+		_updates.set_kind(id, false)
+		if not _updates.any_on():
+			_updates.queue_free()
+			_updates = null
+	_set_update_box(id, on)
+	return true
+
+
+func _set_update_box(id: String, on: bool) -> void:
+	var box: CheckBox = _update_boxes.get(id)
+	if box != null and box.button_pressed != on:
+		box.set_pressed_no_signal(on)
+
+
+## The kinds switched on (tests), from the overlay when it is there.
+func update_kinds_on() -> Array:
+	return _updates.kinds_on() if _updates != null and is_instance_valid(_updates) else []
+
+
+func update_overlay() -> Node3D:
+	return _updates if _updates != null and is_instance_valid(_updates) else null
+
+
+## Opening the menu: an overlay gone with its game (the world freed) is made again in this one for the kinds
+## still ticked, or they are unticked when there is no game.
+func _sync_updates() -> void:
+	if _updates != null and is_instance_valid(_updates):
+		return
+	_updates = null
+	for id: String in _update_boxes:
+		if (_update_boxes[id] as CheckBox).button_pressed:
+			set_update_kind(id, true)

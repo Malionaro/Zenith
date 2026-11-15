@@ -46,6 +46,10 @@ static var _send: Callable
 static var _load_task := -1
 static var _loaded = null  # what the cache read on a worker thread found
 static var _loaded_mutex := Mutex.new()
+## The parts merged and written to the cache on a worker thread once all are in: on the main thread
+## the last part's message took 25-37 ms (client-cpu.md 5). [fp, merged] when done.
+static var _merge_task := -1
+static var _merged = null
 static var _ready_list = null  # [fp, merged] whole, waiting for mod_files.gd to find the mods
 
 
@@ -65,7 +69,7 @@ static func on_welcome(msg: Dictionary, send: Callable) -> void:
 	if fp == fingerprint or fp == _want:
 		# The same list again (every handshake starts with a welcome: a full resync, a lost one):
 		# kept if in use or being read from the cache; asked for again only while still arriving.
-		if fp != fingerprint and _load_task < 0:
+		if fp != fingerprint and _load_task < 0 and _merge_task < 0:
 			_ask(true)
 		return
 	_want = fp
@@ -90,11 +94,18 @@ static func on_part(msg: Dictionary) -> void:
 	if part < 1 or part > _total or not d is Dictionary or _want == fingerprint or _parts.has(part):
 		return  # in use already, or a part sent twice
 	_parts[part] = d
-	if _parts.size() == _total:
-		var merged := _merge(_parts.values())
+	if _parts.size() == _total and _merge_task < 0:
 		print("Mod graphics: graphics list from the bridge: %d parts in %d ms" % [_total, Time.get_ticks_msec() - _started_msec])
-		_save(_want, merged)
-		_apply_soon(_want, merged)
+		_merge_task = WorkerThreadPool.add_task(_merge_and_save.bind(_want, _parts.values(), ModFiles.active_mods().duplicate()))
+
+
+## On a worker thread: the parts as one list, kept in the cache, handed to poll().
+static func _merge_and_save(fp: String, parts: Array, mods: Dictionary) -> void:
+	var merged := _merge(parts)
+	_save(fp, merged, mods)
+	_loaded_mutex.lock()
+	_merged = [fp, merged]
+	_loaded_mutex.unlock()
 
 
 ## Once a frame: asks again for missing parts, and applies a cache read meanwhile.
@@ -105,6 +116,18 @@ static func poll() -> void:
 		_ready_list = null
 		if l[0] == _want:
 			_apply(l[0], l[1])
+	if _merge_task >= 0 and WorkerThreadPool.is_task_completed(_merge_task):
+		WorkerThreadPool.wait_for_task_completion(_merge_task)
+		_merge_task = -1
+		_loaded_mutex.lock()
+		var merged = _merged
+		_merged = null
+		_loaded_mutex.unlock()
+		if merged is Array and merged[0] == _want:
+			_apply_soon(merged[0], merged[1])
+		elif _want != "" and _want != fingerprint and _total > 0 and _parts.size() == _total:
+			# Another list's merge ran meanwhile: this one's parts are all in, merged now.
+			_merge_task = WorkerThreadPool.add_task(_merge_and_save.bind(_want, _parts.values(), ModFiles.active_mods().duplicate()))
 	if _load_task >= 0 and WorkerThreadPool.is_task_completed(_load_task):
 		WorkerThreadPool.wait_for_task_completion(_load_task)
 		_load_task = -1
@@ -117,7 +140,7 @@ static func poll() -> void:
 			_apply_soon(got[0], got[1])
 		elif _want != "":
 			_ask(true)
-	if _want != "" and _want != fingerprint and _load_task < 0 and _asked_msec > 0 and _parts.size() < _total \
+	if _want != "" and _want != fingerprint and _load_task < 0 and _merge_task < 0 and _asked_msec > 0 and _parts.size() < _total \
 			and Time.get_ticks_msec() - _asked_msec > RETRY_MSEC:
 		_ask(false)
 
@@ -254,12 +277,12 @@ static func _cache_path(fp: String) -> String:
 	return CACHE_DIR.path_join(fp.validate_filename() + ".json")
 
 
-static func _save(fp: String, merged: Dictionary) -> void:
+static func _save(fp: String, merged: Dictionary, mods: Dictionary) -> void:
 	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(CACHE_DIR))
 	var file := FileAccess.open(_cache_path(fp), FileAccess.WRITE)
 	if file == null:
 		return
-	file.store_string(JSON.stringify({"fp": fp, "mods": ModFiles.active_mods(), "list": merged}))
+	file.store_string(JSON.stringify({"fp": fp, "mods": mods, "list": merged}))
 	file.close()
 	var files := []
 	for f in DirAccess.get_files_at(CACHE_DIR):

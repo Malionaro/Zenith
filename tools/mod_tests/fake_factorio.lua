@@ -15,6 +15,7 @@ F = {
   slots = setmetatable({}, { __mode = "k" }), -- character -> {guns = slots, ammo = slots}, for the harness
   signals = setmetatable({}, { __mode = "k" }), -- entity -> {connector id -> {{signal = {type, name}, count}, ...}}
   networks = setmetatable({}, { __mode = "k" }), -- entity -> {connector id -> LuaCircuitNetwork-like {network_id}}
+  lamp_signal_colors = setmetatable({}, { __mode = "k" }), -- lamp -> the Color its circuit network gives it (K10)
   stop_trains = setmetatable({}, { __mode = "k" }), -- train stop -> {LuaTrain-like, ...} (get_train_stop_trains)
   decon_marks = setmetatable({}, { __mode = "k" }), -- entity -> true when marked for deconstruction
   upgrade_marks = setmetatable({}, { __mode = "k" }), -- entity -> target prototype
@@ -75,7 +76,8 @@ local event_names = {
   "on_chart_tag_removed", "on_entity_renamed", "on_console_chat", "on_rocket_launch_ordered",
   "on_space_platform_changed_state", "on_tower_planted_seed", "on_tower_pre_mined_plant",
   "on_player_joined_game", "on_player_left_game", "on_player_respawned", "on_runtime_mod_setting_changed",
-  "on_object_destroyed",
+  "on_object_destroyed", "on_cargo_pod_started_ascending", "on_cargo_pod_finished_ascending",
+  "on_cargo_pod_finished_descending",
 }
 local events = {}
 for i, n in ipairs(event_names) do
@@ -93,7 +95,7 @@ defines = strict("defines", {
   command = strict("defines.command", { attack = 1, go_to_location = 2, wander = 6, stop = 8 }),
   entity_status = strict("defines.entity_status", { working = 1, no_power = 2, no_ingredients = 3, low_power = 4, no_research_in_progress = 5, missing_science_packs = 6, not_plugged_in_electric_network = 7,
     no_fuel = 8, full_output = 9, no_ammo = 10, charging = 11, discharging = 12, fully_charged = 13,
-    disabled_by_control_behavior = 14 }),
+    disabled_by_control_behavior = 14, no_minable_resources = 15, turned_off_during_daytime = 16 }),
   signal_state = strict("defines.signal_state", { open = 0, closed = 1, reserved = 2, reserved_by_circuit_network = 3 }),
   chain_signal_state = strict("defines.chain_signal_state", { none = 0, all_open = 1, partially_open = 2, none_open = 3 }),
   wire_type = strict("defines.wire_type", { red = 1, green = 2, copper = 3 }),
@@ -297,10 +299,14 @@ local entity_protos = {
   ["stone-furnace"] = entity_proto("stone-furnace", "furnace", 2, 2, { crafting_categories = { smelting = true } }),
   ["wooden-chest"] = entity_proto("wooden-chest", "container", 1, 1),
   lab = entity_proto("lab", "lab", 3, 3, { lab_inputs = { "automation-science-pack", "logistic-science-pack" } }),
+  -- (A drill: belt_sim.lua's actors; its drop spot and mining progress set by the harness.)
+  ["burner-mining-drill"] = entity_proto("burner-mining-drill", "mining-drill", 2, 2, { rotatable = true, mining_speed = 0.25 }),
   inserter = entity_proto("inserter", "inserter", 1, 1, { rotatable = true,
-    inserter_pickup_position = { x = 0, y = -1 }, inserter_drop_position = { x = 0, y = 1.2 } }),
+    inserter_pickup_position = { x = 0, y = -1 }, inserter_drop_position = { x = 0, y = 1.2 },
+    get_inserter_rotation_speed = function() return 0.014 end, get_inserter_extension_speed = function() return 0.035 end }),
   ["fast-inserter"] = entity_proto("fast-inserter", "inserter", 1, 1, { rotatable = true, bulk = false, filter_count = 5,
-    inserter_pickup_position = { 0, -1 }, inserter_drop_position = { 0, 1.2 } }),
+    inserter_pickup_position = { 0, -1 }, inserter_drop_position = { 0, 1.2 },
+    get_inserter_rotation_speed = function() return 0.04 end, get_inserter_extension_speed = function() return 0.1 end }),
   -- 2.x lists each pipe connection's position for all four directions (north first).
   ["offshore-pump"] = entity_proto("offshore-pump", "offshore-pump", 1, 2, { rotatable = true,
     fluidbox_prototypes = { { pipe_connections = { { connection_type = "normal", flow_direction = "output", direction = 0,
@@ -308,7 +314,7 @@ local entity_protos = {
   -- A boiler with fluid boxes and no fuel inventory (heat source): it opens with no inventory.
   ["heat-exchanger"] = entity_proto("heat-exchanger", "boiler", 3, 2, { rotatable = true,
     fluidbox_prototypes = { { pipe_connections = {} }, { pipe_connections = {} } } }),
-  splitter = entity_proto("splitter", "splitter", 2, 1, { rotatable = true }),
+  splitter = entity_proto("splitter", "splitter", 2, 1, { rotatable = true, fast_replaceable_group = "transport-belt" }),
   ["power-switch"] = entity_proto("power-switch", "power-switch", 2, 2),
   ["gun-turret"] = entity_proto("gun-turret", "ammo-turret", 2, 2),
   ["small-lamp"] = entity_proto("small-lamp", "lamp", 1, 1),
@@ -416,6 +422,25 @@ for _, n in pairs({ "assembling-machine-1", "lab", "beacon" }) do
   entity_protos[n].module_inventory_size = 2
   entity_protos[n].allowed_effects = { speed = true, productivity = n == "assembling-machine-1", consumption = true, pollution = true, quality = true }
 end
+-- Where Alt-mode draws an entity's icons (alt_mode.lua, K1, K2): every prototype's
+-- icon_draw_specification (the game gives each one; the default {0, 0}, 1 stays out of eprops) and
+-- icons_positioning, read back with every field filled in as 2.1 does: Space Age's lab and the
+-- beacon's; the assembler has none, so Factorio's defaults. Vectors both ways the game writes them.
+for _, p in pairs(entity_protos) do
+  p.icon_draw_specification = { shift = { x = 0, y = 0 }, scale = 1, scale_for_many = 1, render_layer = "entity-info-icon" }
+end
+entity_protos["assembling-machine-1"].icon_draw_specification.shift = { x = 0, y = -0.3 }
+entity_protos["wooden-chest"].icon_draw_specification.scale = 0.7
+entity_protos.lab.icons_positioning = {
+  { inventory_index = defines.inventory.lab_modules, shift = { x = 0, y = 0.9 }, scale = 0.5, max_icons_per_row = 4,
+    max_icon_rows = 2, separation_multiplier = 1.1, multi_row_initial_height_modifier = -0.1 },
+  { inventory_index = defines.inventory.lab_input, shift = { 0, 0 }, scale = 0.5, max_icons_per_row = 6,
+    max_icon_rows = 2, separation_multiplier = 1 / 1.1, multi_row_initial_height_modifier = -0.1 },
+}
+entity_protos.beacon.icons_positioning = {
+  { inventory_index = defines.inventory.beacon_modules, shift = { x = 0, y = 0 }, scale = 0.5, max_icons_per_row = 2,
+    max_icon_rows = 2, separation_multiplier = 1.1, multi_row_initial_height_modifier = -0.3 },
+}
 -- What an assembler draws (H20's entity info): 75 kW at most (joules a tick, by quality) and a
 -- 2.5 kW drain; consumers' electric sources have an input priority.
 entity_protos["assembling-machine-1"].energy_usage = 1250
@@ -433,6 +458,7 @@ for _, n in pairs({ "wooden-chest", "assembling-machine-1", "burner-inserter" })
 end
 -- Like most real prototypes, the wall has no map colour of its own: the map uses its type's.
 entity_protos["stone-wall"].map_color = nil
+entity_protos["stone-wall"].repair_speed_modifier = 2 -- as 2.1's: a repair pack mends walls twice as fast
 entity_protos["stone-wall"].friendly_map_color = nil
 
 local decorative_protos = {}
@@ -460,7 +486,7 @@ for name, t in pairs(tile_protos) do
 end
 
 local item_protos = {}
-for _, n in pairs({ "transport-belt", "fast-transport-belt", "underground-belt", "assembling-machine-1", "stone-furnace", "locomotive" }) do
+for _, n in pairs({ "transport-belt", "fast-transport-belt", "underground-belt", "assembling-machine-1", "stone-furnace", "locomotive", "splitter" }) do
   item_protos[n] = { name = n, place_result = entity_protos[n] }
 end
 -- 2.x: the rail item is a rail planner; its place_result is empty and `rails` lists what it builds.
@@ -526,6 +552,20 @@ for name, e in pairs(equipment_protos) do
 end
 item_protos["power-armor"] = { name = "power-armor", place_result = nil }
 item_protos["repair-pack"] = { name = "repair-pack", place_result = nil, type = "repair-tool" }
+-- (K13: 2.1's repair pack, speed 2 and 300 durability; quality multiplies the durability, not the speed,
+-- by its level as the wiki lists: 300, 600, 900, 1200, 1800.)
+item_protos["repair-pack"].speed = 2
+item_protos["repair-pack"].durability = 300
+local TOOL_QUALITY = { normal = 1, uncommon = 2, rare = 3, epic = 4, legendary = 6 }
+local function tool_durability(name, quality)
+  local q = type(quality) == "table" and quality.name or quality or "normal"
+  return item_protos[name].durability * (TOOL_QUALITY[q] or 1)
+end
+item_protos["repair-pack"].get_durability = function(quality) return tool_durability("repair-pack", quality) end
+local function is_tool(name)
+  local ip = item_protos[name]
+  return ip ~= nil and (ip.type == "tool" or ip.type == "repair-tool")
+end
 
 local fluid_protos = {
   water = { name = "water", base_color = { r = 0, g = 0.34, b = 0.6, a = 1 } },
@@ -611,10 +651,22 @@ F.mod_data = {
   p1 = '{"icons":{"item":{"gizmo":[["__my-mod__/graphics/icons/gizmo.png",64,null,null,null]]}}}',
   p2 = '{"tiles":{"my-floor":{"group":"ground-artificial","layer":60,"mat":["__my-mod__/graphics/terrain/floor.png",4,0.5],"water":0}}}',
 }
+-- The planets with lightning (data-final-fixes.lua's zenith-planets): F.planet_data, which tests may change.
+F.planet_data = { lightning = { "fulgora" } }
+-- Entities' own mining sounds (data-final-fixes.lua's zenith-mining-sounds, J11): F.mining_data.
+F.mining_data = { ms = { ["iron-ore"] = "base/sound/axe-mining-test" }, rs = { ["stone-wall"] = "base/sound/manual-repair-simple" } }
 local mod_data = {
   ["zenith-graphics"] = strict("LuaModData", {
     name = "zenith-graphics", data_type = "zenith-graphics",
     get = function(key) return F.mod_data[key] end,
+  }),
+  ["zenith-planets"] = strict("LuaModData", {
+    name = "zenith-planets", data_type = "zenith-planets",
+    get = function(key) return F.planet_data[key] end,
+  }),
+  ["zenith-mining-sounds"] = strict("LuaModData", {
+    name = "zenith-mining-sounds", data_type = "zenith-mining-sounds",
+    get = function(key) return F.mining_data[key] end,
   }),
 }
 
@@ -668,11 +720,13 @@ local function make_recipe(name, enabled, category, extra)
 end
 
 local function make_tech(name, prerequisites, extra)
+  -- `level` is the level being researched (a levelled technology's goes up as each is done);
+  -- `force` is set once the player force exists.
   local t = {
     name = name, order = "a-" .. name, researched = false, enabled = true, visible_when_disabled = false,
-    prerequisites = prerequisites, research_unit_count = 10, research_unit_energy = 600,
+    prerequisites = prerequisites, research_unit_count = 10, research_unit_energy = 600, level = 1,
     research_unit_ingredients = { { type = "item", name = "automation-science-pack", amount = 1 } },
-    prototype = strict("LuaTechnologyPrototype", { hidden = false, essential = false, effects = {} }),
+    prototype = strict("LuaTechnologyPrototype", { hidden = false, essential = false, effects = {}, level = 1, max_level = 1 }),
   }
   for k, v in pairs(extra or {}) do
     t[k] = v
@@ -690,12 +744,12 @@ end
 local forces = {}
 local techs = {}
 techs.automation = make_tech("automation", {}, {
-  prototype = strict("LuaTechnologyPrototype", { hidden = false, essential = true,
+  prototype = strict("LuaTechnologyPrototype", { hidden = false, essential = true, level = 1, max_level = 1,
     effects = { { type = "unlock-recipe", recipe = "iron-gear-wheel" } } }),
 })
 techs.logistics = make_tech("logistics", { automation = techs.automation })
 techs["steel-processing"] = make_tech("steel-processing", {}, { researched = true })
-techs["secret"] = make_tech("secret", {}, { prototype = strict("LuaTechnologyPrototype", { hidden = true, effects = {} }) })
+techs["secret"] = make_tech("secret", {}, { prototype = strict("LuaTechnologyPrototype", { hidden = true, effects = {}, level = 1, max_level = 1 }) })
 
 -- current_research is nil when nothing is being researched; anything else unknown is an error.
 forces.player = setmetatable({
@@ -830,6 +884,7 @@ for name, r in pairs(forces.player.recipes) do
 end
 for name, t in pairs(techs) do
   prototypes.technology[name] = t.prototype
+  rawset(t, "force", forces.player)
 end
 forces.neutral = strict("LuaForce", { name = "neutral" })
 for name, r in pairs(forces.player.recipes) do
@@ -844,6 +899,11 @@ forces.enemy = strict("LuaForce", { name = "enemy",
   get_evolution_factor_by_pollution = function(surface) return 0.05 end,
   get_evolution_factor_by_killing_spawners = function(surface) return 0.05 end,
 })
+-- Repair packs (repair.lua): friends' buildings may be mended too; the fake's forces have none.
+rawset(forces.player, "get_friend", function(other)
+  assert(other and other.name, "get_friend(force)")
+  return false
+end)
 -- /cheat (console.lua)
 rawset(forces.player, "research_all_technologies", function()
   F.researched_all = true
@@ -960,10 +1020,17 @@ local function item_stack(slots, i)
         return strict("LuaQualityPrototype", { name = slot.quality or "normal" })
       elseif k == "spoil_percent" then
         return slot.spoil or 0
+      elseif k == "durability" and is_tool(slot.name) then
+        -- (The top item's: a fresh stack's is full.)
+        return slot.durability or tool_durability(slot.name, slot.quality)
       elseif k == "prototype" then
         local ip = item_protos[slot.name]
-        return strict("LuaItemPrototype", { stack_size = stack_size(slot.name),
-          place_as_equipment_result = ip and ip.place_as_equipment_result or nil, type = ip and ip.type or "item" })
+        local proto = { stack_size = stack_size(slot.name),
+          place_as_equipment_result = ip and ip.place_as_equipment_result or nil, type = ip and ip.type or "item" }
+        if is_tool(slot.name) then
+          proto.get_durability = function(quality) return tool_durability(slot.name, quality) end
+        end
+        return strict("LuaItemPrototype", proto)
       end
       error("LuaItemStack doesn't contain key " .. tostring(k), 2)
     end,
@@ -983,6 +1050,12 @@ local function item_stack(slots, i)
       if k == "spoil_percent" and slots[i] then
         assert(v >= 0 and v <= 1, "spoil_percent is 0..1")
         slots[i].spoil = v
+        return
+      end
+      if k == "durability" and slots[i] and is_tool(slots[i].name) then
+        -- (Capped at the item's full durability, as the game does; a tool's can't go below 0.)
+        assert(type(v) == "number" and v >= 0, "durability is a number >= 0")
+        slots[i].durability = math.min(v, tool_durability(slots[i].name, slots[i].quality))
         return
       end
       if k == "preview_icons" and slots[i] then
@@ -1153,6 +1226,15 @@ local function make_inventory(size)
   inv.is_empty = function()
     return next(slots) == nil
   end
+  -- (Every slot taken: the alerts' platform storage check, alerts.lua.)
+  inv.is_full = function()
+    for k = 1, size do
+      if not slots[k] then
+        return false
+      end
+    end
+    return true
+  end
   inv.find_item_stack = function(name)
     if type(name) == "table" then -- ItemWithQualityID (2.x): the fake keeps no quality on items
       assert(type(name.name) == "string", "find_item_stack{name, quality?}")
@@ -1274,6 +1356,21 @@ local function make_slots(size)
     end
     return n
   end)
+  -- (puppet.lua's `mnd` reads what the character holds in every inventory, J20.)
+  rawset(inv, "get_contents", function()
+    local out, at = {}, {}
+    for k = 1, size do
+      local name = slots[k].name
+      if name then
+        if not at[name] then
+          out[#out + 1] = { name = name, count = 0, quality = "normal" }
+          at[name] = out[#out]
+        end
+        at[name].count = at[name].count + slots[k].count
+      end
+    end
+    return out
+  end)
   return inv, slots
 end
 
@@ -1281,6 +1378,60 @@ end
 -- line 2 the right. An underground belt's lines 3 and 4 stand for the tunnel: they start at the
 -- front edge of the entity and run away from it, so their items are outside it.
 local belt_lines = setmetatable({}, { __mode = "k" }) -- entity -> {line index -> items}
+
+-- An item on a line as get_detailed_contents' LuaItemStack: it reads the item; `count` writes its stack size
+-- and clear() takes it off the line (F's pick-up, puppet.lua). Reading an emptied one throws, as the game's.
+-- F.belt_stack_writes false: the reference changes nothing (a game that wouldn't let it: the name fallback).
+local function belt_stack(items, it)
+  local function clear()
+    if F.belt_stack_writes == false then
+      return
+    end
+    for k, other in ipairs(items) do
+      if other == it then
+        table.remove(items, k)
+        break
+      end
+    end
+    it.gone = true
+  end
+  return setmetatable({}, {
+    __index = function(_, k)
+      if k == "valid_for_read" then
+        return not it.gone
+      elseif k == "valid" then
+        return true
+      elseif k == "clear" then
+        return clear
+      end
+      if it.gone then
+        error("LuaItemStack: an empty stack has no " .. tostring(k), 2)
+      end
+      if k == "name" then
+        return it.name
+      elseif k == "count" then
+        return it.count or 1
+      elseif k == "spoil_percent" then
+        return it.spoil or 0
+      elseif k == "quality" then
+        return strict("LuaQualityPrototype", { name = it.quality or "normal" })
+      end
+      error("LuaItemStack doesn't contain key " .. tostring(k), 2)
+    end,
+    __newindex = function(_, k, v)
+      assert(k == "count", "LuaItemStack: can't write " .. tostring(k))
+      assert(not it.gone and type(v) == "number" and v >= 0, "LuaItemStack: bad count")
+      if F.belt_stack_writes == false then
+        return
+      end
+      if v == 0 then
+        clear()
+      else
+        it.count = v
+      end
+    end,
+  })
+end
 
 local function make_transport_line(e, index)
   local items = belt_lines[e][index]
@@ -1290,9 +1441,16 @@ local function make_transport_line(e, index)
   -- As measured in 2.1.23 (live_check): a line's position 0 is at the belt's exit edge and grows
   -- backwards; the lanes are 0.234 tiles either side of the centre.
   local lane = (index % 2 == 1) and -0.234 or 0.234
+  -- A splitter of 8 lines (spawned with lines = 8), as BELT-RULES.md measured 2.1's: lines 1-2 and 5-6 the left
+  -- half's (looking the way items go), 3-4 and 7-8 the right's, 68 and 188 steps from its centre; the inputs
+  -- (179 steps) end 51 steps past its centre, the outputs (128) at its front edge.
+  local split8 = belt_lines[e] and #belt_lines[e] == 8 and F.datas[e] and F.datas[e].type == "splitter"
+  if split8 then
+    lane = ({ -188, -68, 68, 188 })[(index - 1) % 4 + 1] / 256
+  end
   local line
   line = strict("LuaTransportLine", {
-    line_length = 1,
+    line_length = split8 and (index <= 4 and 179 / 256 or 0.5) or 1,
     -- As in 2.1.23: item 1 is the front one (the lowest position), and the map position comes second.
     get_item_position = function(k)
       local sorted = {}
@@ -1308,8 +1466,7 @@ local function make_transport_line(e, index)
       local out = {}
       for _, it in ipairs(items) do
         out[#out + 1] = strict("DetailedItemOnLine", {
-          stack = strict("LuaItemStack", { valid_for_read = true, name = it.name, count = it.count or 1, spoil_percent = it.spoil or 0,
-            quality = strict("LuaQualityPrototype", { name = it.quality or "normal" }) }),
+          stack = belt_stack(items, it),
           position = it.position,
           unique_id = it.unique_id,
         })
@@ -1366,6 +1523,9 @@ local function make_transport_line(e, index)
     get_line_item_position = function(position)
       local p = e.position
       local along = index <= 2 and 0.5 - position or 0.5 + position
+      if split8 then
+        along = (index <= 4 and 51 / 256 or 0.5) - position
+      end
       return { x = p.x + fx * along + rx * lane, y = p.y + fy * along + ry * lane }
     end,
   })
@@ -1818,7 +1978,7 @@ local function make_entity(surface, params)
     relative_turret_orientation = true, torso_orientation = "harness", driver_is_gunner = true,
     crafting_queue_progress = "harness", status = "harness", energy = "harness",
     signal_state = "harness", chain_signal_state = "harness",
-    electric_network_id = "harness", is_flying = "harness", flight_height = "harness",
+    electric_network_id = "harness", is_flying = "harness", flight_height = "harness", productivity_bonus = "harness",
     color = true, character_inventory_slots_bonus = true, grid = "harness", allow_dispatching_robots = true,
     ignore_unprioritised_targets = true,
     mirroring = true, use_filters = true, inserter_filter_mode = true, inserter_stack_size_override = true,
@@ -1835,6 +1995,17 @@ local function make_entity(surface, params)
   elseif proto.type == "mining-drill" then
     optional.drop_target = true
     writable.drop_target = "harness"
+  end
+  -- Where an inserter takes from and puts, and where a drill drops (pickup_position, drop_position): nil until
+  -- the harness sets them (the real ones always have one; a test world's default spot would land on belts the
+  -- harness gave the inserter no target on). A drill's mining progress and its bonus's, 0 until set.
+  if proto.type == "inserter" then
+    optional.pickup_position, optional.drop_position = true, true
+    writable.pickup_position, writable.drop_position = "harness", "harness"
+  elseif proto.type == "mining-drill" then
+    optional.drop_position = true
+    data.mining_progress, data.bonus_mining_progress = 0, 0
+    writable.drop_position, writable.mining_progress, writable.bonus_mining_progress = "harness", "harness", "harness"
   end
   -- Fluid storages (pipes one, machines as the harness sets) and wire connectors, empty until the
   -- harness fills them (F.set_fluid, F.connect). 2.1 has no LuaEntity.fluidbox: storages are read
@@ -1987,7 +2158,8 @@ local function make_entity(surface, params)
     end
   end
   if t == "transport-belt" or t == "underground-belt" or t == "splitter" or t == "linked-belt" or t == "lane-splitter" then
-    local count = (t == "underground-belt" or t == "lane-splitter") and 4 or 2
+    -- (A splitter has 2 lines here unless spawned with lines = 8: the game's, inputs 1-4, outputs 5-8.)
+    local count = (t == "splitter" and params.lines == 8) and 8 or (t == "underground-belt" or t == "lane-splitter") and 4 or 2
     belt_lines[e] = {}
     for i = 1, count do
       belt_lines[e][i] = {}
@@ -2425,6 +2597,8 @@ local function make_entity(surface, params)
         __index = function(_, k)
           if k == "type" then
             return vals.type
+          elseif k == "color" and t == "lamp" then
+            return vals.use_colors and F.lamp_signal_colors[e] or nil
           elseif fields[k] then
             if vals[k] == nil and fields[k] == "c" then
               return { comparator = "<", constant = 0, fulfilled = false }
@@ -2462,6 +2636,8 @@ local function make_entity(surface, params)
       data.color = { r = 1, g = 1, b = 1, a = 1 }
       data.always_on = false
     end
+    -- K10: the colour a lamp shows from its circuit network's colour signals, LuaLampControlBehavior.color
+    -- (read-only), set by the harness: F.lamp_signal_colors[lamp] = {r, g, b, a}; nil while "Use colors" is off.
   end
 
   -- Inventories by role. get_inventory knows two indexes: 1 (chest) and 2 (crafter, furnace or
@@ -2649,10 +2825,17 @@ local function make_entity(surface, params)
   local recipe_quality = qualities.normal
   if t == "assembling-machine" or t == "furnace" then
     data.crafting_progress = 0
+    -- With modules and beacons in the game; the prototype's here (assembler 1 and stone furnace).
+    data.crafting_speed = t == "furnace" and 1 or 0.5
+    -- Modules', beacons' and research's productivity together (the harness sets it).
+    data.productivity_bonus = 0
     -- 2.x returns the recipe and its quality.
     data.get_recipe = function()
       if t == "furnace" then
-        return invs.input.get_item_count("iron-ore") > 0 and forces.player.recipes["iron-plate"] or nil, qualities.normal
+        local r = invs.input.get_item_count("iron-ore") > 0 and forces.player.recipes["iron-plate"] or nil
+        -- (previous_recipe: the last recipe it had, which the game keeps when the input runs out)
+        data.f3d_prev_recipe = r or data.f3d_prev_recipe
+        return r, qualities.normal
       end
       return recipe, recipe and recipe_quality or nil
     end
@@ -2731,7 +2914,21 @@ local function make_entity(surface, params)
   end
   data.rotate = function(p)
     local before = data.direction
-    data.direction = (data.direction + ((p and p.reverse) and -4 or 4)) % 16
+    if t == "underground-belt" then
+      -- As 2.1.24 turns one: half way round as its other end (entrance <-> exit), and a connected
+      -- pair together, with no event for the other end.
+      local function flip(d)
+        d.direction = (d.direction + 8) % 16
+        d.belt_to_ground_type = d.belt_to_ground_type == "input" and "output" or "input"
+      end
+      flip(data)
+      local other = data.underground_belt_neighbour
+      if other and other.valid then
+        flip(F.datas[other])
+      end
+    else
+      data.direction = (data.direction + ((p and p.reverse) and -4 or 4)) % 16
+    end
     if p and p.by_player ~= nil then
       F.player_events[#F.player_events + 1] = "on_player_rotated_entity"
       raise("on_player_rotated_entity", { entity = e, previous_direction = before, player_index = p.by_player.index })
@@ -2805,7 +3002,15 @@ local function make_entity(surface, params)
     data.insert = function(stack)
       local slots = (stack.name == "pistol" and gun_slots) or (stack.name == "firearm-magazine" and ammo_slots) or nil
       if not slots then
-        return inventory.insert(stack)
+        -- (F.inventory_space, as mine_entity: a belt item F takes fills it too.) A LuaItemStack is read as
+        -- the game reads one: name, count and quality.
+        local room = math.min(stack.count or 1, F.inventory_space)
+        if room <= 0 then
+          return 0
+        end
+        local n = inventory.insert({ name = stack.name, count = room, quality = stack.quality })
+        F.inventory_space = F.inventory_space - n
+        return n
       end
       for _, slot in ipairs(slots) do
         if not slot.name or slot.name == stack.name then
@@ -2816,7 +3021,13 @@ local function make_entity(surface, params)
       end
       return 0
     end
-    data.can_insert = function(stack) return true end
+    data.can_insert = function(stack) return F.inventory_space > 0 end
+    -- (F's pick-up hands back what a lane wouldn't give up.)
+    data.remove_item = function(stack)
+      local n = inventory.remove({ name = stack.name, count = stack.count or 1, quality = stack.quality })
+      F.inventory_space = F.inventory_space + n
+      return n
+    end
     -- Reach is measured to the target's selection box, like the game.
     data.can_reach_entity = function(target)
       local b, p = target.selection_box, data.position
@@ -2906,6 +3117,13 @@ local function make_entity(surface, params)
       if k == "item_request_proxy" then
         local proxy = F.proxies[e]
         return proxy and proxy.valid and proxy or nil
+      end
+      -- 2.x: a furnace's last recipe as {name, quality} (prototypes); nil before its first. Other
+      -- entities haven't got it.
+      if k == "previous_recipe" and t == "furnace" then
+        data.get_recipe()
+        local r = data.f3d_prev_recipe
+        return r and { name = prototypes.recipe[r.name], quality = qualities.normal } or nil
       end
       local v = data[k]
       if v == nil and not optional[k] and not (spider and k == "autopilot_destination") then
@@ -3155,6 +3373,11 @@ local function make_surface(index, name, default_tile)
     return out
   end
   surface.find_entities_filtered = function(f)
+    -- (Tests count searches by their type filter: F.finds["cargo-pod"], F.finds["unit,turret"]...)
+    if F.finds and f.type then
+      local key = type(f.type) == "table" and table.concat(f.type, ",") or tostring(f.type)
+      F.finds[key] = (F.finds[key] or 0) + 1
+    end
     local out = {}
     for _, e in ipairs(surface.entities) do
       local ok = true
@@ -3241,18 +3464,24 @@ local function make_surface(index, name, default_tile)
     F.spilled[#F.spilled + 1] = p.stack
     return {}
   end
-  -- Fast-replace: an entity of the same fast-replaceable group standing there, of another kind or
-  -- quality.
+  -- Fast-replace: the entities of the same fast-replaceable group standing under the new one's
+  -- footprint (a splitter over the two belts it covers), of another kind or quality.
   local function replaceable(p)
-    local group = entity_protos[p.name].fast_replaceable_group
+    local proto = entity_protos[p.name]
+    local group = proto.fast_replaceable_group
     local x, y = p.position.x or p.position[1], p.position.y or p.position[2]
+    local w, h = proto.tile_width, proto.tile_height
+    if p.direction == 4 or p.direction == 12 then
+      w, h = h, w
+    end
+    local out = {}
     for _, e in ipairs(surface.entities) do
-      if group and e.prototype.fast_replaceable_group == group and e.position.x == x and e.position.y == y
-          and (e.name ~= p.name or e.quality.name ~= (p.quality or "normal")) then
-        return e
+      if group and e.prototype.fast_replaceable_group == group and math.abs(e.position.x - x) < w / 2
+          and math.abs(e.position.y - y) < h / 2 and (e.name ~= p.name or e.quality.name ~= (p.quality or "normal")) then
+        out[#out + 1] = e
       end
     end
-    return nil
+    return out[1] and out or nil
   end
   surface.can_fast_replace = function(p)
     assert(p.build_check_type == nil, "can_fast_replace takes no build_check_type")
@@ -3261,9 +3490,11 @@ local function make_surface(index, name, default_tile)
   surface.create_entity = function(p)
     if p.fast_replace then
       assert(p.spill == false, "fast_replace without a player: pass spill = false")
-      local old = replaceable(p)
-      assert(old, "create_entity: nothing to fast-replace")
-      old.destroy()
+      local olds = replaceable(p)
+      assert(olds, "create_entity: nothing to fast-replace")
+      for _, old in ipairs(olds) do
+        old.destroy()
+      end
     elseif p.name ~= "entity-ghost" and replaceable(p) then
       -- Without fast_replace the game won't build over an entity it would replace: nil.
       return nil
@@ -3316,11 +3547,16 @@ local function make_surface(index, name, default_tile)
     local x, y = p.x or p[1], p.y or p[2]
     return (F.pollution or {})[math.floor(x / 32) .. "," .. math.floor(y / 32)] or 0
   end
-  -- 2.1: Vulcanus' demolisher territories; F.territories = {{{x=, y=}, ...}, ...} chunk lists.
+  -- 2.1: Vulcanus' demolisher territories; F.territories = {{{x=, y=}, ...}, ...} chunk lists;
+  -- F.cleared_territories[i] = true: territory i's demolisher is dead (no segmented units).
   surface.get_territories = function()
     local out = {}
     for i, chunks in ipairs(F.territories or {}) do
-      out[i] = strict("LuaTerritory", { get_chunks = function() return chunks end })
+      local units = (F.cleared_territories or {})[i] and {} or { {} }
+      out[i] = strict("LuaTerritory", {
+        get_chunks = function() return chunks end,
+        get_segmented_units = function() return units end,
+      })
     end
     return out
   end
@@ -3790,6 +4026,8 @@ game = strict("LuaGameScript", {
     end,
   }),
   get_surface = function(id) return surfaces[id] end,
+  -- pollution.lua reads whether pollution is on and when trees start to take damage.
+  map_settings = { pollution = { enabled = true, min_pollution_to_damage_trees = 60 } },
   get_pollution_statistics = function(surface)
     assert(surface and surface.index, "get_pollution_statistics(surface)")
     return flow_statistics("pollution")
@@ -3826,9 +4064,15 @@ local function make_profiler(stopped)
   })
 end
 
+-- Files the mod wrote with helpers.write_file: name -> text (appends concatenated).
+F.written = {}
 helpers = strict("LuaHelpers", {
   create_profiler = make_profiler,
   table_to_json = function(t) return F_to_json(t) end,
+  write_file = function(name, data, append)
+    assert(type(name) == "string" and type(data) == "string", "write_file: a file name and text")
+    F.written[name] = (append and F.written[name] or "") .. data
+  end,
   json_to_table = function(s) return F_from_json(s) end,
   send_udp = function(port, data, who)
     assert(type(port) == "number", "send_udp: port must be a number")

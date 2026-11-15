@@ -137,9 +137,36 @@ static var _array: Texture2DArray
 static var _infos := PackedColorArray()
 static var _reflects := PackedFloat32Array()
 static var _dirty := false
-static var _compress := -1  # -1 unknown, 0 no, 1 yes
+## Whether the ground's pictures are compressed (S3TC/BC1): 1 yes, 0 no. Only an editor build can:
+## in Godot 4.7.2 etcpak's compressors (BC1-3, ETC) are registered only with TOOLS_ENABLED, and CVTT
+## (BPTC) and Betsy (on the GPU) only in templates built with cvtt_export_templates or
+## betsy_export_templates, which the official ones aren't. Image.compress() has nothing to call in an
+## exported game: it logged `Parameter "_image_compress_bc_func" is null` and failed, so the export
+## is never asked. There each layer is kept as RGBA8, the format Godot's renderer turns RGB8 into on
+## every upload anyway (texture_storage.cpp; 2.8 ms a layer on the main thread, and every layer again
+## when the array grows): 11.2 MB a layer on the GPU with its mipmaps (2048 x 1024) against 1.4 MB
+## compressed, and 11.2 MB in _images against 1.4. A base's 35-45 kinds of ground: about 0.5 GB of
+## video memory and as much RAM, against 70 and 60 MB.
+static var _compress := 1 if OS.has_feature("editor") else 0
 ## --plain-terrain keeps the procedural ground even with an install (for comparisons).
 static var disabled := "--plain-terrain" in OS.get_cmdline_user_args()
+## The array on the GPU is made with room for ARRAY_ROOM layers (grown ARRAY_STEP at a time when
+## full), and a new kind of ground is written into its layer alone (update_layer): one picture's
+## upload, 2-3 ms. Making the whole array again from every picture loaded, on each new kind of
+## ground, was 56-114 ms on the main thread once 35-45 kinds were in (the 0.2.0 base's worst
+## frames standing, a third of its slow frames on laps; client-cpu.md 1). The spare layers hold
+## copies of the first picture and are never sampled. Uncompressed pictures (an exported game, see
+## _compress) are 8 times the size, so then the room is only ARRAY_STEP_PLAIN past what is loaded.
+## `--terrain-layers=rebuild` makes the whole array again on each new picture, as before.
+const ARRAY_ROOM := 48
+const ARRAY_STEP := 16
+const ARRAY_STEP_PLAIN := 4
+static var rebuild_layers := "--terrain-layers=rebuild" in OS.get_cmdline_user_args()
+static var _room := 0  # layers the array on the GPU has (0: none made since the last trim)
+static var _uploaded := 0  # of _images, how many are in it
+## Arrays made and single layers written (for tests and probes).
+static var arrays_made := 0
+static var layers_written := 0
 
 
 ## Pictures being read on worker threads: tile name -> [task id, TileGfx]. A TileGfx is only
@@ -157,6 +184,16 @@ static var _list_generation := 0  # ModGraphics.generation last seen
 ## again (and clears it), as those chunks aren't waiting for a picture.
 static var relook := false
 static var _changed := false
+## A new array goes on the GPU from a worker thread (--terrain-upload-thread=on, the default): the
+## renderer takes the upload on the calling thread, so making it from 20-40 layers (1.4 MB each,
+## compressed, with mipmaps) on the main thread was a 90-100 ms frame once a join at -62,-26. (Since
+## the array has room (ARRAY_ROOM), a new array is made only when it is full; a single new layer is
+## still written on the main thread, update_layer.) A tile whose layer is in an array still being
+## made stays unknown (lookup() null, _staged) until that array is in use, so no ground is built with
+## a layer the bound array lacks. off: made on the main thread.
+static var upload_thread := not ("--terrain-upload-thread=off" in OS.get_cmdline_user_args())
+static var _upload: Array = []  # [task id, [Texture2DArray or null], infos, reflects, layers] while a worker makes the next array
+static var _staged := {}  # tile name -> TileGfx: published, its layer in an array not yet in use
 
 
 ## The graphics for a tile, or null while its picture is being read (on a worker thread: reading
@@ -164,7 +201,7 @@ static var _changed := false
 ## of ground). Draw it in its map colour meanwhile and ask again after `generation` changes.
 static func lookup(tile_name: String) -> TileGfx:
 	var g: TileGfx = _gfx.get(tile_name)
-	if g != null or _pending.has(tile_name):
+	if g != null or _pending.has(tile_name) or _staged.has(tile_name):
 		return g
 	g = TileGfx.new()
 	g.name = tile_name
@@ -233,10 +270,16 @@ static func trim(next_surface := -1) -> bool:
 				more += 1
 		if _images.size() + _pending.size() + more <= MAX_LAYERS:
 			return false
+	if not _upload.is_empty():
+		WorkerThreadPool.wait_for_task_completion(int(_upload[0]))  # an array of the old layers
+		_upload = []
+	_staged.clear()
 	_gfx.clear()
 	_images.clear()
 	_infos = PackedColorArray()
 	_reflects = PackedFloat32Array()
+	_room = 0  # the next commit makes a new array (a loading moment: the surface changed)
+	_uploaded = 0
 	_changed = true
 	generation += 1
 	layout += 1
@@ -427,7 +470,7 @@ static func poll() -> bool:
 static func finish_all() -> void:
 	for tile_name in _pending.keys():
 		_publish(tile_name, _pending[tile_name][0])
-	commit()
+	commit(true)
 
 
 static func _publish(tile_name: String, task: int) -> void:
@@ -447,33 +490,152 @@ static func _publish(tile_name: String, task: int) -> void:
 		_infos.append(g.shader_info())
 		_reflects.append(g.reflect)
 		_dirty = true
+		if upload_thread:
+			_staged[tile_name] = g  # known once the array with its layer is in use (commit)
+			return
 	_gfx[tile_name] = g
 	_changed = true
 
 
-## Puts newly loaded layers on the GPU (one upload however many tiles arrived this frame).
-static func commit() -> void:
-	if not _dirty or _images.is_empty():
-		return
-	_dirty = false
-	_array = Texture2DArray.new()
-	var err := _array.create_from_images(_images)
+## Puts newly loaded layers on the GPU: each into its own layer of the array in use (update_layer, here:
+## one picture's upload, 2-3 ms), or, when that array is full (or none is made yet), a new array with
+## room for more, made on a worker thread (upload_thread) and taken into use once it is done (`wait`:
+## now, before quitting or in tests), else made here and now. A tile whose layer the array in use
+## doesn't have yet stays staged (lookup() null) until it does.
+static func commit(wait := false) -> void:
+	while true:
+		if not _upload.is_empty():
+			if not (wait or WorkerThreadPool.is_task_completed(int(_upload[0]))):
+				return
+			WorkerThreadPool.wait_for_task_completion(int(_upload[0]))
+			var holder: Array = _upload[1]
+			if holder[0] != null:
+				_take_array(holder[0], int(_upload[5]), int(_upload[4]))
+				_apply(_upload[2], _upload[3])
+			_release(int(_upload[4]))
+			_upload = []
+		if not _dirty or _images.is_empty():
+			return
+		_dirty = false
+		# (Only while no array is being made: the worker reads the pictures it was given.)
+		for i in range(_uploaded, _images.size()):
+			if not _fit(i):
+				_plain_all()  # (a picture that wouldn't compress after others did: rare)
+				break
+		if not (rebuild_layers or _room < _images.size() or _uploaded > _images.size()):
+			for i in range(_uploaded, _images.size()):
+				_array.update_layer(_images[i], i)
+				layers_written += 1
+			_uploaded = _images.size()
+			_apply(_infos, _reflects)
+			_release(_uploaded)
+			return
+		var layers := _layers_with_room()
+		if not upload_thread:
+			var arr := Texture2DArray.new()
+			if _make_array(arr, layers):
+				_take_array(arr, layers.size(), _images.size())
+				_apply(_infos, _reflects)
+			return
+		var holder: Array = [Texture2DArray.new()]
+		_upload = [WorkerThreadPool.add_task(_upload_task.bind(holder, layers), false, "terrain layers"), holder,
+			_infos.duplicate(), _reflects.duplicate(), _images.size(), layers.size()]
+		if not wait:
+			return
+
+
+## The tiles whose layers the array in use has (below `layers`) are known from now on.
+static func _release(layers: int) -> void:
+	for tile_name in _staged.keys():
+		if (_staged[tile_name] as TileGfx).layer < layers:
+			_gfx[tile_name] = _staged[tile_name]
+			_staged.erase(tile_name)
+			_changed = true
+
+
+## A worker's part: the array made from the layers it was given (null in `holder` if that failed).
+static func _upload_task(holder: Array, images: Array) -> void:
+	if not _make_array(holder[0], images):
+		holder[0] = null
+
+
+static func _make_array(arr: Texture2DArray, images: Array) -> bool:
+	var err := arr.create_from_images(images)
 	if err != OK:
 		push_warning("Terrain textures: %s" % error_string(err))
-		return
+		return false
+	return true
+
+
+## The array in use and the layers' table go to the ground's materials.
+static func _apply(layer_infos: PackedColorArray, layer_reflects: PackedFloat32Array) -> void:
 	# Vectors, not Colors: a Color array would be converted from sRGB on the way in.
 	var infos := PackedVector4Array()
 	infos.resize(MAX_LAYERS)
-	for i in _infos.size():
-		var c := _infos[i]
+	for i in layer_infos.size():
+		var c := layer_infos[i]
 		infos[i] = Vector4(c.r, c.g, c.b, c.a)
 	for m: ShaderMaterial in [Visuals.terrain_material(), Visuals.water_material()]:
 		m.set_shader_parameter("tiles", _array)
 		m.set_shader_parameter("tile_info", infos)
 		m.set_shader_parameter("textured", true)
-	var reflects := _reflects.duplicate()
+	var reflects := layer_reflects.duplicate()
 	reflects.resize(MAX_LAYERS)
 	Visuals.water_material().set_shader_parameter("tile_reflect", reflects)
+
+
+## Every picture loaded and room for more (copies of the first, never sampled): a new array's layers.
+static func _layers_with_room() -> Array[Image]:
+	var step := ARRAY_STEP if _images[0].is_compressed() else ARRAY_STEP_PLAIN
+	var room := _images.size()
+	if not rebuild_layers:
+		room = ARRAY_ROOM if _images[0].is_compressed() else _images.size() + step
+		while room < _images.size():
+			room += step
+		room = mini(room, MAX_LAYERS)
+	var layers: Array[Image] = _images.duplicate()
+	while layers.size() < room:
+		layers.append(_images[0])
+	return layers
+
+
+## A new array in use: `room` layers, the first `n` of _images.
+static func _take_array(array: Texture2DArray, room: int, n: int) -> void:
+	_array = array
+	_room = room
+	_uploaded = n
+	if arrays_made == 0 and not OS.has_feature("editor"):
+		print("Terrain textures: the ground's pictures are kept uncompressed (this build has no texture compressor): "
+			+ "about 11 MB of video memory a kind of ground")
+	arrays_made += 1
+
+
+## Layer `i` in the first one's format, which every layer of the array shares. False if it can't be.
+static func _fit(i: int) -> bool:
+	var image: Image = _images[i]
+	var format := _images[0].get_format()
+	if image.get_format() == format:
+		return true
+	if _images[0].is_compressed():
+		if not image.is_compressed():
+			image.compress(Image.COMPRESS_S3TC, Image.COMPRESS_SOURCE_SRGB)
+		return image.get_format() == format
+	if image.is_compressed():
+		image.decompress()
+	image.convert(format)
+	return image.get_format() == format
+
+
+## Every layer uncompressed (the pictures read before one that wouldn't compress were), in a new
+## array at the next commit.
+static func _plain_all() -> void:
+	push_warning("Terrain textures: a ground picture couldn't be compressed; all are kept uncompressed")
+	_compress = 0
+	for image in _images:
+		if image.is_compressed():
+			image.decompress()
+		image.convert(Image.FORMAT_RGBA8)
+	_room = 0
 
 
 ## Whether any of Factorio's tile pictures are in use (the shore is built differently then).
@@ -773,7 +935,9 @@ static func _mean_luma(image: Image) -> float:
 
 
 static func _finish_layer(layer: Image) -> Image:
-	layer.convert(Image.FORMAT_RGB8)
+	layer.convert(Image.FORMAT_RGB8)  # opaque: the sheets' alpha isn't drawn
+	if _compress == 0:
+		layer.convert(Image.FORMAT_RGBA8)  # uncompressed, as the GPU holds it (see _compress)
 	layer.generate_mipmaps()
 	if _compress != 0:
 		# On the CPU (project.godot: rendering/textures/vram_compression/compress_with_gpu=false).
@@ -782,6 +946,8 @@ static func _finish_layer(layer: Image) -> Image:
 		# loading or quitting, no CPU used (on 4 threads all of Zenith's tasks share one slot).
 		var err := layer.compress(Image.COMPRESS_S3TC, Image.COMPRESS_SOURCE_SRGB)
 		_compress = 1 if err == OK else 0
+		if err != OK:
+			layer.convert(Image.FORMAT_RGBA8)
 	return layer
 
 

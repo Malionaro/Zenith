@@ -44,6 +44,9 @@ var empty_icon: Texture2D = null
 var tip_title := ""
 ## Tooltip lines: [text] or [text, item for an icon].
 var tip_lines: Array = []
+## When valid, called for the lines as the tooltip opens instead of tip_lines: what may have arrived
+## since the slot was made (an assembler's recipe's details from Factoriopedia, J14).
+var tip_fn := Callable()
 ## Dragging this slot carries this item ("" disables dragging).
 var drag_item := ""
 ## Called with the item dropped on this slot; dropping is off while it is invalid.
@@ -53,6 +56,12 @@ var blocked := false
 ## Factorio's item stats under every item slot's tooltip (stack size, fuel value, the entity it
 ## builds...): Callable(item) -> lines, set by factorio_ui.gd from Factoriopedia's data.
 static var info := Callable()
+## A blueprint's (or book's) picture under its tooltip's title, as Factorio's tooltip draws one
+## (K11): Callable(slot) -> Control or null, set by factorio_ui.gd (planner_ui.gd tip_picture).
+static var picture_for := Callable()
+## Callable() -> proto_db.gd or null: the pictures' footprints and colours.
+static var picture_protos := Callable()
+const PICTURED := {"blueprint": true, "blueprint-book": true}
 ## A filter set on an empty slot: its item drawn faintly (inventory and inserter filters).
 var filter_item := ""
 ## The stack's quality ("" or "normal": none drawn) and freshness (0..1, below 0: doesn't spoil).
@@ -61,6 +70,9 @@ var freshness := -1.0
 ## Rounds left in a magazine as a fraction (0..1), drawn as Factorio's thin green bar along the
 ## bottom left (item_ammo_magazine_left_bar_color); below 0, or a full magazine: none.
 var ammo_bar := -1.0
+## K13: a worn tool's durability left on its top one (0..1; below 0: whole, or not a tool), drawn as the
+## same green bar (Factorio's item_tool_durability_bar_color).
+var durability := -1.0
 ## A blueprint's, book's or planner's icons ([[signal type, name], ...]): Factorio draws them over
 ## the item, one big or up to four in a square.
 var record_icons: Array = []
@@ -93,10 +105,12 @@ func set_stack(new_item: String, new_count: int, is_ghost := false) -> void:
 func set_extra(stack: Dictionary) -> void:
 	var q := str(stack.get("quality", ""))
 	var f := float(stack.get("freshness", -1.0))
+	var d := float(stack.get("durability", -1.0))
 	var i: Array = stack.get("icons", []) if stack.get("icons") is Array else []
-	if q != quality or not is_equal_approx(f, freshness) or i != record_icons:
+	if q != quality or not is_equal_approx(f, freshness) or not is_equal_approx(d, durability) or i != record_icons:
 		quality = q
 		freshness = f
+		durability = d
 		record_icons = i
 		queue_redraw()
 
@@ -194,9 +208,10 @@ func _draw() -> void:
 		var bar := Rect2(Vector2(Kit.px(4), Kit.px(3)), Vector2(size.x - Kit.px(8), maxf(2.0, Kit.px(3))))
 		draw_rect(bar, Color(0, 0, 0, 0.6))
 		draw_rect(Rect2(bar.position, Vector2(bar.size.x * clampf(freshness, 0.0, 1.0), bar.size.y)), freshness_color(freshness))
-	if ammo_bar >= 0.0 and ammo_bar < 1.0 and not faded:
+	var bar_left := ammo_bar if ammo_bar >= 0.0 else durability
+	if bar_left >= 0.0 and bar_left < 1.0 and not faded:
 		var full := size.x - Kit.px(6)
-		draw_rect(Rect2(Vector2(Kit.px(3), size.y - Kit.px(5)), Vector2(maxf(1.0, full * ammo_bar), maxf(2.0, Kit.px(2)))), Color(0, 1, 0))
+		draw_rect(Rect2(Vector2(Kit.px(3), size.y - Kit.px(5)), Vector2(maxf(1.0, full * bar_left), maxf(2.0, Kit.px(2)))), Color(0, 1, 0))
 	if count >= 0 and not faded:
 		var f := Kit.font("bold")
 		var fs := Kit.px(13)
@@ -253,13 +268,25 @@ static func pie_points(rect: Rect2, done: float) -> PackedVector2Array:
 func _make_custom_tooltip(_for_text: String) -> Object:
 	if tip_title == "":
 		return null
-	var lines := tip_lines
+	var lines: Array = tip_fn.call() if tip_fn.is_valid() else tip_lines
 	if info.is_valid() and item != "":
 		var more: Array = info.call(item)
 		if not more.is_empty():
-			lines = tip_lines.duplicate()
+			lines = lines.duplicate()
 			lines.append_array(more)
-	return Kit.tooltip(tip_title, lines)
+	var box := Kit.tooltip(tip_title, lines)
+	var picture := _tip_picture()
+	if picture != null:
+		box.add_child(picture)
+		box.move_child(picture, 1)  # under the title, over the lines
+	return box
+
+
+## The picture a blueprint's tooltip shows (picture_for), or null.
+func _tip_picture() -> Control:
+	if picture_for.is_valid() and PICTURED.has(item) and not ghost:
+		return picture_for.call(self)
+	return null
 
 
 func _get_drag_data(_at_position: Vector2) -> Variant:

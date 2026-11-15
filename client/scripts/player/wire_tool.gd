@@ -11,6 +11,7 @@ extends Node3D
 
 const WorldMirror := preload("res://scripts/world/world.gd")
 const ProtoDB := preload("res://scripts/world/protos.gd")
+const GroundHeight := preload("res://scripts/world/ground_height.gd")
 
 ## Tool name (player_input.gd's cursor_tool) -> the wire kind on the wire ("r", "g", "w").
 const KINDS := {"red-wire": "r", "green-wire": "g", "copper-wire": "w"}
@@ -28,14 +29,11 @@ var from := {}
 
 var _mesh := ImmediateMesh.new()
 var _mi := MeshInstance3D.new()
-var _material := StandardMaterial3D.new()
+## The vertex colour, riding on an add-on's hills (ground_height.gd) as the poles and their wires do.
+var _material := GroundHeight.mark_material(Color.WHITE)
 
 
 func _ready() -> void:
-	_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	_material.vertex_color_use_as_albedo = true
-	_material.cull_mode = BaseMaterial3D.CULL_DISABLED
-	_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 	_mi.mesh = _mesh
 	_mi.material_override = _material
 	_mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF

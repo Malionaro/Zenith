@@ -271,7 +271,8 @@ end
 -- entity: "t" tiles [item, "t", tile, other direction's tile or "", [tile ids it may go on]];
 -- "c" capsules [item, "c", action type, range, radius]; "r" rail planners [item, "r", support
 -- entity or "", elevated rails allowed 0/1]; "b" belts [item, "b", their underground belt's item];
--- "p" pipes [item, "p", their pipe-to-ground's item]; "m" modules [item, "m", module category].
+-- "p" pipes [item, "p", their pipe-to-ground's item]; "m" modules [item, "m", module category];
+-- "h" repair tools [item, "h", health a unit of durability mends, durability at normal quality].
 -- Prototypes only but for the force's elevated rails, so kept per that (12 ms on Space Age, every
 -- handshake).
 local iuse_cache = {}
@@ -308,6 +309,12 @@ local function build_item_uses(allow_elevated)
     if item.type == "module" then
       local okm, cat = pcall(function() return item.category end)
       l[#l + 1] = { name, "m", okm and cat or "" }
+    end
+    if item.type == "repair-tool" then
+      -- (Health a unit of durability mends, and the units a normal-quality one has: repair.lua.)
+      local oks, speed = pcall(function() return item.speed end)
+      local okd, dur = pcall(function() return item.get_durability() end)
+      l[#l + 1] = { name, "h", oks and tonumber(speed) or 0, okd and tonumber(dur) or 0 }
     end
     local place = registry.place_result(item)
     if place and place.type == "transport-belt" then

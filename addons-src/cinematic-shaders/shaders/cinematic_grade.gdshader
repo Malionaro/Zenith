@@ -41,6 +41,11 @@ uniform float cloud_low = 230.0;        // the layer's bottom and top
 uniform float cloud_high = 300.0;
 uniform float cloud_scale = 0.009;      // pattern per tile (about 110 tiles a cloud)
 uniform vec2 wind = vec2(3.2, 1.1);     // tiles a second
+// The pattern, drawn once into a texture (cloud_field.gdshader, main.gd): red, green and blue are it to
+// 3, 4 and 5 octaves. It repeats every cloud_period of the pattern (about 1,800 tiles). Black (no
+// clouds) until it is drawn.
+uniform sampler2D cloud_field : hint_default_black, filter_linear, repeat_enable;
+uniform float cloud_period = 16.0;
 
 float hash(vec2 p) {
 	vec3 p3 = fract(vec3(p.xyx) * 0.1031);
@@ -48,41 +53,16 @@ float hash(vec2 p) {
 	return fract((p3.x + p3.y) * p3.z);
 }
 
-// Gradient noise (smooth, no grid showing the way value noise does when seen in perspective), about 0-1.
-float gnoise(vec2 p) {
-	vec2 i = floor(p);
-	vec2 f = fract(p);
-	vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
-	float ga = hash(i) * 6.2831853;
-	float gb = hash(i + vec2(1.0, 0.0)) * 6.2831853;
-	float gc = hash(i + vec2(0.0, 1.0)) * 6.2831853;
-	float gd = hash(i + vec2(1.0, 1.0)) * 6.2831853;
-	float a = dot(vec2(cos(ga), sin(ga)), f);
-	float b = dot(vec2(cos(gb), sin(gb)), f - vec2(1.0, 0.0));
-	float c = dot(vec2(cos(gc), sin(gc)), f - vec2(0.0, 1.0));
-	float d = dot(vec2(cos(gd), sin(gd)), f - vec2(1.0, 1.0));
-	return 0.5 + 0.75 * mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+// The pattern at a point in the world, drifting with the wind: (3, 4, 5 octaves), each about 0-1. One
+// read where the noise was worked out before (up to 48 sines and cosines for one point).
+vec3 cloud_pattern(vec2 xz) {
+	return textureLod(cloud_field, (xz - wind * TIME) * cloud_scale / cloud_period, 0.0).rgb;
 }
 
-float fbm(vec2 p, int octaves) {
-	float v = 0.0;
-	float a = 0.5;
-	mat2 turn = mat2(vec2(0.8, 0.6), vec2(-0.6, 0.8));
-	for (int i = 0; i < octaves; i++) {
-		p = turn * p * 2.03 + 17.1;
-		v += a * gnoise(p * 0.5);
-		a *= 0.5;
-	}
-	return v / (1.0 - pow(0.5, float(octaves)));
-}
-
-// The clouds' density at a point in the world (0 clear, 1 thick), thinning to the layer's top and bottom.
-float cloud_density(vec3 p, int octaves) {
-	vec2 q = (p.xz - wind * TIME) * cloud_scale;
-	// A little warp of the pattern by itself, so clouds billow instead of lying in even blobs.
-	q += 0.55 * vec2(gnoise(q * 0.7 + 3.1), gnoise(q * 0.7 + 8.7)) - 0.275;
-	float shape = fbm(q, octaves);
-	float h = clamp((p.y - cloud_low) / (cloud_high - cloud_low), 0.0, 1.0);
+// The clouds' density (0 clear, 1 thick) for the pattern's `shape` at height y, thinning to the layer's
+// top and bottom.
+float cloud_density(float shape, float y) {
+	float h = clamp((y - cloud_low) / (cloud_high - cloud_low), 0.0, 1.0);
 	// Each cloud is widest a third of the way up and narrows to its flat base and rounded top, so seen
 	// from low down it is a cloud, not a column of the pattern stretched up through the layer.
 	float narrow = 0.5 * pow(abs(h - 0.32) / 0.68, 1.6);
@@ -117,10 +97,12 @@ vec4 sky_clouds(vec3 from, vec3 dir, float night, float jitter) {
 	float trans = 1.0;
 	for (int i = 0; i < STEPS; i++) {
 		vec3 p = from + dir * (t0 + (float(i) + jitter) * dt);
-		float d = cloud_density(p, 5);
+		float d = cloud_density(cloud_pattern(p.xz).b, p.y);
 		if (d > 0.001) {
 			// How much cloud lies towards the sun from here: the lit side's brightness.
-			float towards = cloud_density(p + look_sun_dir * 40.0, 3) + cloud_density(p + look_sun_dir * 90.0, 3);
+			vec3 near_sun = p + look_sun_dir * 40.0;
+			vec3 far_sun = p + look_sun_dir * 90.0;
+			float towards = cloud_density(cloud_pattern(near_sun.xz).r, near_sun.y) + cloud_density(cloud_pattern(far_sun.xz).r, far_sun.y);
 			float light = exp(-towards * 1.6);
 			float h = clamp((p.y - cloud_low) / (cloud_high - cloud_low), 0.0, 1.0);
 			// With the sun low the light reaches their bases too.
@@ -144,8 +126,9 @@ float ground_cloud_shadow(vec3 p) {
 	if (fade <= 0.0)
 		return 0.0;
 	vec3 sd = normalize(vec3(look_sun_dir.x, max(look_sun_dir.y, 0.24), look_sun_dir.z));
-	vec3 at = p + sd * ((0.5 * (cloud_low + cloud_high) - p.y) / sd.y);
-	float d = cloud_density(vec3(at.x, 0.5 * (cloud_low + cloud_high), at.z), 4);
+	float mid = 0.5 * (cloud_low + cloud_high);
+	vec3 at = p + sd * ((mid - p.y) / sd.y);
+	float d = cloud_density(cloud_pattern(at.xz).g, mid);
 	return smoothstep(0.03, 0.45, d) * fade;
 }
 
@@ -166,12 +149,21 @@ void fragment() {
 	float space_sky = step(0.5, look_space) * (1.0 - step(1e-6, raw));
 	far *= 1.0 - space_sky;
 
-	// Chromatic aberration: red and blue a little apart towards the corners (on what is near).
+	// Chromatic aberration: red and blue a little apart towards the corners (on what is near). Their
+	// two reads only where they land a quarter of a pixel or more apart from green: nearer the middle
+	// (most of the screen) they read what green does.
 	vec2 shift = from_mid * aberration * edge * 2.0 * near;
-	vec3 c = vec3(scene_color(uv + shift).r, scene_color(uv).g, scene_color(uv - shift).b);
+	vec3 c = scene_color(uv);
+	vec2 shift_px = shift * VIEWPORT_SIZE;
+	if (dot(shift_px, shift_px) >= 0.0625) {
+		c = vec3(scene_color(uv + shift).r, c.g, scene_color(uv - shift).b);
+	}
 
 	// The far distance softened: a smaller copy of the screen, which also hides what shimmers there.
-	c = mix(c, scene_color_blurred(uv, 1.6), far);
+	// Not read where nothing is softened (from above, nearly the whole screen).
+	if (far > 0.0) {
+		c = mix(c, scene_color_blurred(uv, 1.6), far);
+	}
 
 	// Clouds: in the sky where nothing was drawn, their shadows on everything else (on what the sun lights:
 	// the brightest parts lose most).

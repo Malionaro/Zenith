@@ -2,7 +2,8 @@
 -- state, the current research with its progress and queue, and commands to queue or cancel.
 --
 -- The tree is resent when research finishes or is undone (a flag in storage set from the events),
--- so it stays deterministic.
+-- so it stays deterministic. What finished goes to the client as `rdone`, for Factorio's chime,
+-- its console line and the research panel's "finished" (K23).
 
 local transport = require("scripts.transport")
 local puppet = require("scripts.puppet")
@@ -228,15 +229,51 @@ end
 ---------------------------------------------------------------------------------------------
 -- Events
 
+-- What finished, for the client's chime and notice (K23): `rdone`, one message for the technologies
+-- of the character's force finished in a tick (Factorio plays its research_completed sound once when
+-- several finish on the same tick, 2.0.34), naming at most DONE_MAX (a /cheat researches hundreds).
+local DONE_MAX = 100
+
+-- The level a levelled technology (an infinite one, or one of several levels) has just finished, 0 for
+-- one of a single level, whose name says it. LuaTechnology.level is the level being researched, so
+-- once one is done it is already the next, unless that was the last.
+local function finished_level(tech)
+  local proto = tech.prototype
+  local first = read(proto, "level") or 1
+  local max_level = read(proto, "max_level") or first
+  if max_level <= first then
+    return 0
+  end
+  local level = read(tech, "level") or first
+  return tech.researched and level or math.max(first, level - 1)
+end
+
+-- Joins the tick's `rdone` while it is still waiting in the outbox (reliable: a lost one would lose
+-- the chime), else starts one. Only the outbox is read, so every peer joins the same way.
+local function note_finished(tech)
+  local s = storage.f3d
+  local open = s.outbox_tail >= s.outbox_head and s.outbox[s.outbox_tail] or nil
+  if not (open and open.t == "rdone" and open.tick == game.tick) then
+    open = { t = "rdone", l = {}, tick = game.tick }
+    transport.send_reliable(open)
+  end
+  if #open.l < DONE_MAX then
+    open.l[#open.l + 1] = { tech.name, finished_level(tech) }
+  else
+    open.n = (open.n or 0) + 1
+  end
+  -- The research after it, the next tick (`rs` waited for the tree, or a second).
+  s.research_status_due = true
+end
+
 -- Research finished or was undone: the tree, and what can be hand-crafted, need sending again.
 function M.on_research_changed(event)
   storage.f3d.techs_dirty = true
   crafting.invalidate()
-  -- A notification for the client; `tech` lets it show the name in the player's
-  -- language (the text is internal names, a headless server can't translate).
   local tech = event.research
-  if event.name == defines.events.on_research_finished and tech and storage.f3d.client then
-    transport.send_now({ t = "msg", text = "Research completed: " .. tech.name, tech = tech.name })
+  if event.name == defines.events.on_research_finished and tech and storage.f3d.client
+      and tech.force.name == force().name then
+    note_finished(tech)
   end
 end
 
@@ -254,6 +291,10 @@ function M.tick()
   if s.techs_job and not s.techs_job.block then
     s.techs_job = nil
     s.techs_dirty = true
+  end
+  if s.research_status_due then
+    s.research_status_due = nil
+    send_status()
   end
   if s.techs_dirty and not s.techs_job then
     s.techs_dirty = nil

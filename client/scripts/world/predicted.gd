@@ -8,12 +8,14 @@ extends Node3D
 ## prediction goes when its entity is drawn, or when the game has moved on without it (refused:
 ## out of reach, something in the way, none left), and is never drawn over something already
 ## there. Builds never touch the world mirror; a turn (turn()) turns the mirror's record in place
-## until the game's `upd` replaces it, and turns it back if none comes.
+## until the game's `upd` replaces it, and turns it back if none comes; a ghost removed by a right
+## click (remove_ghost()) is hidden until the game's `del` takes it, and shown again if none comes.
 
 const WorldMirror := preload("res://scripts/world/world.gd")
 const ProtoDB := preload("res://scripts/world/protos.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
+const GroundHeight := preload("res://scripts/world/ground_height.gd")
 
 ## Game ticks after the send with no entity: the mod answers on its next tick, so by then it was
 ## refused. Also at least this long in real time, for a server that stalls.
@@ -55,6 +57,7 @@ func reset() -> void:
 		p.node.queue_free()
 	_pending.clear()
 	_turns.clear()
+	_removed.clear()
 
 
 func count() -> int:
@@ -63,12 +66,14 @@ func count() -> int:
 
 ## Draws `proto` at `pos` (its footprint's centre, as sent to the mod), turned `dir`. False when it
 ## isn't predicted (a type the mod shapes, or something already drawn or predicted there).
-func build(proto: ProtoDB.EntityProto, pos: Vector2, dir: int) -> bool:
+## `look_turned`: one Factorio can't turn, built turned for the look (K21, visual_turns.gd), drawn so.
+func build(proto: ProtoDB.EntityProto, pos: Vector2, dir: int, look_turned := false) -> bool:
 	if proto == null or proto.type in NOT_PREDICTED:
 		return false
 	# Factorio puts a crafting machine down facing north while it has no recipe (2.1.24: an
 	# assembler built turned east, south or west came back north), and a hand-built one has none.
-	if proto.type == "assembling-machine":
+	# One it can't turn at all keeps the cursor's turn in Zenith (K21).
+	if proto.type == "assembling-machine" and not look_turned:
 		dir = 0
 	# A model not made yet would be a grey box where the building is about to appear: nothing is
 	# better (the first of a kind only; asking starts it loading).
@@ -150,7 +155,7 @@ func _make_node(proto: ProtoDB.EntityProto, pos: Vector2, dir: int) -> Node3D:
 	var box := MeshInstance3D.new()
 	box.mesh = Visuals.box_mesh()
 	box.transform = Visuals.placeholder_transform(proto, pos, dir, Visuals.height_for(proto))
-	box.material_override = Visuals.ghost_material(Color(0.6, 0.6, 0.6, 1.0))
+	box.material_override = GroundHeight.mark_material(Color(0.6, 0.6, 0.6, 1.0), false)  # on the hills, as models are
 	root.add_child(box)
 	return root
 
@@ -174,6 +179,8 @@ func _process(_delta: float) -> void:
 	var now := Time.get_ticks_msec()
 	if not _turns.is_empty():
 		_check_turns(now)
+	if not _removed.is_empty():
+		_check_removed(now)
 	if _pending.is_empty():
 		return
 	var i := 0
@@ -247,6 +254,41 @@ func turn(rec: WorldMirror.Rec, reverse: bool) -> bool:
 		rec.dir = posmod(rec.dir + (-4 if reverse else 4), 16)
 	world.redraw(rec.chunk)
 	return true
+
+
+## Ghosts removed by a right click (I6), hidden at once: entity key -> Turn (its record, and when).
+var _removed := {}
+
+
+## Hides a ghost (or tile ghost) the player just removed, before the game's `del` arrives: its
+## record gets `hid` (ghosts.gd draws it not, world.pick passes it by); shown again if the game moves
+## on without removing it. False when it isn't a ghost.
+func remove_ghost(rec: WorldMirror.Rec) -> bool:
+	if rec == null or not (rec.extra.has("gh") or rec.extra.has("tg")) or rec.extra.has("hid"):
+		return false
+	var t := Turn.new()
+	t.rec = rec
+	t.old_extra = rec.extra
+	t.tick = Bridge.server_tick
+	t.msec = Time.get_ticks_msec()
+	_removed[rec.key] = t
+	var e := rec.extra.duplicate()
+	e["hid"] = 1
+	rec.extra = e
+	world.hide_record(rec)
+	return true
+
+
+func _check_removed(now: int) -> void:
+	for key in _removed.keys():
+		var t: Turn = _removed[key]
+		if world.entities.get(key) != t.rec:
+			_removed.erase(key)  # its `del` came (or another record): the game agrees
+		elif Bridge.server_tick - t.tick >= REFUSED_TICKS and now - t.msec >= REFUSED_MSEC:
+			t.rec.extra = t.old_extra
+			world.hide_record(t.rec)
+			refused += 1
+			_removed.erase(key)
 
 
 func _check_turns(now: int) -> void:

@@ -175,6 +175,8 @@ func _hide_chunks() -> void:
 		elif not hide and _hidden.has(c):
 			cv.visible = true
 			_hidden.erase(c)
+			if world.has_method("chunk_shown"):
+				world.chunk_shown(c)  # its levels of detail, kept while hidden
 	for c in _hidden.keys():
 		if not is_instance_valid(_hidden[c]) or chunks.get(c) != _hidden[c]:
 			_hidden.erase(c)
@@ -188,6 +190,8 @@ func _show_chunks() -> void:
 		var cv: Variant = _hidden[c]
 		if is_instance_valid(cv):
 			cv.visible = true
+			if world != null and world.has_method("chunk_shown"):
+				world.chunk_shown(c)
 	_hidden.clear()
 
 

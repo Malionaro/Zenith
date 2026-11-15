@@ -3,117 +3,110 @@ name: tests
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+# A new push to a branch cancels the run still going on it (a tag, a PR and another branch each
+# have their own).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   GODOT_VERSION: "4.7.2"
   FACTORIO_VERSION: "2.1.23"
 
+# Every job: a pinned runner image (ubuntu-latest moves to a new Ubuntu by itself), a time limit, a
+# one-line result per job in the run's summary with each failing check named (and as an error
+# annotation), and its logs uploaded when it fails.
 jobs:
+  # The same command as locally (docs/RUNNING.md "Tests"): the Lua suites against the fake Factorio
+  # API, the mock over UDP, gdparse, the models' check and both fuzzers, each once, then a table.
   tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install test dependencies
-        run: pip install lupa "gdtoolkit==4.*"
-      - name: Bridge mod against the fake Factorio API
-        run: python tools/mod_tests/test_bridge.py
-      - name: The bridge's data stage (the graphics list)
-        run: python tools/mod_tests/test_data_stage.py
-      - name: Mock server over UDP
-        run: python tools/test_mock_server.py
-      - name: GDScript parses
-        run: gdparse $(find client -name '*.gd') > /dev/null
-      - name: Every model passes check.py
-        run: python tools/models/check.py
-      - name: Fuzz the mod (malformed, truncated, out-of-order packets)
-        run: python tools/mod_tests/test_fuzz.py
-      - name: Fuzz the mock
-        run: python tools/test_mock_fuzz.py
+        run: pip install "lupa==2.*" "gdtoolkit==4.*"
+      - name: The fast suites (tools/check.py --all)
+        timeout-minutes: 15
+        run: python tools/check.py --all fast --logs ci-logs
+      - name: Upload the suites' output
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tests-logs
+          path: ci-logs/
+          if-no-files-found: ignore
 
-  # The client's UI test (client/tests/ui_test.tscn) in headless Godot. Without a Factorio
-  # install the UI falls back to flat panels, which is what this checks: input paths and
+  # The client's headless Godot tests (UI test, packet fuzzing, decoratives, mods' files, add-ons, VR,
+  # model loading), through check.py as locally: each fails on its exit code or on any SCRIPT ERROR
+  # (a GDScript runtime error only stops that call), and all run even when one fails. Without a
+  # Factorio install the UI falls back to flat panels, which is what this checks: input paths and
   # model hooks, not looks.
   ui:
-    runs-on: ubuntu-latest
-    # A test script that doesn't parse leaves headless Godot running with nothing to quit it.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
       - name: Cache Godot
         id: godot-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/godot
           key: godot-${{ env.GODOT_VERSION }}
       - name: Download Godot
         if: steps.godot-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 10
         run: |
           mkdir -p ~/godot
           curl -fsSL -o /tmp/godot.zip "https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
           unzip -q /tmp/godot.zip -d ~/godot
           mv ~/godot/Godot_v${GODOT_VERSION}-stable_linux.x86_64 ~/godot/godot
       - name: Import the project
+        timeout-minutes: 10
         run: ~/godot/godot --headless --path client --import
-      # A GDScript runtime error only stops that call, so the exit code can't show it: fail on
-      # any SCRIPT ERROR in the output.
-      - name: UI test
-        run: |
-          set -o pipefail
-          ~/godot/godot --headless --path client res://tests/ui_test.tscn 2>&1 | tee ui_test.log
-          ! grep -n "SCRIPT ERROR" ui_test.log
-      - name: Fuzz the client's packet parsing
-        run: |
-          set -o pipefail
-          ~/godot/godot --headless --path client res://tests/bridge_fuzz_test.tscn 2>&1 | tee fuzz.log
-          ! grep -n "SCRIPT ERROR" fuzz.log
-      - name: Decoratives layer
-        run: |
-          set -o pipefail
-          ~/godot/godot --headless --path client res://tests/decor_test.tscn 2>&1 | tee decor.log
-          ! grep -n "SCRIPT ERROR" decor.log
-      - name: Mods' files and graphics
-        run: |
-          set -o pipefail
-          ~/godot/godot --headless --path client -s res://tests/mod_files_test.gd 2>&1 | tee modfiles.log
-          ! grep -n "SCRIPT ERROR" modfiles.log
-      - name: Add-ons
-        run: |
-          set -o pipefail
-          ~/godot/godot --headless --path client res://tests/addon_test.tscn 2>&1 | tee addons.log
-          ! grep -n "SCRIPT ERROR" addons.log
-      - name: VR panel and session without a headset
-        run: |
-          set -o pipefail
-          ~/godot/godot --headless --path client res://tests/vr_test.tscn 2>&1 | tee vr.log
-          ! grep -n "SCRIPT ERROR" vr.log
-      - name: Every model loads the same both ways
-        run: |
-          set -o pipefail
-          ~/godot/godot --headless --path client -s res://tests/model_load_test.gd 2>&1 | tee modelload.log
-          ! grep -n "SCRIPT ERROR" modelload.log
+      # Each test stops itself on a parse error or past its time limit (client/tests/test_watchdog.gd),
+      # and check.py stops one that still runs a minute later.
+      - name: The Godot tests (tools/check.py --all godot)
+        timeout-minutes: 20
+        run: GODOT="$HOME/godot/godot" python tools/check.py --all godot --logs ci-logs
+      - name: Upload the tests' output
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ui-logs
+          path: ci-logs/
+          if-no-files-found: ignore
 
   # The bridge mod in the real game: Factorio's free Linux headless build, a new map, then
   # tools/live_check.py over UDP and RCON, as on a desktop PC.
   live:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Cache Factorio
         id: factorio-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: server/factorio
           key: factorio-headless-${{ env.FACTORIO_VERSION }}
       - name: Download Factorio
         if: steps.factorio-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 10
         run: server/download-headless.sh "$FACTORIO_VERSION"
       - name: Start the server
+        timeout-minutes: 5
         # One map for every run: a new random map each time put trees, cliffs or water where
         # some check works, and a different check failed on each run. Seed 123456 passes them all
         # (checked on Factorio 2.1.23).
@@ -129,35 +122,52 @@ jobs:
           done
           cat server/server.log; exit 1
       - name: live_check
-        run: python tools/live_check.py
-      - name: Server log
+        timeout-minutes: 25
+        run: |
+          set -o pipefail
+          python tools/live_check.py 2>&1 | tee live_check.log
+      - name: Summary
         if: always()
-        run: cat server/server.log
+        run: python tools/ci_summary.py live_check live_check.log
+      - name: Server log
+        if: failure()
+        run: tail -200 server/server.log
+      - name: Upload the logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: live-logs
+          path: |
+            live_check.log
+            server/server.log
+            server/data/factorio-current.log
+          if-no-files-found: ignore
 
   # What the bridge costs on a big base: tools/busy_base.py builds 20,000+ entities (belt loops,
   # assemblers, a main bus, a train, robots, walls) next to the character in headless Factorio,
   # then profiles the mod per module with a client connected. Fails on a big regression against
   # tools/busy_budget.json; the numbers are uploaded either way.
   busy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Cache Factorio
         id: factorio-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: server/factorio
           key: factorio-headless-${{ env.FACTORIO_VERSION }}
       - name: Download Factorio
         if: steps.factorio-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 10
         run: server/download-headless.sh "$FACTORIO_VERSION"
       - name: Start the server
-        # One map for every run: a new random map each time put trees, cliffs or water where
-        # some check works, and a different check failed on each run. Seed 123456 passes them all
-        # (checked on Factorio 2.1.23).
+        timeout-minutes: 5
+        # The same map as the live job.
         env:
           MAP_SEED: "123456"
         run: |
@@ -172,20 +182,38 @@ jobs:
       # The decoratives' pictures (file names and numbers only) for client/data/decoratives.json,
       # from this Factorio's prototypes: compared with the committed file, printed when it differs.
       - name: Decorative index is current
+        timeout-minutes: 5
         run: |
           python tools/decor_index.py --factorio server/factorio --out decoratives.json
           if ! cmp -s decoratives.json client/data/decoratives.json; then
             echo "client/data/decoratives.json differs from this Factorio's; new one:"; cat decoratives.json; echo
           fi
       - name: Build a big base and measure the bridge
-        run: python tools/busy_base.py --big --measure busy.json --budget tools/busy_budget.json
+        timeout-minutes: 20
+        run: |
+          set -o pipefail
+          python tools/busy_base.py --big --measure busy.json --budget tools/busy_budget.json 2>&1 | tee busy.log
+      - name: Summary
+        if: always()
+        run: python tools/ci_summary.py busy_base busy.log
       - name: Upload the numbers
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: busy
-          path: busy.json
+          path: |
+            busy.json
+            busy.log
           if-no-files-found: ignore
       - name: Server log
         if: always()
         run: tail -200 server/server.log
+      - name: Upload the server's log
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: busy-server-log
+          path: |
+            server/server.log
+            server/data/factorio-current.log
+          if-no-files-found: ignore

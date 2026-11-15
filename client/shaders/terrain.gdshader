@@ -6,7 +6,8 @@ shader_type spatial;
 // tile types spread over its edges with a ragged, noisy mask, like Factorio's transitions. CUSTOM0
 // = (own layer or -1, lower spreading layer, upper spreading layer, mask A + 256 * mask B), the
 // masks being which of the 8 neighbours carry that type (bits: E W S N SE SW NE NW). CUSTOM1.x is
-// the same kind of mask for water neighbours (a wet rim along the bank). COLOR tints the texture.
+// the same kind of mask for water neighbours (a wet rim along the bank), CUSTOM1.z 1 on a player's
+// floor (smoother than natural ground). COLOR tints the texture.
 //
 // Without (or for a tile with no picture): the tile's map colour (COLOR) broken up by
 // world-space noise, so any tile type gets detail without a texture.
@@ -22,7 +23,7 @@ uniform float bump = 1.0;
 // hint of one helps read distances in 3D. Not drawn on textured ground, whose variants show it.
 uniform float tile_edge = 0.04;
 // How much of SSAO darkens the ground's direct (sun) light (Godot's AO_LIGHT_AFFECT; SSAO always
-// darkens its ambient light). The ground has no occlusion of its own: this is only SSAO's.
+// darkens its ambient light). The ground's own occlusion is only its picture's crevices (`crevice`).
 uniform float ssao_on_sunlight = 0.85;
 
 // The look's share of the ground's specular (looks.gd "ground_specular"): the sky's reflection on
@@ -44,7 +45,39 @@ uniform float raggedness = 1.0;
 uniform float coast_wander = 0.55;
 uniform float rim = 0.14;
 
+// How rough the ground is: natural ground fully matte, so the sky and a low sun don't glaze it
+// (owner's I8), a player's floor (concrete, paths) a little smoother, with some sheen.
+uniform float ground_roughness = 1.0;
+uniform float floor_roughness = 0.8;
+uniform float ground_specular = 0.15;
+uniform float floor_specular = 0.3;
+// The tile picture's brightness as height (tiles per unit of linear luminance): its stones and
+// clods tilt the normal. Floors get floor_relief of it (concrete's joints and pits, not rubble).
+uniform float relief_height = 0.03;
+uniform float floor_relief = 0.4;
+// Micro-shadowing: how much darker a pixel in the picture's crevices gets, sky light and (through
+// AO_LIGHT_AFFECT) sunlight both. Godot takes the darker of this and SSAO, so round buildings,
+// where SSAO is darker, nothing changes.
+uniform float crevice = 0.3;
+// The relief and crevices at all (visuals.gd set_ground_relief: off at Level of detail Low), and
+// whether they stop where the mipmaps have already blurred them away (RELIEF_SHARP, RELIEF_GONE).
+uniform bool ground_relief = true;
+uniform bool relief_fades = true;
+
 const vec2 SLOT = vec2(1.0 / 32.0, 1.0 / 16.0);
+// One texel of a tile picture, in tiles (terrain_textures.gd: 64 pixels a tile).
+const float RELIEF_TEXEL = 1.0 / 64.0;
+// The picture's texels a pixel covers (along its finer direction) where the relief starts to fade and
+// where it is gone. Its slope is two neighbouring texels' difference: once a pixel spans a few texels
+// the mip it reads has averaged them, so the slope and the crevices are nearly flat anyway, and the
+// three extra reads (paid again in the depth pre-pass with SSAO) are skipped there. Faded, not cut, so
+// no line shows across the ground where they stop.
+const float RELIEF_SHARP = 1.5;
+const float RELIEF_GONE = 3.0;
+
+float luma(vec3 c) {
+	return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
 
 varying vec3 world_pos;
 varying vec3 world_normal;
@@ -146,19 +179,50 @@ void fragment() {
 	vec3 fine = noised(p * 4.3 + 31.7);
 	int own = int(round(layers.x));
 	int kind = int(round(masks.y));  // 0 ground or bank, 1 shelf under ground, 2 shelf over water
+	// A player's floor (concrete, stone path, refined concrete, platform foundations: terrain_mesher.gd
+	// FLOOR), which stays smoother and shinier than natural ground.
+	float is_floor = step(0.5, masks.z);
+	vec2 duv_x = dFdx(UV);
+	vec2 duv_y = dFdy(UV);
 	vec3 albedo;
 	float bump_scale = bump;
+	// The tile picture's own relief (luminance per tile, east and south) and how deep in a crevice of
+	// it this pixel is (0 to 1): see below.
+	vec2 relief = vec2(0.0);
+	float cavity = 0.0;
 	if (textured && own >= 0) {
 		if (kind == 2) {
 			albedo = layer_color(own, wt, dx, dy) * texture_gain;
 		} else {
 			// Kept half a texel inside the tile's slot, so filtering doesn't reach the next one.
 			vec2 uv = top > 0.5 ? UV + (clamp(f, 0.5 / 64.0, 1.0 - 0.5 / 64.0) - f) * SLOT : UV;
-			albedo = texture(tiles, vec3(uv, float(own))).rgb * texture_gain;
+			vec3 c0 = textureGrad(tiles, vec3(uv, float(own)), duv_x, duv_y).rgb;
+			albedo = c0 * texture_gain;
+			float sharp = 1.0;
+			if (relief_fades) {
+				sharp = 1.0 - smoothstep(RELIEF_SHARP, RELIEF_GONE, min(length(dx), length(dy)) / RELIEF_TEXEL);
+			}
+			if (top > 0.5 && ground_relief && (relief_height > 0.0 || crevice > 0.0) && sharp > 0.0) {
+				// Micro detail from the picture itself, no textures of our own (owner's I8: the ground
+				// looked too shiny and flat): its brightness taken as height, light stones raised and
+				// dark gaps sunk, as Factorio paints them. One texel east and south (inwards, so the
+				// samples stay in the tile's slot) give the slope; mipmapping blurs it away as the
+				// view zooms out, so it fades by itself and never shimmers (and past RELIEF_GONE isn't
+				// read). Three mips up is the neighbourhood's average brightness: a pixel darker than
+				// that lies in a crevice.
+				vec2 sgn = vec2(f.x < 0.5 ? 1.0 : -1.0, f.y < 0.5 ? 1.0 : -1.0);
+				vec2 step_uv = sgn * RELIEF_TEXEL * SLOT;
+				float l0 = luma(c0);
+				float lx = luma(textureGrad(tiles, vec3(uv + vec2(step_uv.x, 0.0), float(own)), duv_x, duv_y).rgb);
+				float ly = luma(textureGrad(tiles, vec3(uv + vec2(0.0, step_uv.y), float(own)), duv_x, duv_y).rgb);
+				relief = sharp * sgn * vec2(lx - l0, ly - l0) / RELIEF_TEXEL;
+				float around = luma(textureGrad(tiles, vec3(uv, float(own)), duv_x * 8.0, duv_y * 8.0).rgb);
+				cavity = sharp * smoothstep(0.01, 0.12, around - l0);
+			}
 		}
 		// A whisper of broad variation keeps large fields from looking printed.
 		albedo *= 1.0 + detail * 0.12 * (broad - 0.5);
-		bump_scale *= 0.35;
+		bump_scale *= 0.35 * mix(1.0, 0.5, is_floor);
 	} else {
 		// Grit: small dark and light specks where the finest noise is at its extremes.
 		float grit = vnoise(p * 11.0 + 5.1);
@@ -209,30 +273,42 @@ void fragment() {
 		if (packed != 0) {
 			n = raggedness * (0.55 * (2.0 * fbm3(w * 1.4 + 3.7) - 1.0) + 0.2 * (vnoise(w * 5.3 + 9.2) - 0.5));
 		}
+		// The own picture's relief and crevices fade where a neighbour's picture covers it.
+		float own_share = 1.0;
 		if (la >= 0 && mask_a != 0) {
 			float wa = spread_weight(mask_distance(mask_a, f), n);
 			if (wa > 0.0) albedo = mix(albedo, layer_color(la, wt, dx, dy) * texture_gain, wa);
+			own_share -= wa * own_share;
 		}
 		if (lb >= 0 && mask_b != 0) {
 			float wb = spread_weight(mask_distance(mask_b, f), n);
 			if (wb > 0.0) albedo = mix(albedo, layer_color(lb, wt, dx, dy) * texture_gain, wb);
+			own_share -= wb * own_share;
 		}
+		relief *= own_share;
+		cavity *= own_share;
+		// Natural ground's matte, a floor's smoother (the wet shore above keeps its own).
+		roughness = mix(ground_roughness, floor_roughness, is_floor);
+	} else if (top > 0.5) {
+		roughness = mix(ground_roughness, floor_roughness, is_floor);
 	}
 
 	ALBEDO = albedo;
 	ROUGHNESS = roughness;
-	SPECULAR = 0.3 * f3d_look_ground_specular;
+	SPECULAR = mix(ground_specular, floor_specular, is_floor) * f3d_look_ground_specular;
 	// SSAO darkens the ground's sunlight too, not only the sky's light: Factorio paints the shade
 	// round a building's foot whatever the light. Without it Godot took a quarter of SSAO to direct
 	// light here (the environment's light affect times its AO channel affect, 0.5 x 0.5), and the
-	// ground round the buildings, nearly all lit by the sun, showed almost none.
-	AO = 1.0;
+	// ground round the buildings, nearly all lit by the sun, showed almost none. The picture's own
+	// crevices are the ground's occlusion (Godot takes the darker of it and SSAO).
+	AO = 1.0 - crevice * mix(1.0, 0.5, is_floor) * cavity;
 	AO_LIGHT_AFFECT = ssao_on_sunlight;
 
 	if (top > 0.5) {
 		// Height = 0.06 * mid + 0.015 * fine; the gradient tilts the normal. Chain rule: the
-		// noise is sampled at p * scale, so its gradient scales too.
+		// noise is sampled at p * scale, so its gradient scales too. Then the picture's own relief.
 		vec2 grad = bump_scale * (mid.yz * 0.9 * 0.06 + fine.yz * 4.3 * 0.015);
+		grad += relief * relief_height * mix(1.0, floor_relief, is_floor);
 		vec3 nrm = normalize(hill_normal + vec3(-grad.x, 0.0, -grad.y));
 		NORMAL = normalize((VIEW_MATRIX * vec4(nrm, 0.0)).xyz);
 	}

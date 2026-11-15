@@ -8,7 +8,7 @@ extends Node
 ## so the game ran at 50 and 35 UPS.
 ##
 ## This watches the game's UPS (server ticks per real second, over the last WINDOW seconds) and,
-## while it stays under LOW, lowers one step of STEPS at a time, PAUSE_DOWN apart; once it has held
+## while it stays under LOW, lowers one step of `steps` (STEPS, the belts' last) at a time, PAUSE_DOWN apart; once it has held
 ## HIGH for a while it takes the last step back, towards the player's own settings. It never writes
 ## the settings: `limit()` gives each knob's value under the player's, which main.gd applies.
 ## Ticks that stop altogether (a save, the game paused) are not slowness and are skipped.
@@ -106,6 +106,36 @@ const BUDGET_GROW := 1.2
 const BIG_LOAD := 0.75
 const AFTER_LOAD := 8.0
 const BUDGET_LOAD_FLOOR := 150
+## The `updates` steps (Moving belt items 3000, 1500: `bfar` m, the belt cap) are skipped: the client
+## simulates its belts (`bs` in its hello) and the bridge's square ignores the cap (belt_sim.lua
+## full_area), so they bought nothing and cost PAUSE_DOWN each before `far` shrank the square (measured
+## live at -62,-26, the belt-rate round). `--ups-updates-steps=on` takes them again (a bridge with
+## `/f3d-bs full_area off`, where the cap bounds the square).
+var updates_steps := Settings.arg_value("--ups-updates-steps=") == "on"
+## --governor-belts-last=on|off (on; the owner: "belt logic ... high priority on what gets culled for performance,
+## it is integral to the game's feel"): the belt item distance's steps (`far`, and `updates` where taken) come after
+## every other step, the view distance and the FPS cap too, so the belts keep their reach until nothing else is
+## left to give; off: STEPS' order, as before (the belt item distance cut to 96 at the seventh step).
+var belts_last := Settings.arg_value("--governor-belts-last=") != "off":
+	set(v):
+		belts_last = v
+		steps = order(v)
+## The steps in the order they are taken (STEPS, or with belts_last the belts' steps last).
+var steps: Array = order(Settings.arg_value("--governor-belts-last=") != "off")
+
+
+## STEPS in the order they are taken: with `last` the belts' steps (`far`, `updates`) after every other.
+static func order(last: bool) -> Array:
+	if not last:
+		return STEPS.duplicate()
+	var rest: Array = []
+	var belts: Array = []
+	for s in STEPS:
+		if s[0] == "far" or s[0] == "updates":
+			belts.append(s)
+		else:
+			rest.append(s)
+	return rest + belts
 
 signal budget_changed(units: int)
 
@@ -187,7 +217,7 @@ func limit(knob: String, wanted: float) -> float:
 	if lifted:
 		return wanted
 	wanted = AddonRequests.lighter(knob, wanted)  # an add-on's lighter updates (a timelapse), under the setting
-	if not _caps.has(knob):
+	if not _caps.has(knob) or (knob == "updates" and not updates_steps):
 		return wanted
 	var cap := float(_caps[knob])
 	if knob == "map" or knob == "rate":
@@ -342,7 +372,7 @@ func _measure(window: float) -> float:
 
 ## The next step down that changes anything with the player's settings now, or -1.
 func _next_down() -> int:
-	for i in range(level, STEPS.size()):
+	for i in range(level, steps.size()):
 		if _changes_at(i):
 			return i
 	return -1
@@ -379,7 +409,7 @@ func _step(dir: int) -> void:
 		level = maxi(0, i)
 	_caps = {}
 	for i in level:
-		_caps[STEPS[i][0]] = STEPS[i][1]  # each knob's steps go one way, so the last one taken holds
+		_caps[steps[i][0]] = steps[i][1]  # each knob's steps go one way, so the last one taken holds
 	_since_step = 0.0
 	_low_for = 0.0
 	_high_for = 0.0
@@ -388,9 +418,11 @@ func _step(dir: int) -> void:
 
 ## Whether the step at i, given the steps before it, changed anything for the player's settings.
 func _changes_at(i: int) -> bool:
-	var knob: String = STEPS[i][0]
+	var knob: String = steps[i][0]
+	if knob == "updates" and not updates_steps:
+		return false  # (see updates_steps: the belt cap buys a `bs` client nothing)
 	var now := _player(knob)
 	for j in i:
-		if STEPS[j][0] == knob:
-			now = limit_with(knob, now, float(STEPS[j][1]))
-	return absf(limit_with(knob, now, float(STEPS[i][1])) - now) > 0.001
+		if steps[j][0] == knob:
+			now = limit_with(knob, now, float(steps[j][1]))
+	return absf(limit_with(knob, now, float(steps[i][1])) - now) > 0.001

@@ -1,7 +1,10 @@
 extends MeshInstance3D
 ## Vulcanus' demolisher territories in the world: their borders as thin red strips on the ground,
-## where Factorio draws them red. From ui_model.gd's territory_edges (`terr`): one
-## mesh for all of them, rebuilt when they change.
+## where Factorio draws them red (owner's #4). From ui_model.gd's territory_edges (`terr`): one
+## mesh for all of them, rebuilt when they change. Lifted onto an add-on's hills in their shader
+## (ground_height.gd), as the ground is.
+
+const GroundHeight := preload("res://scripts/world/ground_height.gd")
 
 const WIDTH := 0.18  # tiles
 const HEIGHT := 0.06  # just over the ground
@@ -12,12 +15,7 @@ var model  # ui_model.gd
 
 func _ready() -> void:
 	cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	var m := StandardMaterial3D.new()
-	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	m.albedo_color = COLOR
-	m.cull_mode = BaseMaterial3D.CULL_DISABLED
-	material_override = m
+	material_override = GroundHeight.mark_material(COLOR, false)
 	if model != null:
 		model.territories_changed.connect(rebuild)
 	rebuild()

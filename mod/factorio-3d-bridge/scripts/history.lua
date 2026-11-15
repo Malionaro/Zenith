@@ -274,7 +274,7 @@ local function reverse(entry, back)
         r = not r
       end
       entry.e.rotate({ reverse = r })
-      tracker.changed(entry.e)
+      tracker.rotated(entry.e)
     end
   else -- marks
     local add = (entry.cancel == back) -- undoing a cancel puts marks back

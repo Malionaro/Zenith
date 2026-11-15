@@ -16,6 +16,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 import protocol  # noqa: E402
 
+# A FAIL line can hold any character: on Windows, output to a file or pipe is in the system's code page,
+# and one character it lacks stopped the run with UnicodeEncodeError.
+sys.stdout.reconfigure(errors="backslashreplace")
+
 MOD = ROOT / "mod" / "factorio-3d-bridge"
 
 failures = []
@@ -354,6 +358,49 @@ check(any("not made" in str(s) for s in g4.logged.values()), "the error is logge
 # JSON: escapes, numbers, nulls.
 enc = ex.encode
 check(enc(lua.eval('{ "a\\"b\\\\c", 1, 0.5, -0.0, 1e-7 }')) == '["a\\"b\\\\c",1,0.5,0,1e-07]', "encoding: %s" % enc(lua.eval('{ "a\\"b\\\\c", 1, 0.5, -0.0, 1e-7 }')))
+
+# The planets with lightning (the 0.2.1 hotfix: planets.lua looks for lightning often only on those).
+_, g5 = run("""return { planet = {
+  fulgora = { type = "planet", name = "fulgora", lightning_properties = { search_radius = 10 } },
+  nauvis = { type = "planet", name = "nauvis" },
+  aaa = { type = "planet", name = "aaa", lightning_properties = {} },
+} }""")
+pl = g5.data.raw["mod-data"]["zenith-planets"] if g5.data.raw["mod-data"] else None
+check(pl is not None and pl.data_type == "zenith-planets" and list(pl.data.lightning.values()) == ["aaa", "fulgora"],
+      "zenith-planets lists the planets whose prototype has lightning, sorted: %r" % (list(pl.data.lightning.values()) if pl else None))
+_, g6 = run("return {}")
+pl = g6.data.raw["mod-data"] and g6.data.raw["mod-data"]["zenith-planets"]
+check(pl is not None and len(list(pl.data.lightning.values())) == 0, "and an empty list without planets")
+
+# J11: each minable entity's own mining_sound, as the file of its first variation without its number:
+# a Sound with variations, one with a filename, and a bare list (sound_variations); none for those
+# without (a tree) or that can't be mined.
+_, g7 = run("""return {
+  ["simple-entity"] = {
+    ["huge-rock"] = { type = "simple-entity", name = "huge-rock", minable = { mining_time = 2 },
+      mining_sound = { variations = { { filename = "__base__/sound/axe-mining-stone-1.ogg", volume = 0.5 },
+                                      { filename = "__base__/sound/axe-mining-stone-2.ogg", volume = 0.5 } } } },
+    ["fake-rock"] = { type = "simple-entity", name = "fake-rock", mining_sound = { filename = "__base__/sound/x.ogg" } },
+  },
+  resource = { stone = { type = "resource", name = "stone", minable = { mining_time = 1 },
+    mining_sound = { filename = "__core__/sound/axe-mining-stone.ogg" } } },
+  plant = { ["yumako-tree"] = { type = "plant", name = "yumako-tree", minable = { mining_time = 0.5 },
+    mining_sound = { { filename = "__space-age__/sound/mining/axe-mining-yumako-tree-1.ogg", volume = 0.6 } } } },
+  tree = { ["tree-01"] = { type = "tree", name = "tree-01", minable = { mining_time = 0.5 } } },
+  wall = { ["stone-wall"] = { type = "wall", name = "stone-wall", minable = { mining_time = 0.2 },
+    repair_sound = { { filename = "__base__/sound/manual-repair-simple-1.ogg", volume = 0.5 },
+                     { filename = "__base__/sound/manual-repair-simple-2.ogg", volume = 0.5 } } } },
+  ["assembling-machine"] = { ["assembling-machine-1"] = { type = "assembling-machine", name = "assembling-machine-1" } },
+}""")
+md = g7.data.raw["mod-data"] and g7.data.raw["mod-data"]["zenith-mining-sounds"]
+ms = {k: v for k, v in md.data.ms.items()} if md is not None else None
+check(ms == {"huge-rock": "base/sound/axe-mining-stone", "stone": "core/sound/axe-mining-stone",
+             "yumako-tree": "space-age/sound/mining/axe-mining-yumako-tree"},
+      "J11: zenith-mining-sounds has each minable entity's own mining sound: %r" % ms)
+# K13: and each entity's own repair_sound the same way (a wall's hammering); none for one without.
+rs = {k: v for k, v in md.data.rs.items()} if md is not None and md.data.rs is not None else None
+check(rs == {"stone-wall": "base/sound/manual-repair-simple"},
+      "K13: zenith-mining-sounds has each entity's own repair sound: %r" % rs)
 
 print("DATA STAGE FAILS: %d" % len(failures))
 sys.exit(1 if failures else 0)

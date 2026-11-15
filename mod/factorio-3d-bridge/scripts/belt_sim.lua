@@ -8,7 +8,8 @@
 --   and loaders themselves (until the client simulates them), belts with a circuit connection, and
 --   the square's outermost ring (items leave it and come in from outside). Each is checked cheaply
 --   every update (its count, front and back positions, items) and read in full when that changed,
---   sent in `sl` with the tick it was read on.
+--   sent in `sl` with the tick it was read on. (ins_driven: one watched for inserters alone is read
+--   only when a hand took or put there, as its inserter's check shows.)
 -- * Drift checks (`pc`): every other lane's cheap check about every PC_EVERY updates, which the
 --   client compares with its own state at that tick; it asks again (`bre`) for lanes that differ.
 -- * Anything built, mined, rotated or destroyed near a belt (tracker.listeners): those belts are
@@ -81,6 +82,9 @@ M.quiet_ticks = 12
 -- progress) is checked at once when one acted; quiet, it is checked again only every spot_quiet_ticks
 -- otherwise, as a safety net. (Fields for tests.)
 M.spot_quiet_ticks = 60
+-- (ins_driven) An inserter at a belt watched for inserters alone is checked every update, never backed off (false:
+-- backed off as the rest; a field for measuring).
+M.ins_eager = true
 -- A lane read again for the client (`bre`) is read with the packed run it belongs to: at most this
 -- many belts ahead and behind. (Tests: 0 turns it off.)
 M.run_belts = 6
@@ -179,7 +183,14 @@ M.counts = { checked = 0, changed = 0, quiet = 0, flow = 0, scan_moved = 0, scan
 -- `rate` levels 1-2 (Hold 60 UPS's first steps) leave them at every f3d-detail-interval ticks and level 3
 -- doubles them once; off, they follow the glided belt items' job (`bi`: tier 1, 12, 24, 48 ticks), as
 -- before, which under Hold 60 UPS read every input spot only once in 24-48 ticks and left the owner's
--- bus with gaps along every lane (rate.lua's top).
+-- bus with gaps along every lane (rate.lua's top). period_max (the belt-rate round): the longest period
+-- `bs` is stretched to under `rate`, in ticks: 6 (the default, the detail interval) means never stretched,
+-- every level leaves the updates at 6 ticks; 0 is rate.lua's own max for `bs`, 12 at level 3, as before.
+-- Measured live at -62,-26 (Hold 60 UPS, the belt-rate round): 6 ticks at every level gave phantoms 1.7-1.8%
+-- in 4 of 5 runs (one 2.4) against 1.9-2.6% in 6 runs at 12 ticks (the owner's gate is 2%), visible 96.1-96.4%
+-- either way (the visible gap there isn't the period), for 1-2.5 ms a tick of bridge (bs.watch 2.0-2.3 -> 3.0-3.2)
+-- and about 1 UPS (46.3-48.5 against 47.9-48.6 while scored); the alerts' pass (rate.lua `al`) and the client's
+-- ladder (its `updates` steps skipped) pay part of it. 0 is the knob for a server that needs the 1-2 ms more.
 -- drift_watched: watched belts' lanes (an inserter's or drill's belt, the belt behind a pickup belt, a
 -- splitter, a loader, a wired belt) get drift checks (`pc`) in the same turns as the rest; off, as
 -- before, they have none: a watched lane is sent only when the game's changes, so one the client got
@@ -206,13 +217,94 @@ M.counts = { checked = 0, changed = 0, quiet = 0, flow = 0, scan_moved = 0, scan
 -- extra_units / (period - 1) a tick at most, the rest of the queue waiting a tick (never on the due
 -- tick). Off: they land wherever their step comes, which for the asked lanes' runs was all on the
 -- round's first tick (bs.bre 6-11 ms there at -62,-26, the update's worst tick after the due one).
+-- The 0.2.1 hotfix's housekeeping (bridge.md change 3; each off: as before): quiet_first: a watched belt
+-- whose lanes are all quiet is passed over before its `valid` is read (do_step); watch_nosort: the
+-- watched belts' order made without a Lua comparator (number sorts of scan indices, watch_order) and made
+-- again only when the watched set, a spot or the scan changed, not whenever any belt loaded; the actors'
+-- list walked to its length at the round's start instead of copied (make_queue); scan_step: a new scan
+-- when the focus moved max(1, r / 32) tiles (11 at 352) instead of every tile (each scan walks the whole
+-- square three times: 7.5 ms an update on laps); far_load_cap: first loads of belts past walk_near get
+-- LOAD_MIN units a tick unless the work budget is idle, instead of half of it (0.98 ms a tick on laps,
+-- nearly all for belts coming in at the far edge), once the client's square has been loaded whole
+-- (b.whole): capped from the join on, a cached join's belts finished loading at 23-27 s instead of 9.6
+-- with no better UPS meanwhile (art-src/perf-plans/after.md 2). two_call (on since that measurement: 0.35
+-- ms a tick less, as many items drawn): a watched lane's check reads its count and front first, the full
+-- check only when either changed (two_call_line). A save that set it keeps its own value (storage.f3d_bs
+-- holds only what /f3d-bs set). far_tier (bridge.md change 8; off: it changes when far belts are read): the watched
+-- belts and the inserters and drills using belts at far_ring tiles or more from the focus are checked in turn,
+-- far_units belt units an update, a cursor carrying on where the last update stopped (far_split), instead of
+-- every one every update; within far_ring as before. The whole square stays loaded and simulated; a far input
+-- spot is read every few updates, an actor just before its belt, so one that acted wakes its belt in the same
+-- pass.
+-- target_spots (on; off: as before): an inserter's or drill's belt is its pickup or drop target when the game
+-- has that set and alive, else the belt on the tile of its pickup or drop spot (spot_belt). In 2.1 a drill has
+-- no drop_target until it first puts something out (and a replaced target is a dead entity until then), and a
+-- chunk's targets are read once and kept (bs.bt), so a drill placed before its belt, or a belt laid or replaced
+-- under a drill, was never an input spot: its belt wasn't watched and its items reached the client only when
+-- a drift check happened on one and the client asked again (a fresh world: a fifth of a drill's line drawn near
+-- the drill, none of it under 650 ms hitches). An actor still without a target at an end is looked at again
+-- every RETRY_TICKS (retry_targets), so one whose belt comes without an event is found too.
+-- drill_tails (on; off: as before): a drill seen to have put out (its progress gone round) has its drop belt read
+-- and the belts that one feeds, as far as an item can have gone since the drill's check before (the tails a changed
+-- watched belt gets). A drill's item sits on its drop lane only until it runs off it (21 ticks on a yellow belt from
+-- a burner or electric drill's spot) and the progress goes round a tick after the drop, so a check of the drop lane
+-- alone found it empty whenever the drill's check came that late after the drop; the drill's period being a whole
+-- number of updates, that was every drop of the run, and the client never heard of them but by drift checks.
+-- built_now (on; off: as before, K16, K22): a belt built, rotated, replaced or removed is worked out on the next tick
+-- (built_now()), not at the next round's scan of the whole square: one built inside the square is loaded there and
+-- then (lm, sl, read on that tick), the loaded belts round it read again with it (its feeders and what it feeds,
+-- an underground's other end, those forget_touched lists), a removed one's lanes leave (dl), and a loaded belt
+-- under a new one whose entity is gone (a fast-replace raises nothing for it) is dropped. Before, a belt built
+-- waited for the round's start, then for any scan in progress and a scan of its own, each reading at most
+-- SCAN_FINDS chunks a tick whose lists had expired (empty ones too): at a belt item distance of 320 a new belt
+-- reached the client 9-200 ticks after it was built, at 640 up to 550, and meanwhile the line it extended stood
+-- in Zenith while it ran on in the game. A belt loaded so is kept by the scans that began before it was (it isn't
+-- in them); the scan asked for finds it.
+-- lane_next (on; off: as before, E31): each lane's `lm` next says whether that lane leads out of what is sent, from
+-- the belt its own items leave into (a splitter's output lanes each by their half, found by where they end), and is
+-- sent again (lm with sl, on that tick) whenever that changes: when the belt it feeds loads (its next no longer
+-- negative) or leaves (negative, in the same tick as that belt's dl), and once a lane's next is found otherwise than
+-- the client was told (a look at every drift check, each lane leading out and each watched belt checked: counts
+-- next_fix). A lane read twice in one tick sends its meta with the second read too (a reload after a catch-up's read
+-- lost its lm: a belt turned or its next changed kept its old meta in Zenith), and reloads a round didn't get to
+-- wait for the next round instead of being dropped. Off: a belt leading out had every exit lane -1 (oset); a belt
+-- loading read its feeders' lanes without their meta, so the -1 stayed (the chain's first loads leave every fourth
+-- ring of a line going outwards loaded before its next, and the square's edge does the same at every step walked),
+-- and one leaving had its feeders' -1 sent only at the next round's reload (the lanes said 0 meanwhile).
+-- ins_driven (off until measured live; off: as before, the owner's idea): a belt watched for its inserters alone (an
+-- inserter's pickup or drop belt, the belt behind a pickup belt; rec[16]: not a drill's drop belt, no splitter, loader,
+-- loader's neighbour or circuit) gets no look an update. Its lanes are checked when one of its inserters' checks (the
+-- actors', every update) finds the hand's count up (a take: the pickup belt and the belt behind it) or down (a put:
+-- the drop belt) and read in full, but for a lane holding items that stands as its last read left it, the belts they
+-- feed too as far as an item can have gone since the hand's check before (the tails a changed watched belt gets: an item
+-- taken as it left the belt is on the next one in the client's simulation; event_belt), then watched as before for
+-- ins_window updates (20; 0: not) or until its lanes settle (the reads while a hole closes up or a put runs on, and the
+-- settled read: Zenith's lattice takes a packed lane's motion and phase from the bridge's reads; bs.iwin: unit -> the
+-- last update of its window). Offline at 6 updates the busy line-end scene's phantoms were 0.24% (0.16% at 20,
+-- 0.07% with the switch off) for about 5% less work. An inserter at such a belt is checked every update (no
+-- actor_backoff: a take and a put between two backed-off checks would leave the count as it was). Those belts get
+-- drift checks (`pc`) as unwatched ones do: the safety net for what a hand's count doesn't show. Offline, four
+-- line-end scenes (tools/belt_line_end.py, every belt in them an inserter's): belt work 39-54% less, lane reads 50-74%
+-- fewer; the client's simulation by id 99.86-100% (99.99-100% off); drawn, the game's items seen as often (98.8-99.6%),
+-- phantoms 0.06-0.14% -> 0.15-0.21%.
+-- The actors' checks are the bridge's own reads (in storage, the same on every peer), not inserters.lua's `ie`
+-- events, which are module-local by design. Needs inputs_first (the actors' checks); off under checkpoints (which
+-- checks pickup lanes every update). ins_ho (on; only under ins_driven): a put by an inserter inside inserters.lua's
+-- square (the detail radius round the focus, no remote view) for a client taking `ie` and `ho` isn't read: the client
+-- got the item itself (PLACED, its lane, place and id).
 M.OPTIONS = { feed_edges = true, full_area = true, inputs_first = true, line_rereads = true, bound = 0.6,
   actor_backoff = true, drift_far = true, bre_cap = 192, quiet_backoff = true, pc_ids = false, hold_inputs = true,
   area = "square", trace_near = 48, trace_hops = 200, trace_down = 8, checkpoints = false, crossings = "sim",
-  own_rate = true, drift_watched = false, walk_load = 1200, walk_near = 96, send_cap = 30000, extra_spread = true }
+  own_rate = true, period_max = 6, drift_watched = false, walk_load = 1200, walk_near = 96, send_cap = 30000,
+  extra_spread = true, quiet_first = true, watch_nosort = true, scan_step = true, far_load_cap = true, two_call = true,
+  far_tier = false, far_ring = 96, far_units = 4000, target_spots = true, drill_tails = true, built_now = true,
+  lane_next = true,
+  ins_driven = false, ins_ho = true, ins_window = 20 }
 M.OPTION_ORDER = { "feed_edges", "full_area", "inputs_first", "line_rereads", "bound", "actor_backoff", "drift_far",
   "bre_cap", "quiet_backoff", "pc_ids", "hold_inputs", "area", "trace_near", "trace_hops", "trace_down",
-  "checkpoints", "crossings", "own_rate", "drift_watched", "walk_load", "walk_near", "send_cap", "extra_spread" }
+  "checkpoints", "crossings", "own_rate", "period_max", "drift_watched", "walk_load", "walk_near", "send_cap",
+  "extra_spread", "quiet_first", "watch_nosort", "scan_step", "far_load_cap", "two_call", "far_tier", "far_ring",
+  "far_units", "target_spots", "drill_tails", "built_now", "lane_next", "ins_driven", "ins_ho", "ins_window" }
 -- The values a word switch takes.
 M.OPTION_VALUES = { area = { square = true, trace = true }, crossings = { sim = true, game = true } }
 local O = {}
@@ -225,6 +317,11 @@ local function read_options()
     end
     O[k] = v
   end
+end
+
+-- (ins_driven) Whether inserters' belts are read on their hands' takes and puts: it needs the actors' checks.
+local function ins_driven()
+  return O.ins_driven and O.inputs_first and not O.checkpoints
 end
 
 -- Numbers a part holds under the send_cap in force (O is read at each tick's start).
@@ -309,17 +406,25 @@ local function chunk_key(x, y)
   return (floor(x / 32) + 32768) * 65536 + (floor(y / 32) + 32768)
 end
 
+-- The tile a place is on, as one number (bs.at).
+local function tile_key(x, y)
+  return (floor(x) + 2097152) * 4194304 + (floor(y) + 2097152)
+end
+
 local function state()
   local s = storage.f3d
   local b = s.bs
   -- (A save from before lanes leading out were kept, or before input spots woke their belts:
   -- everything is sent again.)
-  if b and not (b.oset and b.iset and b.actors and b.alist and b.aseen and b.wake and b.bre) then
+  -- (lane_next: or before each belt kept where its lanes' items go, bs.nref.)
+  if b and not (b.oset and b.iset and b.actors and b.alist and b.aseen and b.wake and b.bre and b.nref) then
     b = nil
   end
   if not b then
+    -- (nref: loaded belts whose lanes' next may have changed (a belt they feed left), their lanes looked at again
+    -- before the tick ends: next_refresh.)
     b = { belts = {}, lanes = {}, count = 0, work = 0, wset = {}, cset = {}, oset = {}, iset = {}, bre = {}, reload = {},
-      actors = {}, alist = {}, aseen = {}, wake = {} }
+      actors = {}, alist = {}, aseen = {}, wake = {}, nref = {} }
     s.bs = b
   end
   return b
@@ -390,9 +495,72 @@ local function actor_value(a)
   return nil
 end
 
+-- (target_spots) The belt on the tile of an inserter's pickup spot (drop false) or an inserter's or drill's
+-- drop spot, or nil.
+local function spot_belt(surface, e, drop)
+  local ok, q = pcall(function() return drop and e.drop_position or e.pickup_position end)
+  if not (ok and q) then
+    return nil
+  end
+  local x, y = floor(q.x or q[1]), floor(q.y or q[2])
+  for _, belt in pairs(surface.find_entities_filtered({ area = { { x + 0.3, y + 0.3 }, { x + 0.7, y + 0.7 } },
+      type = registry.belt_types() })) do
+    if belt.valid and belt.unit_number and BELTISH[belt.type] then
+      return belt
+    end
+  end
+  return nil
+end
+
+-- An actor's pickup (drop false) or drop target: the game's when it is set and alive, else (target_spots) the
+-- belt on its spot. Second: whether it has none (no target, no belt on the spot: looked at again later); third:
+-- whether its spot was looked at (a search: its units).
+local function target_of(surface, e, drop)
+  local t
+  if drop then
+    t = e.drop_target
+  else
+    t = e.pickup_target
+  end
+  if t and t.valid then
+    return t, false, false
+  end
+  if not O.target_spots then
+    return t, false, false
+  end
+  local belt = spot_belt(surface, e, drop)
+  M.counts.spot_looks = (M.counts.spot_looks or 0) + 1
+  if belt then
+    M.counts.spot_targets = (M.counts.spot_targets or 0) + 1
+  end
+  return belt, belt == nil, true
+end
+
+-- Actors without a target looked at again (retry_targets): every RETRY_TICKS, at most RETRY_MAX a round (the rest
+-- the round after). bs.retry: unit -> {entity, chunk key, tick it is due, pickup end open, drop end open};
+-- bs.retry_q: due tick -> units (an entry is due on the tick it says: one moved since is passed over there), so a
+-- round looks only at the ticks since the last (at -62,-26 the list held 96-250).
+local RETRY_TICKS = 300
+local RETRY_MAX = 64
+
+local function retry_at(b, u, ent, due)
+  ent[3] = due
+  b.retry = b.retry or {}
+  b.retry[u] = ent
+  b.retry_q = b.retry_q or {}
+  local list = b.retry_q[due]
+  if not list then
+    list = {}
+    b.retry_q[due] = list
+  end
+  list[#list + 1] = u
+end
+
 -- The chunk's belts that inserters and drills take from (2) or put on (1): read once, kept. Those
 -- inserters and drills (actors) go in bs.actors: {entity, pickup belt's unit number or false, drop
--- belt's or false, a drill, value at its last check}, listed in bs.alist.
+-- belt's or false, a drill, value at its last check}, listed in bs.alist. (target_spots: those without a
+-- target at an end, belt or other, in bs.retry by unit: {entity, chunk key, tick to look again, pickup end
+-- open, drop end open}.)
 local function targets_of(b, surface, x, y)
   b.bt = b.bt or {}
   local key = chunk_key(x, y)
@@ -400,7 +568,8 @@ local function targets_of(b, surface, x, y)
   if t then
     return t, 0
   end
-  t = {}
+  -- (t.d: the belts here a drill drops on; t.dv: the list says so, a chunk read before it doesn't. ins_driven.)
+  t = { dv = true }
   local x0, y0 = floor(x / 32) * 32, floor(y / 32) * 32
   local found = surface.find_entities_filtered({ area = { { x0 - REACH, y0 - REACH }, { x0 + 32 + REACH, y0 + 32 + REACH } },
     type = { "inserter", "mining-drill" } })
@@ -416,14 +585,37 @@ local function targets_of(b, surface, x, y)
     return false, false
   end
   local units = FIND_UNITS + #found * TARGET_UNITS
+  local spots = O.target_spots
   for _, e in pairs(found) do
     local drill = e.type ~= "inserter"
     local pick, here1 = false, false
+    local open_p, looked_p = false, false
     if not drill then
-      pick, here1 = mark(e.pickup_target, 2)
+      local pt
+      pt, open_p, looked_p = target_of(surface, e, false)
+      pick, here1 = mark(pt, 2)
     end
-    local drop, here2 = mark(e.drop_target, 1)
+    local dt, open_d, looked_d = target_of(surface, e, true)
+    local drop, here2 = mark(dt, 1)
+    if drill and here2 then
+      t.d = t.d or {}
+      t.d[drop] = true
+    end
+    -- (Units only for the spots looked at: an actor whose targets are set costs what it did.)
+    if looked_p then
+      units = units + TARGET_UNITS
+    end
+    if looked_d then
+      units = units + TARGET_UNITS
+    end
     local u = e.unit_number
+    if spots and u then
+      if open_p or open_d then
+        retry_at(b, u, { e, key, 0, open_p, open_d }, game.tick + RETRY_TICKS)
+      elseif b.retry then
+        b.retry[u] = nil
+      end
+    end
     if u and (here1 or here2) then
       local a = { e, pick, drop, drill }
       a[5] = actor_value(a)
@@ -437,6 +629,90 @@ local function targets_of(b, surface, x, y)
   end
   b.bt[key] = t
   return t, units
+end
+
+-- (target_spots) The actors bs.retry holds whose look is due: one that has a belt at an end now (laid without
+-- an event, or the game set its target since) is taken as touched, so its chunk's targets are read again and
+-- the belts round it loaded again next round (forget_touched; a scan too when that belt isn't loaded). One whose
+-- ends have targets now, or that is gone, leaves the list (take_scan drops those round chunks the square left).
+-- Due ticks in order, units in order in each, so every peer looks at the same ones. Returns the units.
+local function retry_targets(b)
+  local r, q = b.retry, b.retry_q
+  if not (r and q and O.target_spots) then
+    return 0
+  end
+  local now = game.tick
+  local from = b.retry_from or now
+  b.retry_from = now + 1
+  local ticks = {}
+  if now - from > RETRY_TICKS then
+    -- (Rounds missed: every due tick, by the queue's keys.)
+    for t in pairs(q) do
+      if t <= now then
+        ticks[#ticks + 1] = t
+      end
+    end
+    table.sort(ticks)
+  else
+    for t = from, now do
+      if q[t] then
+        ticks[#ticks + 1] = t
+      end
+    end
+  end
+  if #ticks == 0 then
+    return 0
+  end
+  local surface = world.surface()
+  local units, n = 0, 0
+  for _, t in ipairs(ticks) do
+    local list = q[t]
+    q[t] = nil
+    table.sort(list)
+    for _, u in ipairs(list) do
+      local ent = r[u]
+      if ent and ent[3] == t then
+        if n >= RETRY_MAX then
+          -- (Past the round's most: the next round.)
+          retry_at(b, u, ent, now + 1)
+        else
+          n = n + 1
+          units = units + TARGET_UNITS
+          local e = ent[1]
+          if not e.valid then
+            r[u] = nil
+          else
+            -- (Only the ends that had no target: one whose other end is a belt already isn't touched again.)
+            local open, belt = false, nil
+            for x, drop in ipairs({ false, true }) do
+              if ent[3 + x] then
+                local tg, none = target_of(surface, e, drop)
+                units = units + TARGET_UNITS
+                ent[3 + x] = none
+                open = open or none
+                if tg and BELTISH[tg.type] then
+                  belt = belt or tg
+                end
+              end
+            end
+            if belt then
+              -- (A belt not loaded yet came without an event: a scan to find it, as for one built.)
+              M.counts.retry_found = (M.counts.retry_found or 0) + 1
+              local p = e.position
+              b.dirty = b.dirty or {}
+              b.dirty[#b.dirty + 1] = { e.surface.index, p.x, p.y, u, not (belt.unit_number and b.belts[belt.unit_number]) }
+              r[u] = nil
+            elseif open then
+              retry_at(b, u, ent, now + RETRY_TICKS)
+            else
+              r[u] = nil
+            end
+          end
+        end
+      end
+    end
+  end
+  return units
 end
 
 -- tracker.listeners: something was built, changed or removed. Belts, inserters, drills and loaders
@@ -454,6 +730,21 @@ local function touched(entity)
   local p = entity.position
   b.dirty = b.dirty or {}
   b.dirty[#b.dirty + 1] = { entity.surface.index, p.x, p.y, entity.unit_number or 0, BELTISH[t] or false }
+  -- (built_now) The belt itself, for the next tick: {entity, unit number, x, y, an underground's other end as it
+  -- is now (a removed one's partner is unpaired by then; a new exit's entrance has new hidden lines)}. Kept
+  -- whatever the switch says (it is read at a tick's start, module-local): the round drops the list when it is off.
+  local u = entity.unit_number
+  if BELTISH[t] and u then
+    local partner
+    if t == "underground-belt" then
+      local ok, o = pcall(function() return entity.underground_belt_neighbour end)
+      if ok and o and o.valid and o.unit_number then
+        partner = o
+      end
+    end
+    b.fresh = b.fresh or {}
+    b.fresh[#b.fresh + 1] = { entity, u, p.x, p.y, partner }
+  end
 end
 tracker.listeners[#tracker.listeners + 1] = touched
 
@@ -583,8 +874,72 @@ local function exit_line(belt, i)
   return true
 end
 
--- The lane's meta, 12 integers into `out`. `edge`: the belt leads out of what is sent (bs.oset): its
--- exit lines' next is -1.
+-- Where lane i's items leave a splitter: the unit number of the output (among `list`) standing on the tile just past
+-- the line's exit end (its own half's), 0 for none (that half has no belt: they stop at its end).
+local function out_ahead(line, list)
+  local p0 = line.get_line_item_position(0)
+  local pm = line.get_line_item_position(line.line_length / 2)
+  local dx, dy = p0.x - pm.x, p0.y - pm.y
+  local d = math.sqrt(dx * dx + dy * dy)
+  if d <= 0 then
+    return 0
+  end
+  local qx, qy = floor(p0.x + dx / d * 0.25), floor(p0.y + dy / d * 0.25)
+  for _, e in ipairs(list) do
+    local box = e.bounding_box
+    if qx >= floor(box.left_top.x) and qx < ceil(box.right_bottom.x) and qy >= floor(box.left_top.y) and qy < ceil(box.right_bottom.y) then
+      return e.unit_number
+    end
+  end
+  return 0
+end
+
+-- (lane_next) Where each line items leave a belt by (exit_line) leads: line index -> the unit number of the belt its
+-- items go on into, 0 for none (the line ends there). An underground entrance's hidden lines into its exit
+-- (`partner`), a splitter's outputs each into its half's belt (out_ahead), any other belt's into its one output
+-- (belt_neighbours' `outputs`). Worked out with the belt's record (load_belt), so a belt changed is read again.
+local function lane_outs(belt, t, outputs, partner, lines)
+  local per = {}
+  local n = #lines
+  if t == "underground-belt" and belt.belt_to_ground_type == "input" then
+    for i = 3, n do
+      per[i] = partner or 0
+    end
+    return per
+  end
+  local list = {}
+  for _, e in pairs(outputs or {}) do
+    if e.valid and e.unit_number then
+      list[#list + 1] = e
+    end
+  end
+  local one = nil
+  if #list == 0 then
+    one = 0
+  elseif #list == 1 and t ~= "splitter" then
+    one = list[1].unit_number
+  end
+  for i = 1, n do
+    if exit_line(belt, i) then
+      per[i] = one or out_ahead(lines[i], list)
+    end
+  end
+  return per
+end
+
+-- Whether lane i of a loaded belt (its record `rec`) leads out of what is sent: the belt its own items go on into
+-- isn't loaded (lane_next); off, as before: the belt feeds one that isn't (bs.oset) and items leave it by the line.
+local function lane_out(b, rec, unit, i, belt)
+  local per = O.lane_next and rec and rec[15]
+  if per then
+    local u = per[i]
+    return u ~= nil and u ~= 0 and b.belts[u] == nil
+  end
+  return (b.oset[unit] and exit_line(belt, i)) and true or false
+end
+
+-- The lane's meta, 12 integers into `out`. `edge`: the lane leads out of what is sent (lane_out): its next is
+-- negative.
 -- A lane's meta but its last number, as text, by lane key: the line's geometry doesn't change while
 -- the belt stands (rotated or replaced, the belt is loaded again: load_belt forgets its lanes' metas).
 -- m[12]: the lane it goes on into (next_of), a number; m[13]: whether items leave the belt by it.
@@ -662,6 +1017,34 @@ local function check_line(line)
   return n, fixed(p1), fixed(pn), line.get_item_count()
 end
 
+-- two_call (bridge.md change 12, on by default): a watched lane's check first reads its item count and its
+-- front item's place; when both are as its record has them it counts as unchanged, its stacks and back item
+-- taken from the record (two calls instead of four). The four-call check when either differs, and every
+-- TWO_CALL_FULL'th check anyway (rec[15] counts them). What it adds to the cheap check's blind spots: the stack
+-- count or the back item changing with the count and the front both the same.
+local TWO_CALL_FULL = 4
+local function two_call_line(line, rec)
+  local c = (rec[15] or 0) + 1
+  rec[15] = c
+  if c % TWO_CALL_FULL == 0 or not rec[1] then
+    return check_line(line)
+  end
+  local total = line.get_item_count()
+  if total == 0 then
+    return 0, -1, -1, 0
+  end
+  local p1 = fixed(line.get_item_position(1))
+  if total == rec[4] and p1 == rec[2] and rec[1] > 0 then
+    M.counts.two_call = (M.counts.two_call or 0) + 1
+    return rec[1], p1, rec[3], total
+  end
+  local n = #line
+  local pn = n > 1 and fixed(line.get_item_position(n)) or p1
+  return n, p1, pn, total
+end
+
+M.two_call_line = two_call_line  -- (tests)
+
 -- The item id of a lane's items when they are all one kind of item of normal quality (its totals:
 -- one call), else nil. (Not where a line has no totals: tests' fake worlds.)
 local has_totals = nil
@@ -696,7 +1079,8 @@ local function payload(b)
 end
 
 local function new_payload(id)
-  return { id = id, lm = {}, sl = {}, qu = {}, pc = {}, dl = {}, of = {}, ew = {}, sh = {}, sent = {} }
+  -- (sent: lane key -> the tick its sl went; msent, lane_next: the tick its lm went.)
+  return { id = id, lm = {}, sl = {}, qu = {}, pc = {}, dl = {}, of = {}, ew = {}, sh = {}, sent = {}, msent = {} }
 end
 
 -- Reads lane i of a belt in full (and its meta with `meta`): its record in storage, what is sent
@@ -732,13 +1116,24 @@ local function read_lane(b, belt, unit, i, lines, meta, p, n, p1, pn, total)
     units = units + META_UNITS
     M.counts.meta = M.counts.meta + 1
   end
+  -- rec[16]: whether the client was told the lane leads out (its last lm's next negative; nil before one went). Set
+  -- with every read with meta, payload or not (storage the same on every peer; one without the payload sends less).
+  -- (lane_next: a lane read again in the tick sends its meta too when none went this tick or its next changed: a
+  -- catch-up's or a feeder's read before a reload held the reload's lm back, the belt turned or its next changed
+  -- kept its old meta in Zenith. Off: the meta only with the tick's first read, as before.)
+  if meta then
+    local edge = lane_out(b, br, unit, i, belt)
+    local changed = rec[16] ~= edge
+    rec[16] = edge
+    if p and (p.sent[key] ~= now or (O.lane_next and (p.msent[key] ~= now or changed))) then
+      p.msent[key] = now
+      write_meta(p.lm, belt, unit, i, line, lines.v, edge)
+    end
+  end
   -- (A lane is sent once a tick: read again on a later tick of the same update, it goes again, the
   -- client applying each at its own tick.)
   if p and p.sent[key] ~= now then
     p.sent[key] = now
-    if meta then
-      write_meta(p.lm, belt, unit, i, line, lines.v, b.oset[unit])
-    end
     local sl = p.sl
     local m = #sl
     local at = m + 3
@@ -788,7 +1183,8 @@ local function read_lane(b, belt, unit, i, lines, meta, p, n, p1, pn, total)
 end
 
 -- Works out a belt's record: whether it is watched (see the header), whether it has a circuit
--- connection. Returns the record and the units it cost.
+-- connection. Returns the record, the units it cost, and for lane_outs the belts it outputs into
+-- (belt_neighbours' `outputs`) and an underground entrance's exit's unit number.
 local function belt_record(b, belt, unit, x, y)
   local surface = world.surface()
   local t = belt.type
@@ -796,6 +1192,8 @@ local function belt_record(b, belt, unit, x, y)
   rec[14] = t
   local units = WATCH_UNITS
   local watched = not (t == "transport-belt" or t == "underground-belt")
+  -- (rec[16], ins_driven: watched for inserters alone. other: watched for anything else.)
+  local ins, other = false, watched
   local here, u1 = targets_of(b, surface, x, y)
   units = units + u1
   -- rec[11]: inserters or drills use it (1 drop, 2 pickup, 3 the belt behind a pickup belt).
@@ -803,16 +1201,24 @@ local function belt_record(b, belt, unit, x, y)
     watched = true
     rec[11] = here[unit]
     rec[12] = true
+    -- (A drill's drop belt, or one in a chunk read before drills were told apart: watched, drills send nothing.)
+    if here.dv and not (here.d and here.d[unit]) then
+      ins = true
+    else
+      other = true
+    end
   end
   -- rec[7], rec[8]: the unit numbers of the belts it feeds and that feed it (an underground's other
   -- end too).
   local outs, ins = {}, {}
   rec[7], rec[8] = outs, ins
+  local partner = nil
   if t == "underground-belt" then
     local uok, other = pcall(function() return belt.underground_belt_neighbour end)
     if uok and other and other.valid and other.unit_number then
       local list = belt.belt_to_ground_type == "input" and outs or ins
       list[#list + 1] = other.unit_number
+      partner = other.unit_number
     end
   end
   local ok, nb = pcall(function() return belt.belt_neighbours end)
@@ -824,6 +1230,7 @@ local function belt_record(b, belt, unit, x, y)
         end
         if LOADERS[e.type] then
           watched = true
+          other = true
           rec[12] = true
         end
       end
@@ -835,6 +1242,7 @@ local function belt_record(b, belt, unit, x, y)
         end
         if LOADERS[e.type] then
           watched = true
+          other = true
           rec[12] = true
         elseif e.unit_number then
           local q = e.position
@@ -842,6 +1250,7 @@ local function belt_record(b, belt, unit, x, y)
           units = units + u2
           if there[e.unit_number] == 2 then
             watched = true  -- the belt behind a pickup belt: hands chase items there
+            ins = true
             rec[11] = rec[11] or 3
             rec[12] = true
           end
@@ -852,6 +1261,7 @@ local function belt_record(b, belt, unit, x, y)
   local cok, behavior = pcall(function() return belt.get_control_behavior() end)
   if cok and behavior then
     watched = true
+    other = true
     rec[5] = true
     rec[12] = true
   end
@@ -859,7 +1269,8 @@ local function belt_record(b, belt, unit, x, y)
     rec[12] = true
   end
   rec[4] = watched
-  return rec, units
+  rec[16] = ins and not other or nil
+  return rec, units, ok and nb and nb.outputs or nil, partner
 end
 
 local OFF = nil
@@ -881,8 +1292,18 @@ local function is_off(belt)
   return ok and st == off
 end
 
--- Whether a belt feeds one that isn't loaded (its items leave what is sent: `lm` next -1).
+-- Whether a belt feeds one that isn't loaded (its items leave what is sent: `lm` next -1). (lane_next: whether
+-- any of its lanes does, lane_outs'.)
 local function leads_out(b, rec)
+  local per = O.lane_next and rec[15]
+  if per then
+    for _, u in pairs(per) do
+      if u ~= 0 and not b.belts[u] then
+        return true
+      end
+    end
+    return false
+  end
   for _, u in ipairs(rec[7]) do
     if not b.belts[u] then
       return true
@@ -910,6 +1331,61 @@ local function read_exits(b, belt, unit, p)
     if exit_line(belt, i) and b.lanes[unit * LANE_KEYS + i] then
       units = units + read_lane(b, belt, unit, i, lines, false, p)
     end
+  end
+  return units
+end
+
+-- (lane_next) A loaded belt's lanes whose next leads out otherwise than the client was told (rec[16]; nil: no lm
+-- went yet): read again now, with their meta (lm and sl: a lane that leads out now needs its wall, the front the
+-- client holds its line at). Payload or not, as storage goes (a peer without one sends nothing of it). `count`: the
+-- M.counts field the reads go in (next_sent where a belt came or went, next_fix where a look found it otherwise).
+-- Returns the units.
+local function next_check(b, unit, p, count)
+  local rec = b.belts[unit]
+  local per = rec and rec[15]
+  if not (O.lane_next and per and rec[1].valid) then
+    return 0
+  end
+  local belt = rec[1]
+  local units = 0
+  local lines = nil
+  -- (A belt a drop listed this tick is a change known: a look coming to it first sends it as next_refresh would.)
+  if b.nref[unit] then
+    b.nref[unit] = nil
+    count = "next_sent"
+  end
+  -- (Only the lines items leave it by (lane_outs lists them): no other lane's next leads out.)
+  for i = 1, LANE_KEYS do
+    local u = per[i]
+    if u ~= nil then
+      local lr = b.lanes[unit * LANE_KEYS + i]
+      if lr and lr[16] ~= (u ~= 0 and b.belts[u] == nil) then
+        lines = lines or lines_of(belt, unit)
+        if lines[i] then
+          units = units + read_lane(b, belt, unit, i, lines, true, p)
+          M.counts[count] = (M.counts[count] or 0) + 1
+        end
+      end
+    end
+  end
+  return units
+end
+
+-- (lane_next) The belts whose lanes' next may have changed this tick (a belt they feed left: drop_belt), looked at
+-- before the tick ends, in the update that says it left. Returns the units.
+local function next_refresh(b, p)
+  if not next(b.nref) then
+    return 0
+  end
+  local list = {}
+  for u in pairs(b.nref) do
+    list[#list + 1] = u
+  end
+  table.sort(list)
+  b.nref = {}
+  local units = 0
+  for _, u in ipairs(list) do
+    units = units + next_check(b, u, p, "next_sent")
   end
   return units
 end
@@ -950,18 +1426,41 @@ end
 -- Loads a belt (all its lanes, meta and items) or loads it again. Returns the units.
 local function load_belt(b, belt, unit, x, y, p)
   local old = b.belts[unit]
-  local rec, units = belt_record(b, belt, unit, x, y)
+  local rec, units, outputs, partner = belt_record(b, belt, unit, x, y)
   if old then
     rec[6] = old[6]
   end
   b.belts[unit] = rec
   b.wver = (b.wver or 0) + 1
+  local was_w, was_i = b.wset[unit], b.iset[unit]
   b.wset[unit] = rec[4] or nil
   b.cset[unit] = rec[5] or nil
-  b.oset[unit] = leads_out(b, rec) or nil
   b.iset[unit] = leads_in(b, rec) or nil
+  -- (watch_nosort: the watched list is made again only when what it holds or its order's keys changed.)
+  if was_w ~= b.wset[unit] or (rec[4] and (old and old[12] or false) ~= (rec[12] or false))
+      or (not O.feed_edges and was_i ~= b.iset[unit])
+      or (O.ins_driven and rec[4] and (old and old[16] or false) ~= (rec[16] or false)) then
+    b.wlver = (b.wlver or 0) + 1
+  end
+  -- (built_now: the tile it stands on, b.at, so a belt built over it finds it once its entity is gone.)
+  b.at = b.at or {}
+  b.at[tile_key(x, y)] = unit
+  -- (Loaded again after an event: the belt may have turned; its lines' geometry is read again. built_now: their
+  -- lengths too, kept with the line objects and the lane records: a belt turned into a curve, or a curve
+  -- straightened by a belt built behind it, kept its old lengths for the catch-up's reach and packed checks.)
+  if old and O.built_now then
+    line_cache[unit] = nil
+    for i = 1, LANE_KEYS do
+      local lr = b.lanes[unit * LANE_KEYS + i]
+      if lr then
+        lr[9] = nil
+      end
+    end
+  end
   local lines = lines_of(belt, unit)
-  -- (Loaded again after an event: the belt may have turned; its lines' geometry is read again.)
+  -- rec[15]: where each of its exit lanes goes on into (lane_outs), for each lane's next (lane_out).
+  rec[15] = lane_outs(belt, rec[14], outputs, partner, lines)
+  b.oset[unit] = leads_out(b, rec) or nil
   if old then
     for i = 1, LANE_KEYS do
       meta_cache[unit * LANE_KEYS + i] = nil
@@ -981,6 +1480,9 @@ local function load_belt(b, belt, unit, x, y, p)
       local r = b.belts[u]
       if r and b.iset[u] and not leads_in(b, r) then
         b.iset[u] = nil
+        if not O.feed_edges then
+          b.wlver = (b.wlver or 0) + 1
+        end
       end
       if r then
         local since = now
@@ -999,7 +1501,17 @@ local function load_belt(b, belt, unit, x, y, p)
     end
     for _, u in ipairs(rec[8]) do
       local r = b.belts[u]
-      if r and b.oset[u] then
+      if r and O.lane_next then
+        -- (lane_next: their lanes into it, read again with their meta, the next now 0 or the key it goes on
+        -- into; the rest of a belt still leading out elsewhere keep theirs. Off: every exit lane read again, the
+        -- meta not sent, so the client kept its -1.)
+        local r0 = M.counts.read
+        units = units + next_check(b, u, p, "next_sent")
+        M.counts.r_exits = (M.counts.r_exits or 0) + M.counts.read - r0
+        if b.oset[u] and not leads_out(b, r) then
+          b.oset[u] = nil
+        end
+      elseif r and b.oset[u] then
         if r[1].valid then
           local r0 = M.counts.read
           units = units + read_exits(b, r[1], u, p)
@@ -1029,20 +1541,49 @@ local function drop_belt(b, unit, p)
   if not rec then
     return
   end
+  if b.wset[unit] or (not O.feed_edges and b.iset[unit]) then
+    b.wlver = (b.wlver or 0) + 1
+  end
   b.belts[unit], b.wset[unit], b.cset[unit], b.oset[unit], b.iset[unit] = nil, nil, nil, nil, nil
   if b.wake then
     b.wake[unit] = nil
+  end
+  if b.at then
+    local k = tile_key(rec[2], rec[3])
+    if b.at[k] == unit then
+      b.at[k] = nil
+    end
+  end
+  if b.direct then
+    b.direct[unit] = nil
   end
   b.wver = (b.wver or 0) + 1
   -- The loaded belts it fed are fed from outside what is sent now: watched.
   for _, u in ipairs(rec[7] or {}) do
     if b.belts[u] then
+      if not O.feed_edges and not b.iset[u] then
+        b.wlver = (b.wlver or 0) + 1
+      end
       b.iset[u] = true
     end
   end
   -- The loaded belts feeding it lead out of what is sent now: sent again (their `lm` next -1).
+  -- (lane_next: their lanes into it, read with their meta before the tick ends (next_refresh), in the update whose
+  -- dl says it left; one gone from the game changed what they lead into: their records again (reload). Off: every
+  -- one reloaded with the next round, its lanes saying 0 till then.)
+  local gone = not rec[1].valid
   for _, u in ipairs(rec[8] or {}) do
-    if b.belts[u] and not b.oset[u] then
+    local r = b.belts[u]
+    if r and O.lane_next then
+      if leads_out(b, r) then
+        b.oset[u] = true
+      end
+      if gone then
+        b.reload[#b.reload + 1] = u
+      else
+        b.nref[u] = true
+      end
+    elseif r and not b.oset[u] then
       b.oset[u] = true
       b.reload[#b.reload + 1] = u
     end
@@ -1141,9 +1682,10 @@ local function watch_lane(b, belt, unit, i, lines, p)
   local now = game.tick
   -- (A lane leading out is never quiet nor left out for having only flowed: the client's wall
   -- moves only when it is sent.)
-  local edge = b.oset[unit] and exit_line(belt, i)
-  -- (An inserter's or drill's belt: what they take or put is what the cheap check can miss.)
+  -- (lane_next: the lane itself, lane_out's: a splitter's half feeding a loaded belt isn't one.)
   local brec = b.belts[unit]
+  local edge = lane_out(b, brec, unit, i, belt)
+  -- (An inserter's or drill's belt: what they take or put is what the cheap check can miss.)
   local handled = brec and brec[11]
   -- (A lane fed from outside what is sent: what comes in at its back is news to the client. Never
   -- quiet, never left out for having only flowed, a packed one checked by its ids too.)
@@ -1168,7 +1710,13 @@ local function watch_lane(b, belt, unit, i, lines, p)
     M.counts.quiet = M.counts.quiet + 1
     return 0.5
   end
-  local n, p1, pn, total = check_line(lines[i])
+  local n, p1, pn, total
+  -- (two_call: not for a lane leading out or fed from outside: their walls and what comes in.)
+  if O.two_call and not edge and not fed then
+    n, p1, pn, total = two_call_line(lines[i], rec)
+  else
+    n, p1, pn, total = check_line(lines[i])
+  end
   M.counts.checked = M.counts.checked + 1
   if brec then
     brec[13] = nil
@@ -1373,8 +1921,10 @@ end
 -- own checks left it: their quiet turns go by it.)
 local function drift_check(b, belt, unit, p)
   local lines = lines_of(belt, unit)
-  local units = 0
+  -- (lane_next: each lane's next as the client was told, looked at too: a table look a lane.)
+  local units = next_check(b, unit, p, "next_fix")
   local now = game.tick
+  local unwatched = not b.wset[unit] or (ins_driven() and (b.belts[unit] or {})[16])
   for i = 1, #lines do
     local key = unit * LANE_KEYS + i
     local rec = b.lanes[key]
@@ -1382,7 +1932,7 @@ local function drift_check(b, belt, unit, p)
       local n, p1, pn = check_line(lines[i])
       units = units + CHECK_UNITS
       M.counts.pc = M.counts.pc + 1
-      if not b.wset[unit] then
+      if unwatched then
         rec[6] = now
       end
       -- A packed lane: its front and back items' ids too (`pu`), the only way a lane the client has
@@ -1765,10 +2315,28 @@ local function take_scan(b, sc, p)
   b.edge = edge
   local drop = {}
   local sel = sc.sel
+  -- (built_now: a belt loaded on its event after this scan began isn't in it; the scan asked for then finds it.
+  -- Those loaded before it began were seen by it: forgotten here.)
+  local direct = b.direct
   for unit in pairs(b.belts) do
     local j = inside[unit]
-    if not j or sc.rings[j] >= keep or (sel and not sel[unit]) then
+    if not j and direct and (direct[unit] or -1) >= sc.tick then
+      M.counts.direct_kept = (M.counts.direct_kept or 0) + 1
+    elseif not j or sc.rings[j] >= keep or (sel and not sel[unit]) then
       drop[#drop + 1] = unit
+    end
+  end
+  if direct then
+    local left = false
+    for unit, t in pairs(direct) do
+      if t < sc.tick then
+        direct[unit] = nil
+      else
+        left = true
+      end
+    end
+    if not left then
+      b.direct = nil
     end
   end
   table.sort(drop)
@@ -1813,6 +2381,18 @@ local function take_scan(b, sc, p)
         pruned = true
       end
     end
+    -- (target_spots: the actors to look at again round chunks the square left, likewise.)
+    if b.retry then
+      local drop = {}
+      for u, ent in pairs(b.retry) do
+        if outside(ent[2]) then
+          drop[#drop + 1] = u
+        end
+      end
+      for _, u in ipairs(drop) do
+        b.retry[u] = nil
+      end
+    end
     -- (The actors' list and its seen set made again without them: one found again when the square
     -- comes back is then listed again by enlist; still in aseen it would be in bs.actors but never
     -- checked.)
@@ -1828,6 +2408,7 @@ local function take_scan(b, sc, p)
   end
   b.scan, b.load_i, b.load_total = sc, 1, 0
   b.wver = (b.wver or 0) + 1
+  b.wlver = (b.wlver or 0) + 1
   M.counts.scans = M.counts.scans + 1
   return #drop
 end
@@ -1990,12 +2571,74 @@ local DRIFT_ONE = { { 0, math.huge, 1 } }
 -- update cost more than the checks themselves at 160 tiles.
 local function watch_order(b)
   local c = b.wcache
-  if c and c.ver == (b.wver or 0) and c.fe == O.feed_edges and c.inf == O.inputs_first then
+  local nosort = O.watch_nosort
+  -- (watch_nosort: by wlver, raised only when the watched set, a watched belt's spot or the scan changed;
+  -- wver, raised by every belt loaded or dropped, made it again on every update of a walk.)
+  local ver = nosort and -(b.wlver or 0) - 1 or (b.wver or 0)
+  -- (ins_driven: the belts watched for inserters alone left out; their inserters' checks read them.)
+  local driven = ins_driven()
+  if c and c.ver == ver and c.fe == O.feed_edges and c.inf == O.inputs_first and c.ins == driven then
     return c.list
+  end
+  if nosort then
+    -- Spots first, then the rest, each nearest first: the scan's indices sorted as numbers (no Lua
+    -- comparator: table.sort's own <), then those outside the scan by unit number, as the sort below.
+    local idx = b.scan and b.scan.idx
+    local units = b.scan and b.scan.units
+    local spot = O.inputs_first
+    local belts = b.belts
+    local si, so, ri, ro = {}, {}, {}, {}
+    local function add(u)
+      local r = belts[u]
+      local j = idx and idx[u]
+      -- (Without a scan, by unit number alone, as the sort below.)
+      local first = not idx or not spot or (r and r[12])
+      if j then
+        local t = first and si or ri
+        t[#t + 1] = j
+      else
+        local t = first and so or ro
+        t[#t + 1] = u
+      end
+    end
+    for unit in pairs(b.wset) do
+      if not (driven and belts[unit] and belts[unit][16]) then
+        add(unit)
+      end
+    end
+    if not O.feed_edges then
+      for unit in pairs(b.iset) do
+        if not b.wset[unit] then
+          add(unit)
+        end
+      end
+    end
+    table.sort(si)
+    table.sort(so)
+    table.sort(ri)
+    table.sort(ro)
+    local w = {}
+    for _, j in ipairs(si) do
+      w[#w + 1] = units[j]
+    end
+    for _, u in ipairs(so) do
+      w[#w + 1] = u
+    end
+    for _, j in ipairs(ri) do
+      w[#w + 1] = units[j]
+    end
+    for _, u in ipairs(ro) do
+      w[#w + 1] = u
+    end
+    b.wcache = { ver = ver, fe = O.feed_edges, inf = O.inputs_first, ins = driven, list = w }
+    return w
   end
   local w = {}
   for unit in pairs(b.wset) do
-    w[#w + 1] = unit
+    local r = b.belts[unit]
+    if not (driven and r and r[16]) then
+      w[#w + 1] = unit
+    end
   end
   if not O.feed_edges then
     for unit in pairs(b.iset) do
@@ -2026,8 +2669,63 @@ local function watch_order(b)
   else
     table.sort(w)
   end
-  b.wcache = { ver = b.wver or 0, fe = O.feed_edges, inf = O.inputs_first, list = w }
+  b.wcache = { ver = ver, fe = O.feed_edges, inf = O.inputs_first, ins = driven, list = w }
   return w
+end
+
+-- far_tier: the watched belts and actors (inserters, drills) split by their ring (far_ring): {near_w, near_a,
+-- kinds, units (the far ones, actor before its belt, nearest first), i (the cursor, carried across updates)},
+-- made again when the watched list, the actors' list or the scan changed, at most every FAR_REBUILD updates
+-- for the same scan (an actor or watched belt new meanwhile waits that long for its first check). In
+-- storage (bs.ft), from the scan and the lists.
+local FAR_REBUILD = 4
+local function far_split(b, w)
+  local ft = b.ft
+  local sc = b.scan
+  local edge = tonumber(O.far_ring) or 96
+  local key = (b.wlver or 0) .. ":" .. #b.alist .. ":" .. edge .. ":" .. tostring(O.inputs_first) .. ":" .. #w
+  if ft and ft.scan == sc.tick and (ft.key == key or b.count - ft.built < FAR_REBUILD) then
+    return ft
+  end
+  local idx, rings = sc.idx, sc.rings
+  local near_w, near_a, far = {}, {}, {}
+  for _, u in ipairs(w) do
+    local j = idx[u]
+    if j and rings[j] >= edge then
+      far[#far + 1] = { j * 2 + 1, 3, u }
+    else
+      near_w[#near_w + 1] = u
+    end
+  end
+  if O.inputs_first then
+    for _, u in ipairs(b.alist) do
+      local a = b.actors[u]
+      if a then
+        local j1, j2 = a[2] and idx[a[2]], a[3] and idx[a[3]]
+        local j = j1 and j2 and math.min(j1, j2) or j1 or j2
+        if j and rings[j] >= edge then
+          far[#far + 1] = { j * 2, 7, u }
+        else
+          near_a[#near_a + 1] = u
+        end
+      end
+    end
+  end
+  table.sort(far, function(x, y)
+    if x[1] ~= y[1] then
+      return x[1] < y[1]
+    end
+    return x[3] < y[3]
+  end)
+  local kinds, units = {}, {}
+  for k, f in ipairs(far) do
+    kinds[k], units[k] = f[2], f[3]
+  end
+  local i = ft and ft.i or 1
+  b.ft = { key = key, scan = sc.tick, built = b.count, near_w = near_w, near_a = near_a, kinds = kinds, units = units,
+    i = #units > 0 and (i - 1) % #units + 1 or 1 }
+  M.counts.far_lists = (M.counts.far_lists or 0) + 1
+  return b.ft
 end
 
 -- The steady work's queue: segments {kind, list} worked through in order (1 belts touched by events,
@@ -2126,21 +2824,54 @@ local function make_queue(b, fr)
     end
     b.alist, b.aseen = list, seen
   end
-  if O.inputs_first and #b.alist > 0 then
-    -- (The list as it is now: actors found later in this update wait for the next.)
-    local list = {}
-    for k, unit in ipairs(b.alist) do
-      list[k] = unit
+  -- (far_tier: the near ones every update, the far ones in turn: segment 9, worked in M.tick.)
+  local ftier = O.far_tier and b.scan and far_split(b, watch_order(b))
+  if ftier then
+    if O.inputs_first and #ftier.near_a > 0 then
+      q[#q + 1] = { 7, ftier.near_a }
     end
-    q[#q + 1] = { 7, list }
+    if #ftier.near_w > 0 then
+      q[#q + 1] = { 3, ftier.near_w }
+    end
+    if #ftier.units > 0 then
+      q[#q + 1] = { 9, ftier.units }
+    end
+  elseif O.inputs_first and #b.alist > 0 then
+    -- (The list as it is now: actors found later in this update wait for the next. watch_nosort: walked
+    -- to its length now, not copied; enlist only adds at its end, and a list made anew leaves this one be.)
+    if O.watch_nosort then
+      q[#q + 1] = { 7, b.alist, #b.alist }
+    else
+      local list = {}
+      for k, unit in ipairs(b.alist) do
+        list[k] = unit
+      end
+      q[#q + 1] = { 7, list }
+    end
   end
   profile.stop("bsq.actors", tq)
   tq = profile.start()
   -- Input spots, then the other watched belts, then the outermost ring's (those fed from outside
   -- what is sent are checked on the update's tick: check_edges).
-  local w = watch_order(b)
+  local w = not ftier and watch_order(b) or {}
   if #w > 0 then
     q[#q + 1] = { 3, w }
+  end
+  -- (ins_driven: the belts a hand took from or put on lately, watched as before for their window, by unit number.)
+  if b.iwin and ins_driven() then
+    local list = {}
+    for u, last in pairs(b.iwin) do
+      if b.count > last or not b.belts[u] then
+        b.iwin[u] = nil
+      else
+        list[#list + 1] = u
+      end
+    end
+    table.sort(list)
+    if #list > 0 then
+      q[#q + 1] = { 3, list }
+      M.counts.ins_window = (M.counts.ins_window or 0) + #list
+    end
   end
   profile.stop("bsq.sort", tq)
   tq = profile.start()
@@ -2150,9 +2881,12 @@ local function make_queue(b, fr)
   if sc and not sc.sel and fr > 0 and sc.first[fr - 1] then
     local ring = {}
     local wset, iset, fe = b.wset, b.iset, O.feed_edges
+    -- (ins_driven: a belt watched for its inserters alone is checked on the ring as unwatched ones are.)
+    local driven = ins_driven()
     for j = sc.first[fr - 1], (sc.first[fr] or sc.n + 1) - 1 do
       local unit = sc.units[j]
-      if b.belts[unit] and not wset[unit] and not iset[unit] then
+      local r = b.belts[unit]
+      if r and not (wset[unit] and not (driven and r[16])) and not iset[unit] then
         ring[#ring + 1] = unit
       end
     end
@@ -2167,6 +2901,8 @@ local function make_queue(b, fr)
     local list = {}
     -- (By bands of rings, each its own stride: drift_far.)
     local bands = O.drift_far and DRIFT_BANDS or DRIFT_ONE
+    -- (ins_driven: a belt watched for its inserters alone gets drift checks, as unwatched ones: the safety net.)
+    local driven = ins_driven()
     for _, band in ipairs(bands) do
       local r0, r1 = band[1], math.min(band[2], sc.top + 1)
       if r0 <= sc.top then
@@ -2175,7 +2911,8 @@ local function make_queue(b, fr)
         local turn = b.count % stride
         for j = j0 + (turn - (j0 - 1)) % stride, j1, stride do
           local unit = sc.units[j]
-          if b.belts[unit] and (O.drift_watched or not b.wset[unit]) and not b.oset[unit] and not b.iset[unit] then
+          local r = b.belts[unit]
+          if r and (O.drift_watched or not b.wset[unit] or (driven and r[16])) and not b.oset[unit] and not b.iset[unit] then
             list[#list + 1] = unit
           end
         end
@@ -2191,7 +2928,9 @@ end
 
 -- An inserter or drill that uses a belt, checked: its hand holding more or less than at its last
 -- check, a drill's progress gone round: it took from or put on its belts, which are woken (their
--- lanes checked when their turn comes, never quiet then, packed ones by their ids). Returns the units.
+-- lanes checked when their turn comes, never quiet then, packed ones by their ids); under ins_driven a
+-- belt watched for inserters alone is read there and then instead (event_belt). Returns the units and
+-- the extra units.
 local ACTOR_UNITS = 1.5
 -- actor_backoff: an inserter whose hand held the same at ACTOR_IDLE checks running is checked every
 -- other update, at 2 * ACTOR_IDLE every ACTOR_SKIP'th (a hand that moves again is checked every update
@@ -2199,12 +2938,108 @@ local ACTOR_UNITS = 1.5
 -- how fast it went, at most ACTOR_SKIP updates. a[6]: checks unchanged in a row; a[7]: the update
 -- (bs.count) it is checked again at; a[8]: the tick of a drill's last check.
 local ACTOR_IDLE, ACTOR_SKIP, DRILL_SKIP = 4, 2, 4
-local function actor_check(b, unit, period)
+
+-- (ins_driven) Lane i of a belt watched for its inserters alone, after a hand took or put there: read in full, but for
+-- a lane holding items that stands as its last read left it (its count, front, back and totals, and its front and back
+-- items' ids: a packed one moved a whole gap looks the same otherwise), which the hand left alone. An empty lane is
+-- always read: it was empty at its last read too when an item came, was taken and went (the client may hold it).
+-- Returns the units and whether it was read.
+local function event_lane(b, belt, unit, i, lines, p)
+  local rec = b.lanes[unit * LANE_KEYS + i]
+  local now = game.tick
+  if not rec or rec[5] == now then
+    return 0, false
+  end
+  local n, p1, pn, total = check_line(lines[i])
+  M.counts.checked = M.counts.checked + 1
+  M.counts.ins_checks = (M.counts.ins_checks or 0) + 1
+  local units = CHECK_UNITS
+  local same = n > 0 and n == rec[1] and p1 == rec[2] and pn == rec[3] and total == rec[4]
+  if same and M.identity then
+    units = units + n * ITEM_UNITS
+    same = not front_moved(lines[i], rec)
+  end
+  if same then
+    rec[6] = now
+    return units, false
+  end
+  M.counts.ins_reads = (M.counts.ins_reads or 0) + 1
+  return units + read_lane(b, belt, unit, i, lines, false, p, n, p1, pn, total), true
+end
+
+-- (ins_driven) A belt watched for its inserters alone, after a hand took or put there: its lanes (event_lane), and the
+-- belts it feeds, as far as an item can have gone in `dt` ticks (a changed watched belt's tails, do_step), whatever its
+-- lanes showed: an item taken as it left the belt, or put and run off it since, is on the next belt in the client's
+-- simulation. Returns the units and the extra units (the tails, under extra_units).
+local function event_belt(b, u, p, dt)
+  local rec = b.belts[u]
+  if not rec then
+    return 0, 0
+  end
+  local belt = rec[1]
+  if not belt.valid then
+    drop_belt(b, u, p)
+    return 1, 0
+  end
+  M.counts.ins_belts = (M.counts.ins_belts or 0) + 1
+  local lines = lines_of(belt, u)
+  local units = 0
+  for i = 1, #lines do
+    units = units + event_lane(b, belt, u, i, lines, p)
+  end
+  rec[9] = game.tick
+  local win = floor(tonumber(O.ins_window) or 0)
+  if win > 0 then
+    b.iwin = b.iwin or {}
+    b.iwin[u] = b.count + win
+  end
+  local extra = 0
+  if M.tails and extra_left(b) then
+    local r0 = M.counts.read
+    for _, w in ipairs(rec[7] or {}) do
+      extra = extra + catch_up(b, w, math.max(1, dt), p, CATCH_DEPTH - TAIL_DEPTH + 1)
+    end
+    M.counts.r_tail = (M.counts.r_tail or 0) + M.counts.read - r0
+    extra_spend(b, extra)
+  end
+  return units, extra
+end
+
+-- (ins_ho) Whether the client is told each item this inserter puts on a belt (inserters.lua's PLACED): a client
+-- taking `ie` and `ho`, the inserter inside inserters.lua's square (the detail radius round the focus), no remote
+-- view (inserters.lua leaves out what no radar sees). From storage and settings: the same on every peer.
+local function put_told(a)
+  if not O.ins_ho then
+    return false
+  end
+  local s = storage.f3d
+  local c, f = s.client, s.focus
+  if not (c and c.ie and c.ho and f) or s.remote_view then
+    return false
+  end
+  if not a[10] then
+    local q = a[1].position
+    a[10], a[11] = q.x, q.y
+  end
+  local r = math.min(settings.global["f3d-detail-radius"].value, f.r or 0)
+  return math.abs(a[10] - f.x) <= r and math.abs(a[11] - f.y) <= r
+end
+
+local function actor_check(b, unit, period, p)
   local a = b.actors[unit]
   if not a then
     return 0
   end
   local backoff = O.actor_backoff
+  -- (ins_driven: an inserter at a belt watched for inserters alone is checked every update: its checks are all that
+  -- reads that belt. M.ins_eager false: backed off as the rest, for measuring.)
+  local driven = not a[4] and ins_driven()
+  if driven and backoff and M.ins_eager then
+    local r2, r3 = a[2] and b.belts[a[2]], a[3] and b.belts[a[3]]
+    if (r2 and r2[16]) or (r3 and r3[16]) then
+      backoff = false
+    end
+  end
   if backoff and a[7] and b.count < a[7] then
     M.counts.actors_skipped = (M.counts.actors_skipped or 0) + 1
     return 0.2
@@ -2245,29 +3080,66 @@ local function actor_check(b, unit, period)
     a[8] = now
     return ACTOR_UNITS
   end
+  local prev = a[8] or now
   a[6], a[7], a[8] = 0, nil, now
   M.counts.acted = (M.counts.acted or 0) + 1
+  -- (ins_driven: the hand's count up is a take off its pickup belt, down a put on its drop belt. A belt watched for
+  -- inserters alone is read now for the end that acted; any other is woken for both, as before.)
+  local took, put = v > was, v < was
+  local units, extra = ACTOR_UNITS, 0
+  local dt = now - prev
   for k = 2, 3 do
     local u = a[k]
-    if u and b.belts[u] then
-      b.wake[u] = true
-      -- (A pickup belt's feeder too: a hand chases an item across the belt's back edge.)
+    local r = u and b.belts[u]
+    if r then
+      if driven and r[16] then
+        if k == 2 and took then
+          M.counts.ins_takes = (M.counts.ins_takes or 0) + 1
+          local x1, x2 = event_belt(b, u, p, dt)
+          units, extra = units + x1, extra + x2
+        elseif k == 3 and put then
+          if put_told(a) then
+            M.counts.ins_told = (M.counts.ins_told or 0) + 1
+          else
+            M.counts.ins_puts = (M.counts.ins_puts or 0) + 1
+            local x1, x2 = event_belt(b, u, p, dt)
+            units, extra = units + x1, extra + x2
+          end
+        end
+      else
+        b.wake[u] = true
+      end
+      -- (drill_tails: what the drill put out may have run on past its drop belt since its check before.)
+      if k == 3 and a[4] and O.drill_tails then
+        b.dwake = b.dwake or {}
+        b.dwake[u] = math.min(b.dwake[u] or prev, prev)
+      end
+      -- (A pickup belt's feeder too: a hand chases an item across the belt's back edge. ins_driven: one watched for
+      -- inserters alone read on a take.)
       if k == 2 then
-        for _, w in ipairs(b.belts[u][8] or {}) do
-          if b.belts[w] and b.belts[w][12] then
-            b.wake[w] = true
+        for _, w in ipairs(r[8] or {}) do
+          local rw = b.belts[w]
+          if rw and rw[12] then
+            if driven and rw[16] then
+              if took then
+                local x1, x2 = event_belt(b, w, p, dt)
+                units, extra = units + x1, extra + x2
+              end
+            else
+              b.wake[w] = true
+            end
           end
         end
       end
     end
   end
-  return ACTOR_UNITS
+  return units, extra
 end
 
-local STEP_NAMES = { "bs.reload", "bs.bre", "bs.watch", "bs.drift", nil, nil, "bs.actor" }
+local STEP_NAMES = { "bs.reload", "bs.bre", "bs.watch", "bs.drift", nil, nil, "bs.actor", nil, "bs.far" }
 local function do_step(b, kind, v, p, period)
   if kind == 7 then
-    return actor_check(b, v, period)
+    return actor_check(b, v, period, p)
   elseif kind == 2 then
     -- A group of asked lanes, read on this tick with the packed runs round them (while the reads
     -- for accuracy have room).
@@ -2303,6 +3175,17 @@ local function do_step(b, kind, v, p, period)
     return 1
   end
   local belt = rec[1]
+  -- (quiet_first: a watched belt whose every lane is quiet is passed over before its `valid` is read:
+  -- one API call per watched belt per update for nothing. One gone without an event is found when its
+  -- check comes up. A splitter under crossings game is never passed over whole: below, as before.)
+  if kind == 3 and O.quiet_first and O.crossings ~= "game" then
+    local due = rec[13]
+    if due and game.tick < due and not b.wake[v] then
+      M.counts.quiet_belts = (M.counts.quiet_belts or 0) + 1
+      rec[9] = game.tick
+      return 0.5
+    end
+  end
   if not belt.valid then
     drop_belt(b, v, p)
     return 1
@@ -2327,7 +3210,8 @@ local function do_step(b, kind, v, p, period)
       return 0.5
     end
     local lines = lines_of(belt, v)
-    local units = 0
+    -- (lane_next: each lane's next as the client was told, looked at too.)
+    local units = next_check(b, v, p, "next_fix")
     local changed, settled = false, false
     for i = 1, #lines do
       local u, ev = watch_lane(b, belt, v, i, lines, p)
@@ -2357,6 +3241,10 @@ local function do_step(b, kind, v, p, period)
         rec[13] = due > now and due or nil
       end
     end
+    -- (ins_driven: a belt in its window whose lanes all settled leaves it.)
+    if rec[13] and b.iwin and b.iwin[v] then
+      b.iwin[v] = nil
+    end
     -- Changed: the belts it feeds read too, as far as the client can have carried an item on since
     -- the last check (one an inserter took there that the client still had is gone from them; one
     -- dropped there that ran on shows).
@@ -2366,15 +3254,25 @@ local function do_step(b, kind, v, p, period)
     -- simulation already carries them as the game does.)
     local t = rec[14] or belt.type
     b.wake[v] = nil
+    -- (drill_tails: a drill dropping here put out since its check before: the tails back to then.)
+    local since = last
+    local dsince = b.dwake and b.dwake[v]
+    if dsince then
+      b.dwake[v] = nil
+      since = math.min(since, dsince)
+    end
     -- (On this tick, as the lane's own read: a read a tick later would move this one's items. Apart
     -- from the units the steady limit counts, so every input spot is checked first.)
     local extra = 0
-    if changed and M.tails and (rec[11] or t == "splitter" or t == "lane-splitter") and extra_left(b) then
+    if (changed or dsince) and M.tails and (rec[11] or t == "splitter" or t == "lane-splitter") and extra_left(b) then
       local r0 = M.counts.read
       for _, u in ipairs(rec[7] or {}) do
-        extra = extra + catch_up(b, u, math.max(1, now - last), p, CATCH_DEPTH - TAIL_DEPTH + 1)
+        extra = extra + catch_up(b, u, math.max(1, now - since), p, CATCH_DEPTH - TAIL_DEPTH + 1)
       end
       M.counts.r_tail = (M.counts.r_tail or 0) + M.counts.read - r0
+      if dsince and not changed then
+        M.counts.r_drill = (M.counts.r_drill or 0) + M.counts.read - r0
+      end
     end
     if settled and M.settle_around and (rec[11] or t == "splitter" or t == "lane-splitter") and extra_left(b) then
       local r0 = M.counts.read
@@ -2437,8 +3335,11 @@ local function check_edges(b, p)
     if rec and rec[1].valid then
       local belt = rec[1]
       local lines = lines_of(belt, unit)
+      -- (lane_next: a lane leading out told otherwise is read with its meta first, its wall with it; then only
+      -- the lanes leading out, as the client walls only those.)
+      units = units + next_check(b, unit, p, "next_fix")
       for i = 1, #lines do
-        if exit_line(belt, i) then
+        if exit_line(belt, i) and (not O.lane_next or lane_out(b, rec, unit, i, belt)) then
           units = units + watch_lane(b, belt, unit, i, lines, p)
         end
       end
@@ -2604,6 +3505,166 @@ local function emit(b, p, period, fr, work, loading)
   spool_step(send_cap())
 end
 
+-- Whether the next belt to load lies past walk_near (far_load_cap): the near part is all loaded.
+local IDLE_SHARE = 0.75  -- of the budget left for the tick's queues: idle
+-- (built_now) The belts touched since the last tick, worked out now: the places forgotten (forget_touched: chunk
+-- lists and targets round them, the loaded belts there listed to read again, a scan asked for), each belt removed
+-- dropped (dl), each built inside the square loaded (after dropping a loaded belt under it whose entity is gone:
+-- a fast-replace), and the loaded belts listed read again with their meta (lm, sl). Up to `cap` units a tick:
+-- what is left waits for the next tick (bs.fresh) or the round's queue (bs.reload). Returns the units.
+M.built_units = 2400
+local function built_now(b, p, cap)
+  local fresh = b.fresh
+  if not (fresh or b.dirty) then
+    return 0
+  end
+  local units = 0
+  if b.dirty then
+    units = units + forget_touched(b)
+  end
+  local sc = b.scan
+  local si = world.surface().index
+  local now = game.tick
+  local seen = sc and map.view_filter(true)
+  local list, listed = {}, {}
+  local function again(u)
+    if u and b.belts[u] and not listed[u] then
+      listed[u] = true
+      list[#list + 1] = u
+    end
+  end
+  local i = 1
+  if fresh then
+    -- (A belt touched twice since: its last entry.)
+    local last = {}
+    for k, f in ipairs(fresh) do
+      last[f[2]] = k
+    end
+    while i <= #fresh and units < cap do
+      local f = fresh[i]
+      local e, u = f[1], f[2]
+      if last[u] == i then
+        units = units + 1
+        if not e.valid then
+          if b.belts[u] then
+            drop_belt(b, u, p)
+            M.counts.built_gone = (M.counts.built_gone or 0) + 1
+          end
+        elseif e.surface.index ~= si then
+          -- (Another surface: not this client's square.)
+        elseif b.belts[u] then
+          again(u)
+        elseif sc and not sc.sel then
+          -- (area trace: what is loaded follows the trace; the scan asked for decides.)
+          local x, y = f[3], f[4]
+          local dx, dy = x - sc.fx, y - sc.fy
+          local ring = floor(math.max(dx < 0 and -dx or dx, dy < 0 and -dy or dy))
+          if ring < math.min(sc.r, b.edge or sc.r) and (not seen or seen(x, y)) then
+            -- A loaded belt on its tiles whose entity is gone: what it replaced.
+            local box = e.bounding_box
+            local at = b.at
+            if at then
+              for tx = floor(box.left_top.x), math.ceil(box.right_bottom.x) - 1 do
+                for ty = floor(box.left_top.y), math.ceil(box.right_bottom.y) - 1 do
+                  local v = at[tile_key(tx, ty)]
+                  local r = v and v ~= u and b.belts[v]
+                  if r and not r[1].valid then
+                    drop_belt(b, v, p)
+                    M.counts.built_replaced = (M.counts.built_replaced or 0) + 1
+                  end
+                end
+              end
+            end
+            units = units + load_belt(b, e, u, x, y, p)
+            b.direct = b.direct or {}
+            b.direct[u] = now
+            M.counts.built_loaded = (M.counts.built_loaded or 0) + 1
+            -- Its feeders and what it feeds: their records (what they lead into, what feeds them) and shapes.
+            local rec = b.belts[u]
+            for _, v in ipairs(rec[7]) do
+              again(v)
+            end
+            for _, v in ipairs(rec[8]) do
+              again(v)
+            end
+          end
+        end
+        local o = f[5]
+        if o and o.valid then
+          again(o.unit_number)
+        end
+      end
+      i = i + 1
+    end
+    if i > #fresh then
+      b.fresh = nil
+    else
+      local rest = {}
+      for k = i, #fresh do
+        rest[#rest + 1] = fresh[k]
+      end
+      b.fresh = rest
+    end
+  end
+  -- The loaded belts round the places (and those a drop above made lead out of what is sent), then the rest.
+  for _, u in ipairs(b.reload or {}) do
+    again(u)
+  end
+  b.reload = {}
+  local k = 1
+  while k <= #list and units < cap do
+    local u = list[k]
+    local rec = b.belts[u]
+    if rec then
+      if rec[1].valid then
+        units = units + load_belt(b, rec[1], u, rec[2], rec[3], p)
+      else
+        drop_belt(b, u, p)
+      end
+    end
+    k = k + 1
+  end
+  for x = k, #list do
+    b.reload[#b.reload + 1] = list[x]
+  end
+  M.counts.built_units = (M.counts.built_units or 0) + units
+  return units
+end
+
+local function far_loads(b)
+  local sc = b.scan
+  local j = b.load_i or 1
+  if not sc or j > sc.n then
+    return false
+  end
+  return sc.rings[j] >= (tonumber(O.walk_near) or 0)
+end
+
+-- The units first loads may take this tick: their share of the work budget, more while the view's reach
+-- isn't all loaded (walk_load, b.thin from the last update), LOAD_MIN for belts past walk_near while the
+-- tick's budget isn't idle (far_load_cap), once the square has been loaded whole (b.whole: the join's first
+-- load goes at its full share).
+local function load_limit_now(b)
+  if M.load_cap then
+    return M.load_cap
+  end
+  local limit = math.max(LOAD_MIN, floor(budget.left("bsload", LOAD_SHARE) * UNITS_PER_BUDGET_UNIT))
+  if b.thin then
+    return math.max(limit, floor(tonumber(O.walk_load) or 0))
+  end
+  if O.far_load_cap and b.whole and far_loads(b) and budget.left() < budget.limit() * IDLE_SHARE then
+    return LOAD_MIN
+  end
+  return limit
+end
+
+-- (Tests.)
+function M.load_limit_now()
+  read_options()
+  local b = storage.f3d.bs
+  return b and load_limit_now(b) or 0
+end
+
 -- Steady units a tick: spread over the update's ticks from what the last one took.
 local function steady_units(b, period)
   return math.max(M.units_per_tick, ceil((b.work or 0) * 1.5 / math.max(1, period - 1)))
@@ -2615,13 +3676,21 @@ local function rate_job()
   return O.own_rate and "bs" or "bi"
 end
 
+-- The longest period the updates are stretched to (period_max), for their own job only.
+local function rate_cap()
+  if O.own_rate then
+    return floor(tonumber(O.period_max) or 0)
+  end
+  return nil
+end
+
 function M.planned_units()
   read_options()
   local b = storage.f3d.bs
   if not b then
     return 0
   end
-  local period = rate.period(rate_job(), settings.global["f3d-detail-interval"].value)
+  local period = rate.period(rate_job(), settings.global["f3d-detail-interval"].value, nil, rate_cap())
   return floor(steady_units(b, period) / UNITS_PER_BUDGET_UNIT)
 end
 
@@ -2639,8 +3708,9 @@ function M.tick()
   local b = state()
   local interval = settings.global["f3d-detail-interval"].value
   local job = rate_job()
-  local period = rate.period(job, interval)
-  local due = rate.due(job, interval)
+  local pmax = rate_cap()
+  local period = rate.period(job, interval, nil, pmax)
+  local due = rate.due(job, interval, nil, pmax)
   local surface = world.surface()
   if b.si ~= surface.index then
     M.reset()
@@ -2658,12 +3728,19 @@ function M.tick()
     b.round = round
     pays[s] = new_payload(round.start)
     local t0 = profile.start()
+    if not O.built_now then
+      b.fresh = nil
+    end
     round.units = round.units + forget_touched(b)
+    round.units = round.units + retry_targets(b)
     profile.stop("bsq.forget", t0)
     t0 = profile.start()
     local f = s.focus
     local sc = b.scan
-    local moved = sc and (math.abs(sc.fx - f.x) >= 1 or math.abs(sc.fy - f.y) >= 1)
+    -- (scan_step: once it moved max(1, r / 32) tiles: 11 at 352, 1 at 24. The square's middle lags the
+    -- focus by as much, its far edge alone.)
+    local step = O.scan_step and math.max(1, floor(r / 32)) or 1
+    local moved = sc and (math.abs(sc.fx - f.x) >= step or math.abs(sc.fy - f.y) >= step)
     -- (area trace: a scan again when the switch, the near square or the trace's bounds changed.)
     local tr = trace_on()
     local retrace = sc and ((tr and (sc.near ~= near_now() or sc.tkey ~= trace_key())) or (not tr and sc.near ~= nil))
@@ -2684,6 +3761,15 @@ function M.tick()
   end
   local p = payload(b)
   local fast = 0
+  -- (built_now: belts built, turned, replaced or removed since the last tick, on this tick. Counted as first
+  -- loads are, outside the steady work the bound and the next round's share go by.)
+  if O.built_now and (b.fresh or b.dirty) then
+    local tb = profile.start()
+    local built = built_now(b, p, M.built_units)
+    profile.stop("bs.built", tb)
+    round.units = round.units + built
+    round.loaded = round.loaded + built
+  end
   local steady = steady_units(b, period)
   local limit = due and steady * DUE_BURST or steady
   local spent = 0
@@ -2714,28 +3800,52 @@ function M.tick()
   while round.i <= #q and spent < limit and xtick < xcap do
     local seg = q[round.i]
     local kind, list = seg[1], seg[2]
-    local j = round.j or 1
-    local tk = profile.start()
-    while j <= #list and spent < limit and xtick < xcap do
-      local u, x = do_step(b, kind, list[j], p, period)
-      spent = spent + u
-      round.extra = (round.extra or 0) + (x or 0)
-      xtick = xtick + (x or 0)
-      j = j + 1
-    end
-    profile.stop(STEP_NAMES[kind], tk)
-    if j > #list then
-      round.i, round.j = round.i + 1, nil
+    if kind == 9 then
+      -- far_tier: the far actors and watched belts from the cursor on, far_units an update at most, each
+      -- once at most an update.
+      local ft = b.ft
+      local n = ft and ft.units == list and #list or 0
+      local cap = tonumber(O.far_units) or 4000
+      local tk = profile.start()
+      while n > 0 and (round.fdone or 0) < n and (round.fspent or 0) < cap and spent < limit and xtick < xcap do
+        local k = ft.i
+        if k > n then
+          k = 1
+        end
+        ft.i = k + 1
+        local u, x = do_step(b, ft.kinds[k], list[k], p, period)
+        spent = spent + u
+        round.fspent = (round.fspent or 0) + u
+        round.fdone = (round.fdone or 0) + 1
+        round.extra = (round.extra or 0) + (x or 0)
+        xtick = xtick + (x or 0)
+        M.counts.far_checks = (M.counts.far_checks or 0) + 1
+      end
+      profile.stop("bs.far", tk)
+      if n == 0 or (round.fdone or 0) >= n or (round.fspent or 0) >= cap then
+        round.i, round.j = round.i + 1, nil
+      end
     else
-      round.j = j
+      local last = seg[3] or #list
+      local j = round.j or 1
+      local tk = profile.start()
+      while j <= last and spent < limit and xtick < xcap do
+        local u, x = do_step(b, kind, list[j], p, period)
+        spent = spent + u
+        round.extra = (round.extra or 0) + (x or 0)
+        xtick = xtick + (x or 0)
+        j = j + 1
+      end
+      profile.stop(STEP_NAMES[kind], tk)
+      if j > last then
+        round.i, round.j = round.i + 1, nil
+      else
+        round.j = j
+      end
     end
   end
-  -- First loads beside it, under their share of the work budget.
-  local load_limit = M.load_cap or math.max(LOAD_MIN, floor(budget.left("bsload", LOAD_SHARE) * UNITS_PER_BUDGET_UNIT))
-  -- (walk_load: more while the view's reach isn't all loaded, b.thin from the last update.)
-  if b.thin and not M.load_cap then
-    load_limit = math.max(load_limit, floor(tonumber(O.walk_load) or 0))
-  end
+  -- First loads beside it, under their share of the work budget (load_limit_now).
+  local load_limit = load_limit_now(b)
   local tl = profile.start()
   local loaded = load_step(b, load_limit, p)
   profile.stop("bs.load", tl)
@@ -2743,6 +3853,12 @@ function M.tick()
   round.units = round.units + fast + spent + loaded + (round.extra or 0)
   round.extra = 0
   round.loaded = round.loaded + loaded
+  -- (lane_next: the lanes of belts whose next belt left this tick, with their new next in this tick's reads.)
+  if O.lane_next and next(b.nref) then
+    local tn = profile.start()
+    round.units = round.units + next_refresh(b, p)
+    profile.stop("bs.next", tn)
+  end
   if not due then
     return
   end
@@ -2761,6 +3877,11 @@ function M.tick()
   -- (walk_load: the square loaded whole reaches less than walk_near tiles; the trace's own cap on fr
   -- below doesn't count, its traced belts beyond the near square still loading do.)
   b.thin = unloaded and fr < (tonumber(O.walk_near) or 0) or nil
+  -- (far_load_cap from here on: this client's square has been loaded whole once. b goes with a handshake,
+  -- a resync or a new surface, so each starts uncapped.)
+  if not unloaded then
+    b.whole = true
+  end
   -- (area trace: fr is the near square, every belt of which is loaded, at most; the traced belts
   -- beyond it still loading keep `ld`.)
   if sc and sc.near and fr > sc.near then
@@ -2772,6 +3893,15 @@ function M.tick()
     profile.stop("bs.emit", t)
   end
   bound(b, round.units - round.loaded, period, loading)
+  -- (lane_next: reloads the round didn't get to (its first segment) wait for the next round's; they were dropped,
+  -- the lanes keeping their old meta.)
+  if O.lane_next and q[1] and q[1][1] == 1 and round.i == 1 then
+    local list = q[1][2]
+    for j = round.j or 1, #list do
+      b.reload[#b.reload + 1] = list[j]
+    end
+    M.counts.reload_kept = (M.counts.reload_kept or 0) + #list - (round.j or 1) + 1
+  end
   b.sq = b.scan and { b.scan.fx, b.scan.fy, fr } or nil
   b.work = round.units - round.loaded - round.fast
   b.round, pays[s] = nil, nil
@@ -2808,6 +3938,27 @@ function M.square()
   return b and b.sq
 end
 
+-- The square whose far lanes needn't be read (far_lanes, perf.lua): once every belt is loaded out to
+-- walk_near and the square isn't cut, the whole square being simulated, {fx, fy, its radius}: the few
+-- tiles of its edge still loading while walking don't bring the far ring back (their lanes come within
+-- moments, 350 tiles away at the owner's settings). Joining, after a jump, cut by the bound or traced
+-- (area trace): the square loaded, as M.square. Nil before the first update.
+function M.covered()
+  local b = storage.f3d.bs
+  local sq = b and b.sq
+  if not sq or b.thin or b.cut or O.area == "trace" or not b.scan then
+    return sq
+  end
+  return { sq[1], sq[2], math.max(sq[3], math.min(b.scan.r, wanted_radius())) }
+end
+
+-- The watched belts in the order they are checked (tests).
+function M.watch_list()
+  read_options()
+  local b = storage.f3d.bs
+  return b and watch_order(b) or {}
+end
+
 -- Whether a belt outside that square is loaded all the same (area trace: one traced from the near
 -- square), so the far lanes leave it out: its items are drawn moving.
 function M.hidden(unit)
@@ -2816,6 +3967,18 @@ function M.hidden(unit)
   end
   local b = storage.f3d.bs
   return b ~= nil and b.belts[unit] ~= nil
+end
+
+-- The belts an inserter (or drill) uses, as the actors have them (targets_of): pickup belt's unit
+-- number or false, drop belt's or false; nil when it isn't an actor (its belts aren't loaded, or
+-- the client doesn't simulate belts). Read-only: inserters.lua says which belt a hand took from.
+function M.actor_belts(unit)
+  local b = storage.f3d.bs
+  local a = b and b.actors and b.actors[unit]
+  if not a then
+    return nil
+  end
+  return a[2] or false, a[3] or false
 end
 
 -- A new world (handshake, surface change, resync): everything is sent again.

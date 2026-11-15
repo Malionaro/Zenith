@@ -23,6 +23,7 @@ const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 const Slot := preload("res://scripts/ui/factorio/slot.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const MenuKit := preload("res://scripts/menu/menu_kit.gd")
+const CraftingPanel := preload("res://scripts/ui/factorio/crafting_panel.gd")
 
 ## Factorio's colours: production_progressbar (green), heat_progressbar (red), burning_progressbar,
 ## bonus_progressbar (purple).
@@ -494,6 +495,7 @@ static func burner_row(screen) -> Control:
 	var bar := thin_bar(BURNING_RED, int(screen._last.get("bn", 0)) / 1000.0)
 	bar.name = "BurnerBar"
 	bar.tooltip_text = "Fuel left in the burning item"
+	screen.set_meta("fuel_bar", bar)  # machine_screen.gd moves it on between states (I26)
 	bar.mouse_filter = Control.MOUSE_FILTER_PASS
 	row.add_child(bar)
 	if screen.knows_slots("burnt"):
@@ -1018,7 +1020,13 @@ static func recipe_chooser(screen, recipes: Array, groups: Array, current: Strin
 			s.toggle_mode = true
 			s.button_pressed = name == current
 			s.set_stack(name, -1)
-			s.set_tip(Kit.recipe_name(name))
+			# J14: Factorio's recipe tooltip (ingredients, time, products, Total raw), from the hand
+			# recipe's details or the recipe's Factoriopedia page, asked for as the mouse comes on it.
+			s.set_tip("%s (Recipe)" % Kit.recipe_name(name))
+			var m = screen.get("model")
+			if m != null:
+				s.tip_fn = func() -> Array: return CraftingPanel.recipe_tip_lines(m, m.recipe_info(name), false)
+				s.mouse_entered.connect(func() -> void: m.recipe_info(name))
 			var on_pick := func(button_index: int, _shift: bool) -> void:
 				if button_index == MOUSE_BUTTON_LEFT:
 					pick.call(name)

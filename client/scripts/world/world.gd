@@ -7,6 +7,7 @@ const ChunkView := preload("res://scripts/world/chunk_view.gd")
 const Anim := preload("res://scripts/world/anim.gd")
 const Probing := preload("res://scripts/debug/probing.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
+const VisualTurns := preload("res://scripts/world/visual_turns.gd")
 const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
 const TerrainMesher := preload("res://scripts/world/terrain_mesher.gd")
 const TerrainTextures := preload("res://scripts/world/terrain_textures.gd")
@@ -14,6 +15,8 @@ const ModelLods := preload("res://scripts/world/model_lods.gd")
 const FarChunks := preload("res://scripts/world/far_chunks.gd")
 const FrameBudget := preload("res://scripts/world/frame_budget.gd")
 const BeltBlur := preload("res://scripts/world/belt_blur.gd")
+const BehindCull := preload("res://scripts/world/behind_cull.gd")
+const PipelineWarm := preload("res://scripts/world/pipeline_warm.gd")
 
 const CHUNK := 32
 const SUBSCRIBE_REFRESH := 5.0  # resend the subscription now and then in case it was lost
@@ -22,7 +25,9 @@ const SUBSCRIBE_REFRESH := 5.0  # resend the subscription now and then in case i
 ## at Ultra), which arrived and was built together and stuttered (owner's desktop, 18 fps running).
 ## While the focus moves at most STREAM_MOVING chunks are on their way, standing STREAM_STILL (the
 ## first load), checked every STREAM_STEP seconds, or sooner standing once they are all drawn.
-const STREAM_MOVING := 8
+## (I18: 8 while moving before chunks were asked for in the view's direction and built within the one
+## frame budget; a few more keep up with a run at a long view distance.)
+const STREAM_MOVING := 12
 const STREAM_STILL := 32
 const STREAM_STEP := 0.15
 const STREAM_STEP_QUICK := 0.03  # standing, once every chunk on its way is drawn (_all_came)
@@ -36,6 +41,30 @@ const STREAM_SHOT := 256
 ## CACHE_AGE_MSEC (what changes without an event, a furnace's recipe from its ore, heals by then).
 const CACHE_CHUNKS := 1500
 const CACHE_AGE_MSEC := 600000
+## And no more than about this much memory, from what each kept chunk holds (estimated: its tiles,
+## records and decoratives), the least recently used dropped first (I18).
+const CACHE_BYTES := 192 << 20
+## The area cache (I18, owner: "cache everything in an area instead of having to recheck for
+## chunks"): chunks that leave the square stay built and drawn as they last were (the bridge no longer
+## updates them), up to WARM_RINGS chunks past it, at most WARM_MAX (fewer with a long view:
+## HOLD_TOTAL, the shader instance buffer's limit), the least recently left let go first and those
+## hidden behind the camera before those in view. Walking back they are asked for at once with the
+## counts their drawn copy matches (`kept`, which the bridge sends as they leave) and stay drawn; the
+## bridge's `same` then costs nothing more, and only a changed one is sent and built again.
+const WARM_RINGS := 4
+const WARM_MAX := 600
+## The view's direction (I18): the camera's, turned towards where the focus moves, in SECTORS steps
+## so the wanted order (prio_order) and the bridge's queue (`sub` f) change only when it turns past a
+## sector's edge by SECTOR_SLACK of a sector. Looking nearly straight down (Factorio's view) there is
+## none: every way is in view.
+const SECTORS := 8
+const SECTOR_SLACK := 0.25
+const VIEW_FLAT_ON := 0.35  # the camera's forward's length on the ground for a direction (and off below VIEW_FLAT_OFF)
+const VIEW_FLAT_OFF := 0.25
+const MOVING_SPEED := 3.0  # tiles a second the focus moves at before its way counts
+## A chunk behind the view counts as further away by this (as world.lua's BEHIND): straight behind,
+## twice its distance.
+const BEHIND := 3
 const MOVING_FOR := 1.5  # seconds after the focus last changed chunk that it counts as moving
 const JUMP_CHUNKS := 3  # the focus changing chunk by more than this is a jump, not moving
 const FOCUS_INTERVAL := 0.25
@@ -76,6 +105,9 @@ signal entities_changed(chunk: Vector2i)
 signal alt_changed(chunk: Vector2i)
 ## Tiles in a chunk were laid or mined (`tiles`); a snapshot's new ground comes with entities_changed.
 signal tiles_changed(chunk: Vector2i)
+## A ghost was hidden or shown again by the client alone (predicted.gd's remove_ghost, I6): ghosts.gd
+## draws its chunk again at once, without the chunk's own rebuild.
+signal ghost_hidden(chunk: Vector2i)
 
 
 ## A static entity as last reported by the server.
@@ -126,11 +158,31 @@ var _cargo_left := {}
 ## raises no event, so a new entity clears those under it here (_clear_remnants_under).
 var _remnants := {}
 var working := {}  # unit -> 0/1
+## K10: lit lamps' colours (`st` `lc`): unit -> 0xRRGGBB, for the lamps that show one; a lamp without
+## an entry has Factorio's plain white light. A lamp's colour is forgotten with each state the bridge
+## sends for it, which sends the colour again in the same message when it has one.
+var lamp_colors := {}
+## K20: lit lamps set to Always on (`st` `ao`): unit -> true. They shine by day as well (lamp_lights.gd
+## lights the others only when it is dark). Forgotten with each state, as the colours are.
+var lamp_always := {}
+## Alt-mode's chest contents (`ac`, J6): unit -> [item, more items...], the kinds it holds most of,
+## most first. Only the answers to the current turning on of Alt-mode (Bridge.alt_contents) are
+## kept; alt_overlay.gd draws them over chests that have no icon of their own.
+var alt_contents := {}
+var _alt_contents_g := 0
+## Alt-mode's machine icons (`am`, K1, K2): unit -> [modules, packs], each [[item, quality], ...]
+## (quality "" for normal): the modules in a machine and the science packs in a lab, in slot order.
+## Kept as alt_contents is, for the current turning on of Alt-mode only; alt_overlay.gd lays them out
+## by the prototype's `eprops` isq.
+var alt_machines := {}
+var _alt_machines_g := 0
 ## Machines' moving parts and glows: written as states change for the shader to move, everywhere;
 ## turret heads, collectors' arms and worms moved here each frame near the camera (anim.gd).
 var animator := Anim.new()
 ## Far chunks' buildings merged into one mesh each.
 var far_chunks := FarChunks.new()
+## Chunks far behind the camera hidden (I18).
+var behind_cull := BehindCull.new()
 
 var _focus := Vector2.ZERO
 var _subscribed: Array = []
@@ -144,6 +196,12 @@ var _focus_timer := 0.0
 var _last_focus_sent := Vector2(INF, INF)
 var _dirty := {}  # Vector2i -> true
 var _pending := {}  # Vector2i -> true: chunks built with MultiMeshes still to add (ChunkView.pending)
+## J20: entities the character mined, taken away on the bridge's `mnd` (the tick it mined them) before
+## their `del` comes through the reliable stream, behind the chunk snapshots queued ahead of it: key ->
+## Time.get_ticks_msec(). A record of one coming meanwhile (a snapshot or `upd` read before the mining)
+## is left out; its `del` ends that, or MINED_EARLY_MSEC.
+var _mined_early := {}
+const MINED_EARLY_MSEC := 3000
 var _unloaded: Array = []  # ChunkViews no longer wanted, still to free
 var _dirty_terrain := {}
 var _terrain_jobs := {}  # Vector2i -> [task id, TerrainMesher, ChunkView, signature, own signature]
@@ -180,6 +238,18 @@ func _prof(key: String, t0: int) -> void:
 		prof[key] = int(prof.get(key, 0)) + Time.get_ticks_usec() - t0
 
 
+## Processes after every other script of the frame (the highest process_priority): the frame
+## budget's measure of the frame's other scripts ends here (frame_budget.gd measure_frame).
+class FrameEnd extends Node:
+	const Budget := preload("res://scripts/world/frame_budget.gd")
+
+	func _init() -> void:
+		process_priority = 1 << 20
+
+	func _process(_delta: float) -> void:
+		Budget.frame_end()
+
+
 func _ready() -> void:
 	Bridge.resync_chunks = resync_list
 	animator.name = "Animator"
@@ -188,6 +258,13 @@ func _ready() -> void:
 	far_chunks.name = "FarChunks"
 	far_chunks.world = self
 	add_child(far_chunks)
+	behind_cull.world = self
+	add_child(behind_cull)
+	var frame_end := FrameEnd.new()
+	frame_end.name = "FrameEnd"
+	add_child(frame_end)
+	PipelineWarm.attach(self)
+	Bridge.welcomed.connect(_on_welcome)
 	if "--terrain-probe" in OS.get_cmdline_user_args():
 		var probe: Node = preload("res://scripts/debug/terrain_probe.gd").new()
 		probe.world = self
@@ -223,7 +300,16 @@ func reset(keep_protos := false, next_surface := -1) -> void:
 		cv.retire()
 		_unloaded.append(cv)
 	chunks.clear()
+	behind_cull.reset()
+	_lod_fades.clear()
+	_lod_now.clear()
+	for band: LodBand in _lod_bands:
+		band.ring = -1
+	_lod_far = []
+	_live.clear()
+	_warm.clear()
 	entities.clear()
+	_mined_early.clear()
 	_ghosts.clear()
 	_tile_ghosts.clear()
 	_pipes.clear()
@@ -236,11 +322,16 @@ func reset(keep_protos := false, next_surface := -1) -> void:
 	_cargo_left.clear()
 	_remnants.clear()
 	working.clear()
+	lamp_colors.clear()
+	lamp_always.clear()
+	alt_contents.clear()  # the bridge sends every chest again with the new world
+	alt_machines.clear()
 	_stated.clear()
 	animator.reset()
 	if not keep_protos:
 		protos.clear()
 		_cache.clear()  # another game, or its prototype ids: nothing kept is valid
+		_cache_bytes = 0
 		_terrain_cache.clear()
 		TerrainTextures.forget_surfaces()
 	_filling.clear()
@@ -308,22 +399,57 @@ func handle(msg: Dictionary) -> void:
 			for rec in _array(msg.get("e")):
 				_add(rec)
 		"add", "upd":
-			_add(msg.get("e"))
+			var e = msg.get("e")
+			if e is Array and e.size() >= 4:
+				_touch(chunk_of(Vector2(int(e[2]), int(e[3])) / 256.0))
+			if str(msg.get("t", "")) == "add" and VisualTurns.expecting():
+				_claim_turn(e)
+			_add(e)
 			if str(msg.get("t", "")) == "add":
-				_clear_remnants_under(msg.get("e"))
+				_clear_remnants_under(e)
 		"del":
 			var unit := int(msg.get("u", 0))
+			var key = unit
 			if unit > 0:
-				_remove(unit)
+				VisualTurns.forget(Bridge.save_id, unit)  # mined or destroyed: a look-only turn goes too (I9)
 			else:
-				_remove(static_key(int(msg.get("p", 0)), int(msg.get("x", 0)), int(msg.get("y", 0))))
+				key = static_key(int(msg.get("p", 0)), int(msg.get("x", 0)), int(msg.get("y", 0)))
+			var gone: Rec = entities.get(key)
+			if gone != null:
+				_touch(gone.chunk)
+			elif unit <= 0:
+				_touch(chunk_of(Vector2(int(msg.get("x", 0)), int(msg.get("y", 0))) / 256.0))
+			_remove(key)
+			_mined_early.erase(key)
 		"tiles":
 			_on_tiles(_array(msg.get("l")))
+		"kept":
+			_on_kept(msg)
 		"st":
-			_on_states(_array(msg.get("l")))
+			_on_states(_array(msg.get("l")), _array(msg.get("lc")), _array(msg.get("ao")))
 		"aiu":
 			_on_alt_icons(_array(msg.get("l")))
 			_on_alt_fluids(_array(msg.get("fa")))
+		"ac":
+			_on_alt_contents(msg)
+		"am":
+			_on_alt_machines(msg)
+
+
+## J20: the bridge's `mnd`, the tick the character's mining took an entity: it goes now (`g` 1), as
+## its `del` will take it (fx.gd has played its sound already). Nothing for ore still there or an item on
+## the ground (ground_items.gd hides that itself).
+func mined(msg: Dictionary) -> void:
+	if int(msg.get("g", 0)) != 1 or int(msg.get("gi", 0)) == 1:
+		return
+	var unit := int(msg.get("u", 0))
+	var key = unit if unit > 0 else static_key(int(msg.get("p", 0)), int(msg.get("x", 0)), int(msg.get("y", 0)))
+	var gone: Rec = entities.get(key)
+	if gone == null:
+		return
+	_touch(gone.chunk)
+	_remove(key)
+	_mined_early[key] = Time.get_ticks_msec()
 
 
 ## A snapshot into the cache (a refresh of a kept chunk replaces it).
@@ -332,11 +458,65 @@ func _keep_chunk(msg: Dictionary) -> void:
 		return
 	var c := Vector2i(int(msg.get("cx", 0)), int(msg.get("cy", 0)))
 	var k := Vector3i(int(msg["rs"]), c.x, c.y)
-	_cache.erase(k)
-	_cache[k] = {"rv": int(msg["rv"]), "n": int(msg.get("n", 0)), "msgs": [msg], "dec": [], "msec": Time.get_ticks_msec()}
+	_cache_drop(k)
+	var bytes := 256 + _array(msg.get("tiles")).size() * 16
+	_cache[k] = {"rv": int(msg["rv"]), "n": int(msg.get("n", 0)), "msgs": [msg], "dec": [], "msec": Time.get_ticks_msec(),
+		"b": bytes, "db": 0}
+	_cache_bytes += bytes
 	_filling[c] = k
-	while _cache.size() > CACHE_CHUNKS:
-		_cache.erase(_cache.keys()[0])
+	_trim_cache()
+
+
+## A kept chunk out of the cache.
+func _cache_drop(k: Vector3i) -> void:
+	var entry: Dictionary = _cache.get(k, {})
+	if entry.is_empty():
+		return
+	_cache_bytes -= int(entry["b"]) + int(entry["db"])
+	_cache.erase(k)
+
+
+## The least recently used kept chunks dropped past CACHE_CHUNKS or CACHE_BYTES.
+func _trim_cache() -> void:
+	while _cache.size() > CACHE_CHUNKS or (_cache_bytes > CACHE_BYTES and _cache.size() > 1):
+		for oldest: Vector3i in _cache:
+			_cache_drop(oldest)
+			break
+
+
+## Something in chunk `c` changed (`add`, `upd`, `del`, `tiles`): its kept messages are no longer what
+## it looks like, so they aren't offered again, nor confirmed by `kept` (the drawn chunk still is).
+func _touch(c: Vector2i) -> void:
+	var entry: Dictionary = _cache.get(Vector3i(surface_index, c.x, c.y), {})
+	if not entry.is_empty():
+		entry["t"] = true
+
+
+## Whether a kept chunk has every `ents` part its `chunk` said.
+static func _cache_whole(entry: Dictionary) -> bool:
+	var msgs: Array = entry["msgs"]
+	return not msgs.is_empty() and msgs.size() == int((msgs[0] as Dictionary).get("parts", 1)) + 1
+
+
+## The bridge's counts for chunks that left the square (`kept`, hello `lv`): a chunk still drawn
+## (WARM_RINGS, held) now matches them, and so do its kept messages when nothing changed in it since
+## they came.
+func _on_kept(msg: Dictionary) -> void:
+	var rs := int(msg.get("rs", -1))
+	var l := _array(msg.get("l"))
+	var now := Time.get_ticks_msec()
+	for i in range(0, l.size() - 3, 4):
+		var c := Vector2i(int(l[i]), int(l[i + 1]))
+		var rv := int(l[i + 2])
+		var n := int(l[i + 3])
+		var cv: ChunkView = chunks.get(c)
+		if cv != null and cv.loaded and not cv.is_incomplete():
+			_live[c] = [rs, rv, n]
+		var entry: Dictionary = _cache.get(Vector3i(rs, c.x, c.y), {})
+		if not entry.is_empty() and not entry.get("t", false) and _cache_whole(entry):
+			entry["rv"] = rv
+			entry["n"] = n
+			entry["msec"] = now
 
 
 ## One of a kept chunk's ents or dec messages, after its `chunk`.
@@ -349,7 +529,14 @@ func _keep_part(msg: Dictionary, list: String) -> void:
 		return
 	if list == "dec" and int(msg.get("part", 1)) == 1:
 		entry["dec"] = []  # decoratives sent again (changed): the new ones replace them
+		_cache_bytes -= int(entry["db"])
+		entry["db"] = 0
 	(entry[list] as Array).append(msg)
+	var field := "b" if list == "msgs" else "db"
+	var bytes := 128 + (_array(msg.get("e")).size() * 120 if list == "msgs" else _array(msg.get("l")).size() * 16)
+	entry[field] = int(entry[field]) + bytes
+	_cache_bytes += bytes
+	_trim_cache()
 
 
 ## main.gd: a `dec` message, kept with its chunk.
@@ -361,8 +548,19 @@ func keep_dec(msg: Dictionary) -> void:
 ## it is asked for again.
 func _on_same(msg: Dictionary) -> void:
 	var c := Vector2i(int(msg.get("cx", 0)), int(msg.get("cy", 0)))
-	var k := Vector3i(int(msg.get("rs", -1)), c.x, c.y)
+	var rs := int(msg.get("rs", -1))
+	var k := Vector3i(rs, c.x, c.y)
 	var entry: Dictionary = _cache.get(k, {})
+	# Still drawn as the bridge's counts say (the area cache, I18): nothing to replay or rebuild.
+	var cv: ChunkView = chunks.get(c)
+	var live: Array = _live.get(c, [])
+	if cv != null and cv.loaded and not cv.is_incomplete() and live.size() == 3 and int(live[0]) == rs \
+			and int(live[1]) == int(msg["same"]):
+		ChunkView.count("live_hit")
+		if not entry.is_empty():
+			_cache.erase(k)
+			_cache[k] = entry  # the newest again
+		return
 	if entry.is_empty() or int(entry["rv"]) != int(msg["same"]):
 		Bridge.send({"t": "resync", "c": [[c.x, c.y]]})
 		return
@@ -370,6 +568,19 @@ func _on_same(msg: Dictionary) -> void:
 	_cache.erase(k)
 	_cache[k] = entry  # the newest again
 	_filling[c] = k
+	var counts := [rs, int(msg["same"]), int(entry["n"])]
+	if queued_replay and Bridge.draining():
+		# Handled next, ahead of what came after `same`, the message slice stopping between them: a
+		# busy chunk's dozen kept messages took 10-15 ms handled here in one go (client-cpu.md 7).
+		var queue: Array = []
+		for m: Dictionary in entry["msgs"]:
+			queue.append([_replay_one, m])
+		if replay_dec.is_valid():
+			for m: Dictionary in entry["dec"]:
+				queue.append([replay_dec, m])
+		queue.append([_replayed.bind(c, counts), {}])
+		Bridge.requeue_front(queue)
+		return
 	_replaying = true
 	for m: Dictionary in entry["msgs"]:
 		handle(m)
@@ -377,14 +588,42 @@ func _on_same(msg: Dictionary) -> void:
 		for m: Dictionary in entry["dec"]:
 			replay_dec.call(m)
 	_replaying = false
+	_replayed({}, c, counts)
+
+
+## Kept chunks are replayed through Bridge's queue (`--kept-replay=inline`: inside `same`, as before).
+static var queued_replay := not OS.get_cmdline_user_args().has("--kept-replay=inline")
+
+
+## One of a kept chunk's messages, handled again (not kept again: it is the kept one).
+func _replay_one(m: Dictionary) -> void:
+	_replaying = true
+	handle(m)
+	_replaying = false
+
+
+## A kept chunk's messages are all handled again: it matches the bridge's counts.
+func _replayed(_msg: Dictionary, c: Vector2i, live: Array) -> void:
+	if chunks.has(c):
+		_live[c] = live
 
 
 ## [surface index, cx, cy, rv, n] for a chunk the cache has, fresh enough; empty otherwise.
 func _cached_offer(c: Vector2i) -> Array:
 	var entry: Dictionary = _cache.get(Vector3i(surface_index, c.x, c.y), {})
-	if entry.is_empty() or Time.get_ticks_msec() - int(entry["msec"]) > CACHE_AGE_MSEC:
+	if entry.is_empty() or entry.get("t", false) or Time.get_ticks_msec() - int(entry["msec"]) > CACHE_AGE_MSEC:
 		return []
 	return [surface_index, c.x, c.y, int(entry["rv"]), int(entry["n"])]
+
+
+## What to offer for a chunk asked for again: a chunk still drawn (WARM_RINGS, held) by the counts its
+## drawn copy matches (its snapshot's, or `kept`'s since), else its kept messages'.
+func _offer(c: Vector2i) -> Array:
+	var cv: ChunkView = chunks.get(c)
+	var live: Array = _live.get(c, [])
+	if cv != null and cv.loaded and not cv.is_incomplete() and live.size() == 3 and int(live[0]) == surface_index:
+		return [surface_index, c.x, c.y, int(live[1]), int(live[2])]
+	return _cached_offer(c)
 
 
 func _on_chunk(msg: Dictionary) -> void:
@@ -406,11 +645,18 @@ func _on_chunk(msg: Dictionary) -> void:
 	if not was_loaded:
 		last_arrival_msec = Time.get_ticks_msec()
 	if msg.get("none", false):
+		_live.erase(c)
 		cv.mark_missing()
 		cv.start_snapshot(0)
 	else:
+		if msg.has("rv") and msg.has("rs"):
+			_live[c] = [int(msg["rs"]), int(msg["rv"]), int(msg.get("n", 0))]
 		var rle := _array(msg.get("tiles"))
-		cv.set_tiles_rle(rle)
+		var ids: Variant = msg.get("_tiles")  # decoded on the bridge's parsing thread (message_decode.gd)
+		if ids is PackedInt32Array and (ids as PackedInt32Array).size() == CHUNK * CHUNK:
+			cv.set_tiles(ids)
+		else:
+			cv.set_tiles_rle(rle)
 		if cv.tiles_msec == 0:
 			cv.tiles_msec = Time.get_ticks_msec()
 		cv.start_snapshot(int(msg.get("parts", 1)))
@@ -421,11 +667,24 @@ func _on_chunk(msg: Dictionary) -> void:
 				TerrainTextures.lookup(protos.tile_names[id])
 				TerrainTextures.note(surface_index, protos.tile_names[id])
 	_dirty[c] = true
+	if track_latency and _wanted_at.has(c):
+		_lat_arrived[c] = true  # (--stutter-probe) it can be drawn from now on
 	# The mod resends every chunk now and then to heal losses; the ground rarely changed.
 	if was_loaded and cv.tile_ids == before:
 		return
 	_dirty_terrain[c] = true
 	_dirty_terrain_around(c)
+
+
+## K21: a new building the player sent turned in the build cursor, one Factorio can't turn (the
+## game put it down unturned), keeps the cursor's turn as a look-only one (visual_turns.gd), so
+## _add draws it turned from its first record on. Ghosts and buildings already here take none.
+func _claim_turn(a) -> void:
+	if not (a is Array) or a.size() < 5 or int(a[0]) <= 0 or entities.has(int(a[0])):
+		return
+	if a.size() > 5 and a[5] is Dictionary and ((a[5] as Dictionary).has("gh") or (a[5] as Dictionary).has("tg")):
+		return
+	VisualTurns.claim(Bridge.save_id, int(a[0]), int(a[1]), Vector2(int(a[2]), int(a[3])) / 256.0, int(a[4]))
 
 
 ## [unit, proto id, x, y, direction, extra?] with x, y in 1/256 tiles.
@@ -446,7 +705,14 @@ func _add(a) -> void:
 		var cliff = ModelLibrary.CLIFF_PIECES.get(str(r.extra.get("co", "")))
 		if cliff != null:
 			r.dir = int(cliff[1])
+	# A building turned in Zenith alone (I9, visual_turns.gd) stands turned whatever the game says.
+	if r.unit > 0 and VisualTurns.any(Bridge.save_id):
+		r.dir = posmod(r.dir + 4 * VisualTurns.quarters(Bridge.save_id, r.unit), 16)
 	r.key = r.unit if r.unit > 0 else static_key(r.proto_id, r.fixed.x, r.fixed.y)
+	if not _mined_early.is_empty() and _mined_early.has(r.key):
+		if Time.get_ticks_msec() - int(_mined_early[r.key]) < MINED_EARLY_MSEC:
+			return  # mined (`mnd`): this record was read before
+		_mined_early.erase(r.key)
 	r.chunk = chunk_of(r.pos)
 	var cv: ChunkView = chunks.get(r.chunk)
 	if cv == null:
@@ -510,6 +776,74 @@ func _on_alt_icons(list: Array) -> void:
 			cv.alt[r.key] = r
 
 
+## Chests whose Alt-mode contents changed (`ac`, J6): [unit, item, [more]?], or [unit] for none.
+## An answer to an earlier turning on of Alt-mode (or one while it is off) is dropped; the first
+## answer to a new one starts the list over.
+func _on_alt_contents(msg: Dictionary) -> void:
+	var g := int(msg.get("g", -1))
+	if g <= 0 or g != Bridge.alt_contents:
+		return
+	if g != _alt_contents_g:
+		_alt_contents_g = g
+		alt_contents.clear()
+	for row in _array(msg.get("l")):
+		if not (row is Array) or row.is_empty():
+			continue
+		var unit := int(row[0])
+		if row.size() < 2 or str(row[1]) == "":
+			alt_contents.erase(unit)
+			continue
+		var names: Array[String] = [str(row[1])]
+		if row.size() >= 3 and row[2] is Array:
+			for n in row[2]:
+				names.append(str(n))
+		alt_contents[unit] = names
+
+
+## Alt-mode's chest contents to draw now: {} while Alt-mode is off or before the bridge answered.
+func alt_contents_now() -> Dictionary:
+	return alt_contents if _alt_contents_g > 0 and _alt_contents_g == Bridge.alt_contents else {}
+
+
+## Machines whose modules or science packs changed (`am`, K1, K2): [unit, modules or 0, [packs]?],
+## or [unit] for none; each item a name or [name, quality]. Kept by `g` as `ac` is.
+func _on_alt_machines(msg: Dictionary) -> void:
+	var g := int(msg.get("g", -1))
+	if g <= 0 or g != Bridge.alt_contents:
+		return
+	if g != _alt_machines_g:
+		_alt_machines_g = g
+		alt_machines.clear()
+	for row in _array(msg.get("l")):
+		if not (row is Array) or row.is_empty():
+			continue
+		var unit := int(row[0])
+		var modules := _alt_items(row[1] if row.size() > 1 else null)
+		var packs := _alt_items(row[2] if row.size() > 2 else null)
+		if modules.is_empty() and packs.is_empty():
+			alt_machines.erase(unit)
+		else:
+			alt_machines[unit] = [modules, packs]
+
+
+## An `am` list as [[item, quality], ...] (quality "" for normal); [] for 0 or anything else.
+static func _alt_items(v: Variant) -> Array:
+	var out: Array = []
+	if not (v is Array):
+		return out
+	for it in v:
+		if it is Array and it.size() >= 2:
+			out.append([str(it[0]), str(it[1])])
+		elif it is String and it != "":
+			out.append([it, ""])
+	return out
+
+
+## Alt-mode's machine icons to draw now: {} while Alt-mode is off or before the bridge answered.
+func alt_machines_now() -> Dictionary:
+	return alt_machines if _alt_machines_g > 0 and _alt_machines_g == Bridge.alt_contents else {}
+
+
 ## A crafting machine's recipe's fluids changed (`aiu` fa: [unit, mask], 1 in, 2 out): Alt-mode's
 ## machine arrows (alt_arrows.gd) follow.
 func _on_alt_fluids(list: Array) -> void:
@@ -571,6 +905,10 @@ func _remove(key) -> void:
 	if r == null:
 		return
 	entities.erase(key)
+	if r.unit > 0 and not lamp_colors.is_empty():
+		lamp_colors.erase(r.unit)
+	if r.unit > 0 and not lamp_always.is_empty():
+		lamp_always.erase(r.unit)
 	if _same_key(_ghosts.get(r.fixed), key):
 		_ghosts.erase(r.fixed)
 	var tile := Vector2i(floori(r.pos.x), floori(r.pos.y))
@@ -639,8 +977,9 @@ const PIPE_STEPS := [Vector2i(0, -1), Vector2i(1, 0), Vector2i(0, 1), Vector2i(-
 
 ## Where a line of belts begins and ends, for a modeller's end pieces (ModelLibrary.belt_end_places):
 ## the record's `belt_ends`, per tile it stands on (two bits each: a splitter's halves are 1, 2 and 4, 8),
-## 1 for nothing feeding it from behind, 2 for nothing taking its items in front. Straight belts, splitters
-## and undergrounds' open ends (an entrance's back, an exit's front) get them; curves only their ends. Only
+## 1 for nothing feeding it from behind, 2 for nothing carrying its line on in front (nothing takes its
+## items, or it side-loads them onto another's side: belt_continues). Straight belts, splitters and
+## undergrounds' open ends (an entrance's back, an exit's front) get them; curves only their ends. Only
 ## worked out when such models exist: Zenith's own belts have none.
 const BELT_TYPES := ["transport-belt", "underground-belt", "linked-belt", "splitter", "lane-splitter", "loader", "loader-1x1"]
 ## The belt-like types that get end pieces (loaders feed and take, but have none).
@@ -699,10 +1038,11 @@ func _belt_fed(r: Rec, tile: Vector2i) -> bool:
 	return back != null and back != r and belt_feeds(r.dir, protos.entity(back.proto_id).type, back.dir, str(back.extra.get("u", "")))
 
 
-## Whether what stands on `tile` (in front of r) takes r's items.
+## Whether what stands on `tile` (in front of r) carries r's line on, so r has no end piece there.
 func _belt_taken(r: Rec, tile: Vector2i) -> bool:
 	var front: Rec = entities.get(_belts.get(tile, -1))
-	return front != null and front != r and belt_accepts(r.dir, protos.entity(front.proto_id).type, front.dir, str(front.extra.get("u", "")))
+	return front != null and front != r and belt_continues(r.dir, protos.entity(front.proto_id).type, front.dir,
+		str(front.extra.get("u", "")), str(front.extra.get("s", "s")))
 
 
 ## Whether something behind a belt going `dir` sends its items onto it.
@@ -712,17 +1052,24 @@ static func belt_feeds(dir: int, type: String, other_dir: int, end: String) -> b
 	return end == "o" if type == "underground-belt" or type == "linked-belt" else true
 
 
-## Whether something in front of a belt going `dir` takes its items: a belt unless head-on, an
-## underground from behind if it is an entrance or from the side, the rest from behind.
-static func belt_accepts(dir: int, type: String, other_dir: int, end: String) -> bool:
-	if other_dir == (dir + 8) % 16:
+## Whether something in front of a belt going `dir` carries its line on, so the belt ends there without
+## its end piece: from behind, a belt, a splitter, a loader or an underground's entrance (not an exit's
+## back); from the side, only a curve this belt makes (`shape` "l" is fed from the left as its items go,
+## "r" from the right). A belt facing into the side of a straight belt, of a curve fed from its other
+## side or of an underground side-loads: its items go on, but Factorio draws its ending sprite there (as
+## where nothing takes them), so it gets its end piece. Head-on, nothing.
+static func belt_continues(dir: int, type: String, other_dir: int, end: String, shape := "s") -> bool:
+	if other_dir == dir:
+		if type == "underground-belt" or type == "linked-belt":
+			return end != "o"
+		return true
+	if type != "transport-belt":
 		return false
-	match type:
-		"transport-belt":
-			return true
-		"underground-belt", "linked-belt":
-			return other_dir != dir or end != "o"
-	return other_dir == dir
+	if shape == "l":
+		return other_dir == (dir + 12) % 16
+	if shape == "r":
+		return other_dir == (dir + 4) % 16
+	return false
 
 
 func _is_pipe(r: Rec) -> bool:
@@ -907,11 +1254,15 @@ func cargo_mask(rect: Rect2i, ghosts := false) -> int:
 ## Flat [x, y, tile id, ...]
 func _on_tiles(list: Array) -> void:
 	var changed := {}
+	var touched := {}
 	var i := 0
 	while i + 2 < list.size():
 		var x := int(list[i])
 		var y := int(list[i + 1])
 		var c := Vector2i(floori(x / float(CHUNK)), floori(y / float(CHUNK)))
+		if not touched.has(c):
+			touched[c] = true
+			_touch(c)
 		var cv: ChunkView = chunks.get(c)
 		if cv != null:
 			var local := Vector2i(x - c.x * CHUNK, y - c.y * CHUNK)
@@ -951,14 +1302,21 @@ func _dirty_terrain_around(c: Vector2i) -> void:
 				_dirty_terrain[n] = true
 
 
-## Flat [unit, 0/1, ...]
-func _on_states(list: Array) -> void:
+## Flat [unit, 0/1, ...], lit lamps' colours `lc` [unit, 0xRRGGBB or -1, ...] (K10) and which of them
+## are set to Always on, `ao` [unit, 0/1, ...] (K20).
+func _on_states(list: Array, lc: Array = [], ao: Array = []) -> void:
+	var colored := not lamp_colors.is_empty()
+	var always := not lamp_always.is_empty()
 	var i := 0
 	while i + 1 < list.size():
 		var unit := int(list[i])
 		var state := int(list[i + 1])
 		var was: int = working.get(unit, -1)
 		working[unit] = state
+		if colored:
+			lamp_colors.erase(unit)
+		if always:
+			lamp_always.erase(unit)
 		# Models show the state through anim.gd; placeholders change colour, so rebuild.
 		var r: Rec = entities.get(unit)
 		if r != null:
@@ -974,6 +1332,21 @@ func _on_states(list: Array) -> void:
 						and not cv.set_belt_off(unit, state == Anim.SWITCHED_OFF) and state == Anim.SWITCHED_OFF \
 						and not r.extra.has("r") and not r.extra.has("g"):
 					_dirty[r.chunk] = true
+		i += 2
+	i = 0
+	while i + 1 < lc.size():
+		var col := int(lc[i + 1])
+		if col < 0:
+			lamp_colors.erase(int(lc[i]))
+		else:
+			lamp_colors[int(lc[i])] = col
+		i += 2
+	i = 0
+	while i + 1 < ao.size():
+		if int(ao[i + 1]) == 1:
+			lamp_always[int(ao[i])] = true
+		else:
+			lamp_always.erase(int(ao[i]))
 		i += 2
 
 
@@ -1037,6 +1410,10 @@ func _process(delta: float) -> void:
 	if Engine.get_process_frames() - _pick_frame > 1:
 		FrameBudget.waiting(&"pick", 0)
 	if not Bridge.world_ready:
+		if Bridge.connected and PipelineWarm.listed > 0:
+			# The save's models (pipeline_warm.gd) are read while the prototypes still come.
+			PipelineWarm.poll()
+			ModelLibrary.poll()
 		return
 	var t0 := Time.get_ticks_usec()
 	_update_subscription(delta)
@@ -1052,6 +1429,11 @@ func _process(delta: float) -> void:
 		for c in chunks:
 			var cv := chunks[c] as ChunkView
 			if cv.waiting_models or (cards_made and not cv.placeholder_keys.is_empty()):
+				_dirty[c] = true
+	if PipelineWarm.poll():
+		# Models left out while their pipelines compiled (pipeline_warm.gd) can be drawn now.
+		for c in chunks:
+			if (chunks[c] as ChunkView).waiting_models:
 				_dirty[c] = true
 	_prof("models_poll", t0)
 	_rebuild_dirty()
@@ -1078,38 +1460,94 @@ var _near_at := {}
 var track_latency := false
 var drawn_latency: Array = []
 var _wanted_at := {}  # Vector2i -> msec it was first wanted (while not drawn)
+## Of _wanted_at, the chunks that have arrived (the only ones that can be drawn): the 50 ms look
+## walks these, not all of _wanted_at. At view distance 50 that held ~9,500 chunks not asked for yet,
+## and walking them every 50 ms was 2.8 ms in one frame in five, inside the very numbers the probe
+## reports (client-cpu.md 4).
+var _lat_arrived := {}
 var _latency_timer := 0.0
 var _latency_center := Vector2i(0x7fffffff, 0)
+var _latency_radius := -1
 
 
 func _track_latency(delta: float) -> void:
 	var now := Time.get_ticks_msec()
-	if _wanted_center != _latency_center:
+	if _wanted_center != _latency_center or _wanted_radius != _latency_radius:
+		var was := _latency_center
+		var whole := _wanted_radius >= 0 and _wanted.size() == (2 * _wanted_radius + 1) * (2 * _wanted_radius + 1) \
+			and _sq_center == _wanted_center and _sq_radius == _wanted_radius and not _cover_seen.is_valid()
+		if whole and _latency_radius == _wanted_radius and was.x != 0x7fffffff \
+				and maxi(absi(was.x - _wanted_center.x), absi(was.y - _wanted_center.y)) <= _wanted_radius:
+			# Walking: only the rows and columns the square gained and lost (about 101 a chunk crossed).
+			_latency_strip(_wanted_center, was, _wanted_radius, now, true)
+			_latency_strip(was, _wanted_center, _wanted_radius, now, false)
+		else:
+			var wanted := {}
+			for c in _wanted:
+				wanted[c] = true
+				if not _wanted_at.has(c) and not _drawn(c):
+					_latency_want(c, now)
+			for c in _wanted_at.keys():
+				if not wanted.has(c):
+					_latency_drop(c)  # left the square before it was drawn
 		_latency_center = _wanted_center
-		var wanted := {}
-		for c in _wanted:
-			wanted[c] = true
-			if not _wanted_at.has(c) and not _drawn(c):
-				_wanted_at[c] = now
-		for c in _wanted_at.keys():
-			if not wanted.has(c):
-				_wanted_at.erase(c)  # left the square before it was drawn
-				_near_at.erase(c)
+		_latency_radius = _wanted_radius
 	_latency_timer += delta
 	if _latency_timer < 0.05:
 		return
 	_latency_timer = 0.0
-	near_undrawn = 0
-	for c: Vector2i in _wanted_at.keys():
-		var ring := maxi(absi(c.x - _wanted_center.x), absi(c.y - _wanted_center.y))
+	for c: Vector2i in _lat_arrived.keys():
 		if _drawn(c):
+			var ring := maxi(absi(c.x - _wanted_center.x), absi(c.y - _wanted_center.y))
 			drawn_latency.append([now - int(_wanted_at[c]), ring, now - int(_near_at[c]) if _near_at.has(c) else -1])
-			_wanted_at.erase(c)
-			_near_at.erase(c)
-		elif ring <= NEAR_RING:
-			near_undrawn += 1
-			if not _near_at.has(c):
-				_near_at[c] = now
+			_latency_drop(c)
+	near_undrawn = 0
+	for dy in range(-NEAR_RING, NEAR_RING + 1):
+		for dx in range(-NEAR_RING, NEAR_RING + 1):
+			var c := _wanted_center + Vector2i(dx, dy)
+			if _wanted_at.has(c):
+				near_undrawn += 1
+				if not _near_at.has(c):
+					_near_at[c] = now
+
+
+## A chunk wanted now and not drawn: timed from `now`.
+func _latency_want(c: Vector2i, now: int) -> void:
+	_wanted_at[c] = now
+	var cv: ChunkView = chunks.get(c)
+	if cv != null and cv.loaded:
+		_lat_arrived[c] = true  # kept past the square, or arrived and not built yet
+
+
+func _latency_drop(c: Vector2i) -> void:
+	_wanted_at.erase(c)
+	_near_at.erase(c)
+	_lat_arrived.erase(c)
+
+
+## The chunks of the square `radius` round `center` outside the one round `other`: newly wanted
+## (`add`), or no longer (not `add`).
+func _latency_strip(center: Vector2i, other: Vector2i, radius: int, now: int, add: bool) -> void:
+	var x0 := center.x - radius
+	var x1 := center.x + radius
+	for y in range(center.y - radius, center.y + radius + 1):
+		if absi(y - other.y) > radius:
+			for x in range(x0, x1 + 1):
+				_latency_cell(Vector2i(x, y), now, add)
+			continue
+		# A row both squares share: only its ends past the other square's columns.
+		for x in range(x0, mini(x1, other.x - radius - 1) + 1):
+			_latency_cell(Vector2i(x, y), now, add)
+		for x in range(maxi(x0, other.x + radius + 1), x1 + 1):
+			_latency_cell(Vector2i(x, y), now, add)
+
+
+func _latency_cell(c: Vector2i, now: int, add: bool) -> void:
+	if not add:
+		if _wanted_at.has(c):
+			_latency_drop(c)
+	elif not _wanted_at.has(c) and not _drawn(c):
+		_latency_want(c, now)
 
 
 func undrawn() -> int:
@@ -1218,6 +1656,13 @@ var _asked := {}  # _subscribed as a set
 var _cache := {}
 var _filling := {}
 var _replaying := false
+var _cache_bytes := 0  # the cache's estimated size (CACHE_BYTES)
+## Chunk -> [surface index, rv, n]: the bridge's counts the chunk as drawn matches (its snapshot's,
+## `same`'s, or `kept`'s once it left the square). Deltas don't change it: a chunk that got some while
+## subscribed matches only what `kept` says when it leaves.
+var _live := {}
+## Chunks kept built and drawn after leaving the square (WARM_RINGS): Vector2i -> msec they left.
+var _warm := {}
 ## The surface the bridge streams (welcome and surface `si`, set by main.gd): chunks offered from the cache.
 var surface_index := -1
 ## Replays a cached `dec` message (main.gd: decoratives.handle).
@@ -1234,6 +1679,48 @@ const MAX_VIEW_RADIUS := 50
 const LIST_MAX := 625
 var _wanted_most := 0
 var _wanted_moved := false  # _wanted changed since the last step
+var _wanted_sector := -1  # the view direction _wanted was ordered for (SECTORS; -1 none)
+var _wanted_f := Vector2i.ZERO  # its sector_vector (none: zero)
+var _sent_sector := -1  # and the one the last `sub` said (`f`)
+var _view_on := false  # the camera looks far enough sideways for a direction (VIEW_FLAT_ON, VIEW_FLAT_OFF)
+var _vel := Vector2.ZERO  # the focus's speed, smoothed (tiles a second)
+var _vel_from := Vector2(INF, INF)
+
+
+## The view's direction as a sector (SECTORS; -1 for none): where the camera looks on the ground,
+## turned towards where the focus moves, kept until it turns SECTOR_SLACK of a sector past the
+## sector's edge. None while a screenshot's cover is on (its own order) or looking straight down.
+func _view_sector(delta: float) -> int:
+	if _vel_from.x != INF and delta > 0.0:
+		var v := (_focus - _vel_from) / delta
+		if v.length() < 120.0:  # faster is a jump
+			_vel = _vel.lerp(v, clampf(delta * 4.0, 0.0, 1.0))
+	_vel_from = _focus
+	if has_cover() or _shot_built:
+		return -1
+	var d := Vector2.ZERO
+	var cam := get_viewport().get_camera_3d() if is_inside_tree() else null
+	if cam != null:
+		var fwd := -cam.global_transform.basis.z
+		var flat := Vector2(fwd.x, fwd.z)
+		_view_on = flat.length() > (VIEW_FLAT_OFF if _view_on else VIEW_FLAT_ON)
+		if _view_on:
+			d = flat.normalized()
+	if _vel.length() > MOVING_SPEED:
+		d += _vel.normalized()
+	if d.length() < 0.2:
+		return -1
+	var a := d.angle()
+	var step := TAU / SECTORS
+	if _wanted_sector >= 0 and absf(angle_difference(_wanted_sector * step, a)) <= step * (0.5 + SECTOR_SLACK):
+		return _wanted_sector
+	return posmod(roundi(a / step), SECTORS)
+
+
+## Where a chunk stands in line to be built (smaller first): its view distance from `center`, and
+## after every chunk in view when it is hidden behind the camera (behind_cull.gd).
+func _build_rank(c: Vector2i, center: Vector2i) -> int:
+	return distance_along(c - center, _wanted_f) + (1 << 30 if behind_cull.hidden(c) else 0)
 
 ## api.world.hold_chunks: chunks the view leaves stay drawn as they were last sent (the bridge no
 ## longer updates them), so a screenshot or a flight shows everything streamed so far. Only chunks
@@ -1275,9 +1762,65 @@ func _leave(c: Vector2i) -> void:
 	var cv: ChunkView = chunks[c]
 	if hold and cv.loaded and not cv.is_incomplete():
 		_held[c] = true
-	else:
-		_held.erase(c)
-		_unload(c)
+		return
+	_held.erase(c)
+	# The area cache (WARM_RINGS); not while a screenshot's subscription is held (it lets go as before).
+	if cv.loaded and not cv.is_incomplete() and not _shot_built and not has_cover() and _warm_limit() > 0 \
+			and _past_square(c) <= WARM_RINGS:
+		_warm[c] = Time.get_ticks_msec()
+		return
+	_unload(c)
+
+
+## How many chunks chunk `c` lies past the square sent (0 or less: inside it).
+func _past_square(c: Vector2i) -> int:
+	return maxi(absi(c.x - _sq_center.x), absi(c.y - _sq_center.y)) - _sq_radius
+
+
+## How many chunks may be kept past the square now (WARM_MAX, HOLD_TOTAL; memory aside).
+func _warm_limit() -> int:
+	if WARM_RINGS <= 0:
+		return 0
+	return mini(WARM_MAX, maxi(0, HOLD_TOTAL - _wanted.size() - _held.size()))
+
+
+## Lets kept chunks go: those now more than WARM_RINGS past the square, then past the limit (fewer
+## with under hold_min_free of memory) those behind the camera first, the least recently left first.
+func _cap_warm() -> void:
+	for c: Vector2i in _warm.keys():
+		if _past_square(c) > WARM_RINGS or not chunks.has(c):
+			_warm.erase(c)
+			if chunks.has(c):
+				_unload(c)
+	var limit := _warm_limit()
+	var free := int(OS.get_memory_info().get("available", -1))
+	if free >= 0 and free < hold_min_free:
+		limit = mini(limit, int(_warm.size() * 0.75))
+	if _warm.size() <= limit:
+		return
+	var order: Array = _warm.keys()
+	var first_out := func(a: Vector2i, b: Vector2i) -> bool:
+		var ha: bool = behind_cull.hidden(a)
+		if ha != behind_cull.hidden(b):
+			return ha
+		return int(_warm[a]) < int(_warm[b])
+	order.sort_custom(first_out)
+	for i in _warm.size() - limit:
+		var c: Vector2i = order[i]
+		_warm.erase(c)
+		if chunks.has(c):
+			_unload(c)
+
+
+## How far chunks may be loaded round the square's middle, in chunks (behind_cull.gd).
+func loaded_reach() -> int:
+	return _sq_radius + WARM_RINGS + 1
+
+
+## The ground whose casters can throw a shadow into the view, when the sun casts any (behind_cull.gd
+## keeps it drawn).
+func shadow_outline() -> PackedVector2Array:
+	return _shadow_hull if _shadow_on else PackedVector2Array()
 
 
 ## How many chunks may be held now (HOLD_MAX_CHUNKS, HOLD_TOTAL; memory aside).
@@ -1537,6 +2080,58 @@ static func ring_order(radius: int) -> Array:
 	return order
 
 
+## The view direction of a sector (SECTORS round, 0 east, clockwise on the map as Factorio's y grows
+## south) as integers about 256 long: `sub` f, and prio_order's.
+static func sector_vector(sector: int) -> Vector2i:
+	var a := sector * TAU / SECTORS
+	return Vector2i(roundi(cos(a) * 256.0), roundi(sin(a) * 256.0))
+
+
+## A chunk's distance from the middle for the wanted order, in chunks squared: behind the view
+## (`sector`, -1 for none) it counts as further away, up to twice straight behind (BEHIND, as
+## world.lua's rank_of).
+static func view_distance(d: Vector2i, sector: int) -> int:
+	return distance_along(d, sector_vector(sector) if sector >= 0 else Vector2i.ZERO)
+
+
+## view_distance with the sector's vector (`f`, Vector2i.ZERO for none) worked out already.
+static func distance_along(d: Vector2i, f: Vector2i) -> int:
+	var m := d.length_squared() * 65536
+	var dot := d.x * f.x + d.y * f.y
+	if dot < 0:
+		m += BEHIND * dot * dot
+	return m >> 16
+
+
+## ring_order for a view direction (I18): the same offsets, by view_distance (then row by row), so the
+## chunks the camera looks at and the focus moves towards are asked for and built first. Bucketed like
+## ring_order, made once per radius and sector.
+static var _prio_orders := {}
+
+
+static func prio_order(radius: int, sector: int) -> Array:
+	if sector < 0:
+		return ring_order(radius)
+	var key := radius * SECTORS + sector
+	var order: Array = _prio_orders.get(key, [])
+	if not order.is_empty():
+		return order
+	var buckets := {}
+	var f := sector_vector(sector)
+	for dy in range(-radius, radius + 1):
+		for dx in range(-radius, radius + 1):
+			var d := distance_along(Vector2i(dx, dy), f)
+			if not buckets.has(d):
+				buckets[d] = []
+			(buckets[d] as Array).append(Vector2i(dx, dy))
+	var distances: Array = buckets.keys()
+	distances.sort()
+	for d in distances:
+		order.append_array(buckets[d])
+	_prio_orders[key] = order
+	return order
+
+
 ## The subscription as `sub` carries it (docs/PROTOCOL.md, world.lua subscribe_square): per row of
 ## the square `radius` round `center` that has any of `list`, the row's chunk y, then runs of [first
 ## chunk x, count]. A list of 10,201 chunks (view distance 50) was about 120 KB, more than a
@@ -1578,6 +2173,7 @@ func _update_subscription(delta: float) -> void:
 		else:
 			_wanted_moved = true  # let go: the next step unloads them
 	var center := chunk_of(_focus)
+	var sector := _view_sector(delta)
 	# A bridge from before square subscriptions takes a list of its nearest LIST_MAX; a later one a
 	# square out to its welcome's `sq`.
 	var square := Bridge.square_subs > 0
@@ -1585,7 +2181,7 @@ func _update_subscription(delta: float) -> void:
 	var most := MAX_SUBSCRIPTIONS if square else LIST_MAX
 	# The wanted list only changes with the focus's chunk, the view radius, what the bridge takes or
 	# a screenshot's cover; while a shot's is worked out, with nothing until it ends (set_cover).
-	var changed := center != _wanted_center or radius != _wanted_radius or most != _wanted_most
+	var changed := center != _wanted_center or radius != _wanted_radius or most != _wanted_most or sector != _wanted_sector
 	if (changed and not _shot_built) or _cover_gen != _wanted_cover_gen:
 		# Walking into the next chunks; a jump (a teleport, another surface, a factory building's
 		# door) has nothing of its new square yet and loads it as a standing start does.
@@ -1598,13 +2194,15 @@ func _update_subscription(delta: float) -> void:
 		_wanted_radius = radius
 		_wanted_most = most
 		_wanted_cover_gen = _cover_gen
+		_wanted_sector = sector
+		_wanted_f = sector_vector(sector) if sector >= 0 else Vector2i.ZERO
 		_wanted = []
 		_sq_center = center
 		_sq_radius = radius
 		if _cover_seen.is_valid():
 			_build_shot(center, radius, most, square)
 		else:
-			for offset: Vector2i in ring_order(radius):
+			for offset: Vector2i in prio_order(radius, sector):
 				if _wanted.size() >= most:
 					break
 				_wanted.append(center + offset)
@@ -1629,6 +2227,7 @@ func _update_subscription(delta: float) -> void:
 	if not (_wanted_moved or refresh or (_coming.size() < allowed and _subscribed.size() < _wanted.size())):
 		return
 	_wanted_moved = false
+	var was_asked := _asked
 	# One pass in the wanted list's order, so the list comes out nearest first (the mod sends
 	# chunks in this order).
 	var list: Array = []
@@ -1638,12 +2237,13 @@ func _update_subscription(delta: float) -> void:
 		if _asked.has(c):
 			list.append(c)
 			keep[c] = true
-		elif _held.has(c) and chunks.has(c):
-			# Held (hold_chunks) and wanted again (a screenshot's cover reaching it): asked for at once,
-			# drawn meanwhile, not let go by the held chunks' cap. The cache answers it cheaply.
+		elif (_held.has(c) or _warm.has(c)) and chunks.has(c):
+			# Held (hold_chunks) or kept past the square (the area cache, WARM_RINGS) and wanted again:
+			# asked for at once, drawn meanwhile, not let go by the held chunks' cap. Offered by the
+			# counts its drawn copy matches, it is answered `same` with nothing to rebuild.
 			list.append(c)
 			keep[c] = true
-			var kept := _cached_offer(c)
+			var kept := _offer(c)
 			if not kept.is_empty():
 				have.append(kept)
 			if _shot_left.has(c):
@@ -1664,27 +2264,47 @@ func _update_subscription(delta: float) -> void:
 				ChunkView.count("new_chunk")
 				add_child(cv)
 				chunks[c] = cv
+				behind_cull.added(c, cv)
 	# Chunks no longer wanted leave at once; their records and nodes go over the next frames
 	# (_free_unloaded). Held ones (hold_chunks) stay.
 	for c in chunks.keys():
 		if keep.has(c):
 			_held.erase(c)
+			_warm.erase(c)
+		elif _warm.has(c):
+			pass  # kept past the square (_cap_warm lets it go)
 		elif not _held.has(c) or not hold:
 			_leave(c)
 	if not _held.is_empty():
 		_cap_held()
+	if not _warm.is_empty():
+		_cap_warm()
 	for c in _coming.keys():
 		if not keep.has(c):
 			_coming.erase(c)
 	_asked = keep
-	if refresh or list != _subscribed:
+	# A square is sent as rows (no order), so a list only put in another order (the view turned) is
+	# the same square; its direction goes with it (`f`), and a new one is sent.
+	var differs := list != _subscribed
+	if square and differs and list.size() == _subscribed.size():
+		differs = false
+		for c in list:
+			if not was_asked.has(c):
+				differs = true
+				break
+	var sector_sent := sector if square and not _shot_built and not _cover_seen.is_valid() else -1
+	if refresh or differs or sector_sent != _sent_sector:
 		_sub_timer = 0.0
 		_subscribed = list
+		_sent_sector = sector_sent
 		var sub := {"t": "sub"}
 		if square:
 			sub["o"] = [_sq_center.x, _sq_center.y]
 			sub["r"] = _sq_radius
 			sub["w"] = square_rows(_sq_center, _sq_radius, list)
+			if sector_sent >= 0:
+				var f := sector_vector(sector_sent)
+				sub["f"] = [f.x, f.y]
 		else:
 			var out: Array = []
 			for c in list:
@@ -1700,12 +2320,22 @@ func _update_subscription(delta: float) -> void:
 ## frame or two, and a whole view of them waited 0.15 s for every 32 (2 s back from a factory).
 func _all_came() -> bool:
 	var moving := Time.get_ticks_msec() - _moved_msec < MOVING_FOR * 1000.0
-	if moving or _stream_timer < STREAM_STEP_QUICK or _subscribed.size() >= _wanted.size():
+	if _stream_timer < (STREAM_STEP * 0.5 if moving else STREAM_STEP_QUICK) or _subscribed.size() >= _wanted.size():
 		return false
+	# Moving (I18): the next ones as soon as half of those on their way are drawn, so a run at a long
+	# view distance doesn't wait out the whole step with the bridge idle; never all of a row at once.
+	var waiting := 0
 	for c in _coming:
 		if not _drawn(c):
-			return false
+			waiting += 1
+			if not moving or waiting * 2 > STREAM_MOVING:
+				return false
 	return true
+
+
+## A ghost's record got or lost `hid` (predicted.gd): drawn so at once.
+func hide_record(r: Rec) -> void:
+	ghost_hidden.emit(r.chunk)
 
 
 ## Builds a chunk's entities again (far_chunks.gd, when it swaps between merged and full).
@@ -1727,6 +2357,9 @@ func _unload(c: Vector2i) -> void:
 	var cv: ChunkView = chunks[c]
 	ChunkView.count("unload")
 	chunks.erase(c)
+	_live.erase(c)
+	_warm.erase(c)
+	behind_cull.removed(c)
 	_dirty.erase(c)
 	_pending.erase(c)
 	_partial.erase(c)
@@ -1800,6 +2433,14 @@ func _free_unloaded() -> void:
 
 ## How much streaming work waits (for --stutter-probe): chunks part-way through a build, chunks
 ## whose shadow settings are still to be set, unloaded chunks' records still to go.
+## The subscription as last sent (the debug menu's update overlays): the square's middle chunk and reach, its
+## chunks in the order asked for (the view's direction first), those on their way (asked, not drawn yet), and
+## the view's direction the `sub` carried (`f`; zero for none). Read only.
+func subscription() -> Dictionary:
+	return {"center": _sq_center, "radius": _sq_radius, "list": _subscribed, "coming": _coming,
+		"f": sector_vector(_sent_sector) if _sent_sector >= 0 else Vector2i.ZERO}
+
+
 func stream_queues() -> Dictionary:
 	var records := 0
 	for job: Array in _unload_keys.values():
@@ -1878,7 +2519,8 @@ func _rebuild_dirty() -> void:
 		return
 	# Made only when there is something to build (it was made every frame).
 	var center := chunk_of(_focus)
-	var nearer := func(a: Vector2i, b: Vector2i) -> bool: return (a - center).length_squared() < (b - center).length_squared()
+	# Nearest first, those the view looks at before those behind it, hidden ones last (I18).
+	var nearer := func(a: Vector2i, b: Vector2i) -> bool: return _build_rank(a, center) < _build_rank(b, center)
 	# Chunks already built go on adding what they left for later first, nearest first.
 	if not _pending.is_empty():
 		tp = Time.get_ticks_usec()
@@ -1890,6 +2532,8 @@ func _rebuild_dirty() -> void:
 			var pcv: ChunkView = chunks.get(c)
 			if pcv != null and pcv.building:
 				continue
+			if pcv != null:
+				_lod_soon(c)  # its new MultiMeshes start at the model itself
 			if pcv == null or pcv.add_pending(working, animator, surfaces):
 				_pending.erase(c)
 		_prof("pending", tp)
@@ -1934,6 +2578,7 @@ func _rebuild_dirty() -> void:
 				_partial.erase(c)
 				_built(c, bcv, tb)
 	var waiting: Array = _dirty.keys()
+	var now := Time.get_ticks_msec()
 	if waiting.size() > budget:
 		# Nearest the focus first, so after a jump the buildings round the character come first.
 		waiting.sort_custom(nearer)
@@ -1947,6 +2592,8 @@ func _rebuild_dirty() -> void:
 		if cv != null:
 			if cv.building:
 				continue  # built again once the build part-way through is done (it stays dirty)
+			if whole_snapshots and cv.is_incomplete() and now - cv.snapshot_msec < PARTS_WAIT_MSEC:
+				continue  # more of its snapshot to come: built once, with the last part (it stays dirty)
 			var t0 := Time.get_ticks_usec()
 			# Stops part-way at the frame's deadline and carries on next frame (_partial).
 			cv.build_entities(protos, working, animator, surfaces, until)
@@ -1964,6 +2611,13 @@ func _rebuild_dirty() -> void:
 
 var _surfaces := ChunkView.Budget.new(NEW_SURFACES)
 var _partial := {}  # Vector2i -> true: chunks whose build stopped part-way (ChunkView.building)
+## A chunk's snapshot comes as its `chunk` and then `ents` parts of 120 records (world.lua
+## ENTITIES_PER_MESSAGE), each marking it dirty: a busy chunk of 13 parts was built up to 13 times,
+## each over everything come so far (client-cpu.md 3). It is built once its last part is in, or
+## after PARTS_WAIT_MSEC (a part lost on the way: the watchdog asks again after MISSING_CHUNK_MSEC,
+## and the chunk shouldn't stand empty meanwhile). `--build-parts=each` builds on every part again.
+const PARTS_WAIT_MSEC := 500
+static var whole_snapshots := not OS.get_cmdline_user_args().has("--build-parts=each")
 
 
 ## A chunk's build is done (started at `t0`, its last part this frame).
@@ -1972,6 +2626,7 @@ func _built(c: Vector2i, cv: ChunkView, t0: int) -> void:
 		_pending.erase(c)
 	else:
 		_pending[c] = true
+	_lod_soon(c)  # new MultiMeshes start at the model itself: their levels this frame
 	_prof("build", t0)
 	var te := Time.get_ticks_usec()
 	entities_changed.emit(c)
@@ -1993,13 +2648,13 @@ const SHADOW_SLACK := 4.0
 
 ## Each chunk picks its models' levels of detail (chunk_view.gd update_lods) for Settings > Graphics
 ## > Level of detail's pixels of error at the size of a pixel where the chunk is: in perspective a
-## pixel grows with distance (the field of view over the window's height), in an orthographic view
-## it is the same everywhere.
+## pixel grows with distance (the field of view over the window's height, counted on at most
+## ModelLods.max_lines), in an orthographic view it is the same everywhere.
 func _update_lods(delta: float) -> void:
 	var cam := get_viewport().get_camera_3d() if is_inside_tree() else null
 	if cam == null:
 		return
-	var height := maxf(get_viewport().get_visible_rect().size.y, 1.0)
+	var height := ModelLods.counted_lines(get_viewport().get_visible_rect().size.y)
 	var per_tile := -1.0
 	var flat := -1.0
 	if ModelLods.full_detail:
@@ -2009,9 +2664,21 @@ func _update_lods(delta: float) -> void:
 	else:
 		per_tile = ModelLods.lod_threshold * 2.0 * tan(deg_to_rad(cam.fov) * 0.5) / height
 	var at := cam.global_position
+	if lod_bands_on:
+		_update_lod_bands(at, per_tile, flat, delta)
+		return
+	_update_lods_every(at, per_tile, flat, delta)
+
+
+## The pass before the bands (`--lod-pass=every-frame`): every chunk every frame up to LOD_ALL, else
+## the LOD_NEAR_RINGS round the focus every frame and LOD_SLICE of the rest.
+func _update_lods_every(at: Vector3, per_tile: float, flat: float, delta: float) -> void:
 	if chunks.size() <= LOD_ALL:
 		for c in chunks:
-			(chunks[c] as ChunkView).update_lods(at, per_tile, flat, delta)
+			var lcv := chunks[c] as ChunkView
+			# Hidden behind the camera (I18): kept at their levels until shown, then cross-faded.
+			if lcv.visible or lcv.lod_fading():
+				lcv.update_lods(at, per_tile, flat, delta)
 		return
 	# A long view distance: the chunks round the focus every frame, the rest a slice a frame, each
 	# given the time since its last turn (a full round's frames) for its cross-fades.
@@ -2031,7 +2698,7 @@ func _update_lods(delta: float) -> void:
 		if not is_instance_valid(cv) or chunks.get(cv.coord) != cv:
 			continue
 		var c: Vector2i = cv.coord
-		if maxi(absi(c.x - center.x), absi(c.y - center.y)) > LOD_NEAR_RINGS:
+		if maxi(absi(c.x - center.x), absi(c.y - center.y)) > LOD_NEAR_RINGS and (cv.visible or cv.lod_fading()):
 			(cv as ChunkView).update_lods(at, per_tile, flat, round_delta)
 
 
@@ -2043,6 +2710,206 @@ const LOD_NEAR_RINGS := 12
 const LOD_SLICE := 1500
 var _lod_todo: Array = []
 var _lod_next := 0
+
+
+## Levels of detail by bands of rings round the camera's chunk (client-cpu.md 2). Every loaded chunk
+## every frame (or 2,125 a frame past LOD_ALL) was 1.2-1.4 ms of the main thread with nothing
+## changing, on laps and standing alike. A chunk only needs looking at once its allowed error could
+## have moved by LOD_LOOK_AGAIN: the camera moving that share of the chunk's distance, or the pixel's
+## size changing by it. So the two rings round the camera are looked at every frame, and each band
+## further out once the camera moved that share of the band's nearest distance since the band was
+## last looked at (near bands every few frames while walking, the far ones every few seconds),
+## its rings a slice at a time within the frame budget's `lods` system, nearest band first. Standing
+## still, nothing. Chunks cross-fading move on every frame, chunks just built or added to next to
+## nothing, and chunks shown again by behind_cull.gd switch without a fade (nothing on screen to
+## fade from). `--lod-pass=every-frame` runs the pass before this.
+const LOD_BANDS := [2, 3, 4, 6, 9, 13, 19, 28, 40, 58, 84]  # band k: rings [LOD_BANDS[k], LOD_BANDS[k + 1])
+## A model's levels being made changes ModelLods.level_generation (every chunk looks again): a band
+## starts again for it at most this often (dozens a second while joining).
+const LOD_GEN_MSEC := 250
+static var lod_bands_on := not OS.get_cmdline_user_args().has("--lod-pass=every-frame")
+
+
+class LodBand:
+	var lo := 0  # its rings: [lo, hi)
+	var hi := 0
+	var at := Vector3(INF, INF, INF)  # the camera when it was last started
+	var p := -1.0  # the tiles of error a tile (or flat) then
+	var ortho := false
+	var gen := -1  # ModelLods.level_generation then
+	var msec := -1000000
+	var ring := -1  # the ring to look at next (-1: nothing to do); the far band: its index in _lod_far
+	var center := Vector2i.ZERO  # the camera's chunk when it started
+	var again := false  # due again before it finished
+
+
+var _lod_bands: Array = []
+var _lod_fades := {}  # ChunkView -> true: cross-fading
+var _lod_now := {}  # Vector2i -> whether without a fade (shown again): looked at this frame
+var _lod_far: Array = []  # the far band's chunks (past the last band's rings), when it runs
+## Chunks looked at and microseconds spent this frame (for the UI test and probes).
+var lod_looked := 0
+var lod_usec := 0
+
+
+## behind_cull.gd (and remote_fog.gd) showed a chunk again: its levels, without a fade, next frame.
+func chunk_shown(c: Vector2i) -> void:
+	if lod_bands_on:
+		_lod_now[c] = true
+
+
+func _lod_soon(c: Vector2i) -> void:
+	if lod_bands_on and not _lod_now.has(c):
+		_lod_now[c] = false
+
+
+func _update_lod_bands(at: Vector3, per_tile: float, flat: float, delta: float) -> void:
+	var t0 := Time.get_ticks_usec()
+	lod_looked = 0
+	if _lod_bands.is_empty():
+		for k in LOD_BANDS.size():
+			var band := LodBand.new()
+			band.lo = LOD_BANDS[k]
+			band.hi = LOD_BANDS[k + 1] if k + 1 < LOD_BANDS.size() else 0x3fffffff
+			_lod_bands.append(band)
+	for cv in _lod_fades.keys():
+		if not is_instance_valid(cv) or chunks.get(cv.coord) != cv:
+			_lod_fades.erase(cv)
+			continue
+		cv.update_lods(at, per_tile, flat, delta)
+		if not cv.lod_fading():
+			_lod_fades.erase(cv)
+	var cam_chunk := chunk_of(Vector2(at.x, at.z))
+	for dy in range(-1, 2):
+		for dx in range(-1, 2):
+			_lod_cell(cam_chunk + Vector2i(dx, dy), at, per_tile, flat, false)
+	var ortho := flat >= 0.0
+	var p := flat if ortho else per_tile
+	var gen := ModelLods.level_generation
+	var now := Time.get_ticks_msec()
+	var high := maxf(at.y - ChunkView.LOD_HEIGHT, 0.0) if at.y > 0.0 else -at.y
+	# Rings past this hold no chunk: the square's reach round its middle, from the camera's chunk.
+	var reach := maxi(absi(cam_chunk.x - _sq_center.x), absi(cam_chunk.y - _sq_center.y)) + loaded_reach()
+	if not _held.is_empty():
+		reach = 0x3fffffff
+	var busy := 0
+	for band: LodBand in _lod_bands:
+		if band.lo > reach and band.ring < 0:
+			continue
+		if _lod_due(band, at, p, ortho, gen, now, high):
+			if band.ring < 0:
+				_lod_start(band, at, p, ortho, gen, now, cam_chunk)
+			else:
+				band.again = true
+		if band.ring >= 0:
+			busy += 1
+	if _lod_now.is_empty() and busy == 0:
+		lod_usec = Time.get_ticks_usec() - t0
+		FrameBudget.waiting(&"lods", 0)
+		return
+	# Under full detail (a screenshot) everything at once, as the pass before.
+	var allow := 0x3fffffff if ModelLods.full_detail else FrameBudget.grant(&"lods")
+	var t1 := Time.get_ticks_usec()
+	for c: Vector2i in _lod_now.keys():
+		if lod_looked > 0 and Time.get_ticks_usec() - t1 > allow:
+			break
+		var snap: bool = _lod_now[c]
+		_lod_now.erase(c)
+		_lod_cell(c, at, per_tile, flat, snap)
+	for band: LodBand in _lod_bands:
+		while band.ring >= 0:
+			if lod_looked > 0 and Time.get_ticks_usec() - t1 > allow:
+				break
+			if band.hi == 0x3fffffff:
+				_lod_far_step(band, at, per_tile, flat)
+			elif band.ring >= band.hi or band.ring > reach:
+				band.ring = -1
+			else:
+				_lod_ring(band.center, band.ring, at, per_tile, flat)
+				band.ring += 1
+			if band.ring < 0 and band.again:
+				_lod_start(band, at, p, ortho, gen, now, cam_chunk)
+	busy = 0
+	for band: LodBand in _lod_bands:
+		if band.ring >= 0:
+			busy += 1
+	lod_usec = Time.get_ticks_usec() - t0
+	FrameBudget.spent(&"lods", Time.get_ticks_usec() - t1, busy + _lod_now.size())
+
+
+## Whether a band's chunks may need other levels than when it was last started.
+func _lod_due(band: LodBand, at: Vector3, p: float, ortho: bool, gen: int, now: int, high: float) -> bool:
+	if band.ortho != ortho:
+		return true
+	if band.gen != gen and now - band.msec >= LOD_GEN_MSEC:
+		return true
+	var moved := 0.0
+	if band.p > 0.0:
+		moved = absf(p / band.p - 1.0)
+	elif p != band.p:
+		return true
+	if not ortho:
+		# The band's nearest point: (lo - 1) chunks off the camera's chunk, and the camera's height.
+		var flat_d := maxf(float(band.lo - 1) * CHUNK, 0.0)
+		moved += at.distance_to(band.at) / maxf(sqrt(flat_d * flat_d + high * high), 1.0)
+	return moved > ChunkView.LOD_LOOK_AGAIN
+
+
+func _lod_start(band: LodBand, at: Vector3, p: float, ortho: bool, gen: int, now: int, cam_chunk: Vector2i) -> void:
+	band.at = at
+	band.p = p
+	band.ortho = ortho
+	band.gen = gen
+	band.msec = now
+	band.center = cam_chunk
+	band.again = false
+	if band.hi == 0x3fffffff:
+		_lod_far = chunks.values()
+		band.ring = 0
+	else:
+		band.ring = band.lo
+
+
+## The chunks at ring `r` round `center` (the square's edge r chunks out).
+func _lod_ring(center: Vector2i, r: int, at: Vector3, per_tile: float, flat: float) -> void:
+	for dx in range(-r, r + 1):
+		_lod_cell(center + Vector2i(dx, -r), at, per_tile, flat, false)
+		_lod_cell(center + Vector2i(dx, r), at, per_tile, flat, false)
+	for dy in range(-r + 1, r):
+		_lod_cell(center + Vector2i(-r, dy), at, per_tile, flat, false)
+		_lod_cell(center + Vector2i(r, dy), at, per_tile, flat, false)
+
+
+## The far band: loaded chunks past the last band's rings (held ones), a slice of _lod_far at a time.
+func _lod_far_step(band: LodBand, at: Vector3, per_tile: float, flat: float) -> void:
+	var stop := mini(band.ring + 256, _lod_far.size())
+	while band.ring < stop:
+		var cv = _lod_far[band.ring]
+		band.ring += 1
+		if not is_instance_valid(cv) or chunks.get(cv.coord) != cv:
+			continue
+		var c: Vector2i = cv.coord
+		if maxi(absi(c.x - band.center.x), absi(c.y - band.center.y)) >= band.lo:
+			_lod_cell(c, at, per_tile, flat, false)
+	if band.ring >= _lod_far.size():
+		band.ring = -1
+		_lod_far = []
+
+
+func _lod_cell(c: Vector2i, at: Vector3, per_tile: float, flat: float, snap: bool) -> void:
+	var cv: ChunkView = chunks.get(c)
+	# Hidden behind the camera (I18): kept at their levels until shown (chunk_shown).
+	if cv == null or not cv.visible:
+		return
+	lod_looked += 1
+	if snap:
+		cv.lod_snap = true
+		cv.update_lods(at, per_tile, flat, 0.0)
+		cv.lod_snap = false
+	else:
+		cv.update_lods(at, per_tile, flat, 0.0)
+	if cv.lod_fading():
+		_lod_fades[cv] = true
 
 
 ## The sun's shadow map covers what the camera sees out to its max distance, but Godot draws every
@@ -2286,7 +3153,9 @@ func _start_terrain_jobs() -> void:
 		if _terrain_jobs.has(c):
 			continue  # again once the one running is done
 		var cv: ChunkView = chunks.get(c)
-		var rank := (c - center).length_squared() + (0 if cv == null or not cv.has_ground() else 10000)
+		# Chunks without ground first, then those with it, those hidden behind the camera after both (I18).
+		var rank := distance_along(c - center, _wanted_f) + (0 if cv == null or not cv.has_ground() else 10000) \
+			+ (20000 if behind_cull.hidden(c) else 0)
 		order.append([rank, c])
 	order.sort()
 	for entry in order:
@@ -2376,6 +3245,7 @@ func _finish_terrain_jobs() -> void:
 		var t1 := Time.get_ticks_usec()
 		cv.apply_terrain(job)
 		terrain_build_usec += Time.get_ticks_usec() - t1
+		_prof("terrain_apply", t1)
 		terrain_worker_usec += job.usec
 		terrain_builds += 1
 		_waiting_gfx.erase(c)
@@ -2402,6 +3272,40 @@ func _exit_tree() -> void:
 	_terrain_jobs.clear()
 	TerrainTextures.finish_all()
 	ModelLods.finish_all()
+	ModelLibrary.NatureLooks.finish_all()
+	PipelineWarm.flush()
+	set_joining(false)
+
+
+## The welcome: this save's models, asked for now (pipeline_warm.gd).
+func _on_welcome(msg: Dictionary) -> void:
+	PipelineWarm.on_welcome(str(msg.get("sid", "")))
+
+
+## Rings round the focus the join's loading screen waits for (front_end.gd).
+const JOIN_RINGS := 2
+
+
+## What the join's loading screen still waits for (front_end.gd): chunks within JOIN_RINGS of the
+## focus not drawn yet or drawn with models left out, and pipelines still compiling. Models being
+## read count too while any near chunk waits for one. 0: ready to play.
+func join_left() -> int:
+	var n := 0
+	var center := chunk_of(_focus)
+	for dy in range(-JOIN_RINGS, JOIN_RINGS + 1):
+		for dx in range(-JOIN_RINGS, JOIN_RINGS + 1):
+			var c := center + Vector2i(dx, dy)
+			var cv: ChunkView = chunks.get(c)
+			if cv == null or not _drawn(c) or cv.waiting_models:
+				n += 1
+	if n > 0:
+		n += ModelLibrary.pending_count()
+	return n + PipelineWarm.pending_count()
+
+
+## The join's loading screen is up: models are read on more threads meanwhile (nothing is drawn).
+func set_joining(on: bool) -> void:
+	ModelLibrary.load_jobs = maxi(ModelLibrary.LOAD_JOBS, OS.get_processor_count() - 2) if on else ModelLibrary.LOAD_JOBS
 
 
 ## The entity under a point on the ground (tiles), preferring the smallest selection box,
@@ -2434,7 +3338,7 @@ func pick(point: Vector2) -> Rec:
 			if (dx != 0 or dy != 0) and not Rect2(Vector2(cv.coord * CHUNK), Vector2(CHUNK, CHUNK)).grow(reach).has_point(point):
 				continue
 			for entry: Array in _pick_grid(cv).get(cell, []):
-				if (entry[1] as Rect2).has_point(point) and float(entry[2]) < best_area:
+				if (entry[1] as Rect2).has_point(point) and float(entry[2]) < best_area and not (entry[0] as Rec).extra.has("hid"):
 					best_area = entry[2]
 					best = entry[0]
 	return best

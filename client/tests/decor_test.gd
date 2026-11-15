@@ -178,11 +178,28 @@ func _ready() -> void:
 	await get_tree().process_frame
 	check(_instances(d) == 0 and d.count() == 0, "an unloaded chunk's decoratives go")
 
+	_stale_list_checks(dir)
 	await _grass_checks(d, world, dir)
 	await _mask_checks(dir)
 
 	print("decor test: %s" % ("all passed" if fails == 0 else "%d failed" % fails))
 	get_tree().quit(1 if fails > 0 else 0)
+
+
+## A build started before a new graphics list (mod_graphics.gd) finishes with the old list's pictures:
+## the Kind made from them is used again, not made a second time from their spent atlas (which logged
+## "Invalid image: null" and kept a Kind without a picture for the session); the new list's pictures
+## make their own.
+func _stale_list_checks(dir: String) -> void:
+	Decoratives._kind_data.erase("small-rock")
+	var old: Decoratives.KindData = Decoratives._kind_data_for("small-rock", dir)
+	var first: Decoratives.Kind = Decoratives._kind("small-rock", old)
+	Decoratives._kind_data.erase("small-rock")  # what a new list does (index())
+	var late: Decoratives.Kind = Decoratives._kind("small-rock", old)  # a build from before it, finishing now
+	var fresh: Decoratives.Kind = Decoratives._kind("small-rock", Decoratives._kind_data_for("small-rock", dir))
+	check(first != null and late == first and late.material.get_shader_parameter("atlas") is Texture2D
+		and fresh != null and fresh != first and fresh.material.get_shader_parameter("atlas") is Texture2D,
+		"a build from before a new graphics list keeps its own pictures; the new list's make their own")
 
 
 ## 3D grass: which decoratives rise, where a tuft's root is, the budget, the range.
@@ -313,7 +330,6 @@ func _real_meadow_checks(dir: String) -> void:
 		Decoratives._index[n] = {"layer": real[n]["layer"], "box": real[n]["box"],
 			"pics": [["base/graphics/decorative/blades.png", 0, 0, mini(int(pic[3]), 256), mini(int(pic[4]), 256), float(pic[5]), 0, 0]]}
 		Decoratives._kind_data.erase(n)
-		Decoratives._kinds.erase(n)
 		job.names[id] = n
 		for i in int(counts[n]):
 			job.list.append_array([id, (i * 7) % 32, (i * 13 / 32) % 32, 1])
@@ -394,7 +410,6 @@ func _mask_checks(dir: String) -> void:
 		"pics": [["base/graphics/decorative/tuft.png", 0, 0, 64, 32, 0.5, 0, 0]]}
 	for n: String in ["test-decal", "test-tuft-grass"]:
 		Decoratives._kind_data.erase(n)
-		Decoratives._kinds.erase(n)
 	var world := MaskWorld.new()
 	add_child(world)
 	world.protos.add_tiles([[1, "grass-1", 60, 90, 30], [2, "concrete", 120, 120, 120], [3, "fancy-tiles", 90, 90, 90]])

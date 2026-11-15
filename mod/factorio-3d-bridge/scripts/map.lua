@@ -15,8 +15,12 @@ local puppet = require("scripts.puppet")
 local tracker = require("scripts.tracker")
 local budget = require("scripts.budget")
 local profile = require("scripts.profile")
+local perf = require("scripts.perf")
 
 local M = {}
+
+-- What was sent, since loading (tests): `same` answers (chart_same).
+M.counts = { same = 0 }
 
 local CHUNK = 32
 local MAX_CHUNKS = 1024        -- per request; the nearest to its centre are kept
@@ -675,10 +679,26 @@ local function colour_index(sc, c)
   return i
 end
 
-local function send_chart(surface, own, cx, cy, n, hit)
+-- chart_same (perf.lua): each chart carries a stamp (`st`) of what its picture was made from: the chunk's
+-- change count (world.rev: every build, mine, rotation, death and tile change there), its entity count and the
+-- resolution. A client that holds pictures names their stamps in its request (`map` h), and a chunk whose stamp
+-- is still the same is answered with `same` (the live parts only: pollution, signals, robots) instead of the
+-- picture again; the cache keeps a picture until something touched the chunk or its count changed, not
+-- CHART_KEEP_TICKS, so the job finds it and reads nothing. The minimap asks for its whole area every few
+-- seconds: the picture remade every 30 s and sent again was most of what it cost.
+local RES_INDEX = { [2] = 0, [4] = 1, [8] = 2, [16] = 3, [32] = 4 }
+
+local function stamp_of(si, cx, cy, count, res)
+  local rv = world.rev(si, cx .. "," .. cy)
+  if rv >= 1073741824 or count >= 1048576 then
+    return nil -- (past what a double holds exactly)
+  end
+  return (rv * 1048576 + count) * 8 + (RES_INDEX[res] or 0)
+end
+
+local function live_parts(msg, surface, own, cx, cy, hit)
   local x0, y0 = cx * CHUNK, cy * CHUNK
-  local msg = { t = "chart", cx = cx, cy = cy, n = n, pal = hit.pal, px = hit.px, si = surface.index }
-  -- The chunk's pollution, for the map view's pollution layer.
+  -- The chunk's pollution, for the map view's pollution layer (owner's C12).
   local okp, pollution = pcall(surface.get_pollution, { x0 + 16, y0 + 16 })
   if okp and pollution and pollution >= 0.5 then
     msg.pol = math.floor(pollution + 0.5)
@@ -687,6 +707,11 @@ local function send_chart(surface, own, cx, cy, n, hit)
   if #ov > 0 then
     msg.ov = ov
   end
+end
+
+local function send_chart(surface, own, cx, cy, n, hit, st)
+  local msg = { t = "chart", cx = cx, cy = cy, n = n, pal = hit.pal, px = hit.px, si = surface.index, st = st }
+  live_parts(msg, surface, own, cx, cy, hit)
   transport.send_now(msg)
 end
 
@@ -713,6 +738,12 @@ local function chart_step(surface, force, m)
       job.count = surface.count_entities_filtered({ area = area, type = registry.excluded_types(), invert = true })
       remember_count(key, own, job.count)
     end
+    -- (chart_same: the client's picture is still this one: the live parts alone, sent at the job's end. The job
+    -- still walks its slices, priced the same, reading nothing where chart_cache has the picture: its place in
+    -- storage must not depend on that module-local cache, which a peer that loaded since hasn't got.)
+    job.st = perf.on("chart_same") and stamp_of(surface.index, cx, cy, job.count, res) or nil
+    local have = m.have and m.have[cx .. "," .. cy]
+    job.same = job.st ~= nil and have == job.st or nil
     job.strips = strips_for(job.count)
     job.step = 0
     return
@@ -721,7 +752,7 @@ local function chart_step(surface, force, m)
   local sc = scratches[port]
   if job.step == 0 then
     local hit = chart_cache[key]
-    if hit and hit.count == job.count and hit.own == own and game.tick - hit.tick < CHART_KEEP_TICKS then
+    if hit and hit.count == job.count and hit.own == own and (job.st or game.tick - hit.tick < CHART_KEEP_TICKS) then
       scratches[port] = { id = id, cached = hit }
     else
       sc = { id = id, pal = {}, index = {}, px = {}, layers = {}, ov = {}, signals = {} }
@@ -789,7 +820,16 @@ local function chart_step(surface, force, m)
     hit = { tick = game.tick, count = job.count, own = own, pal = sc.pal, px = sc.px, ov = sc.ov, signals = sc.signals }
     chart_cache[key] = hit
   end
-  send_chart(surface, own, cx, cy, n, hit)
+  -- (A stamp only when nothing changed in the chunk since the job began: the picture may predate it.)
+  local st = job.st and stamp_of(surface.index, cx, cy, job.count, m.res) == job.st and job.st or nil
+  if st and job.same then
+    local msg = { t = "chart", cx = cx, cy = cy, si = surface.index, same = st }
+    live_parts(msg, surface, own, cx, cy, hit)
+    transport.send_now(msg)
+    M.counts.same = M.counts.same + 1
+    return
+  end
+  send_chart(surface, own, cx, cy, n, hit, st)
 end
 
 ---------------------------------------------------------------------------------------------
@@ -932,6 +972,23 @@ function M.request(cmd)
   end)
   local m = state()
   m.queue, m.head, m.res, m.job = queue, 1, res, nil
+  -- `h`: [[cx, cy, stamp], ...], the pictures the client holds (chart_same), by chunk.
+  m.have = nil
+  if type(cmd.h) == "table" then
+    local have, n = {}, 0
+    for _, e in pairs(cmd.h) do
+      if n >= MAX_CHUNKS then
+        break
+      end
+      local hx, hy, st = type(e) == "table" and chunk_coord(e[1]), type(e) == "table" and chunk_coord(e[2]),
+        type(e) == "table" and tonumber(e[3])
+      if hx and hy and st and st == st then
+        have[hx .. "," .. hy] = st
+        n = n + 1
+      end
+    end
+    m.have = n > 0 and have or nil
+  end
   -- `si`: another surface's map (the map view's surface switcher); else the character's.
   local si = tonumber(cmd.si)
   m.si = si and game.get_surface(math.floor(si)) and math.floor(si) or nil

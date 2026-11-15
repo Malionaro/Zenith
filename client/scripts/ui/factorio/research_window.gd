@@ -12,6 +12,11 @@ extends Control
 ##   technology it needs above it, what it opens up under it, joined by lines; the selected one drawn
 ##   large in the middle.
 ##
+## Opened (T, the research panel), it shows the research in progress, else the technology selected
+## last time, else the first available one; a link (Factoriopedia) selects its own. The tree and the
+## list are brought to it once they are laid out (J17: a window just shown has no scroll range yet,
+## and the view stayed at the top of the tree, the furthest prerequisites).
+##
 ## From the mod's `techs` and `rs` (ui_model.gd). Clicking a technology anywhere selects it; the
 ## buttons send `research` and `research_cancel`. Trigger technologies show their task ("Craft 50
 ## Iron plate"), infinite ones their level and cost formula, a stopped one its kept progress.
@@ -82,6 +87,13 @@ var _history: Array = []
 var _history_at := -1
 var _back: Button
 var _forward: Button
+## The technology the tree and the list are to be brought to, and for how many more frames to try
+## while they aren't laid out (_center_on).
+var _center_target := ""
+var _center_frames := 0
+## The technology the tree was last built round.
+var _tree_for := ""
+const CENTER_FRAMES := 10
 
 
 func _ready() -> void:
@@ -232,12 +244,17 @@ func _frame_button(name: String, sprite: String, action: Callable) -> Button:
 
 
 func open(on: bool) -> void:
+	var was := visible
 	visible = on
 	if on:
-		if selected == "" or not model.techs.has(selected):
+		# Factorio's technology screen opens on what is being researched; with nothing researched, on
+		# the technology looked at last.
+		if not was and model.research != "" and model.techs.has(model.research):
+			selected = model.research
+		elif selected == "" or not model.techs.has(selected):
 			selected = _default_selection()
 		refresh()
-		_center_on.call_deferred(selected)
+		_center_on(selected)
 
 
 func is_open() -> bool:
@@ -263,7 +280,7 @@ func select(tech: String) -> void:
 		_history_at = _history.size() - 1
 	selected = tech
 	refresh.call_deferred()
-	_center_on.call_deferred(tech)
+	_center_on(tech)
 
 
 func go_back() -> void:
@@ -271,7 +288,7 @@ func go_back() -> void:
 		_history_at -= 1
 		selected = str(_history[_history_at])
 		refresh()
-		_center_on.call_deferred(selected)
+		_center_on(selected)
 
 
 func go_forward() -> void:
@@ -279,19 +296,45 @@ func go_forward() -> void:
 		_history_at += 1
 		selected = str(_history[_history_at])
 		refresh()
-		_center_on.call_deferred(selected)
+		_center_on(selected)
 
 
-## Brings a technology into view in the tree (in the middle) and in the list.
+## Brings a technology into view in the tree (in the middle) and in the list. Tried again over the
+## next frames until it holds: the window just shown (or the tree just rebuilt) isn't laid out, and a
+## scroll set before its range is known is clamped to the top.
 func _center_on(tech: String) -> void:
-	var s = _tree_slots.get(tech)
-	if s != null and is_instance_valid(s):
+	_center_target = tech
+	_center_frames = CENTER_FRAMES
+	set_process(true)
+
+
+func _process(_delta: float) -> void:
+	if _center_frames <= 0 or not visible:
+		_center_frames = 0
+		set_process(false)
+		return
+	_center_frames -= 1
+	if _apply_center():
+		_center_frames = 0
+
+
+## The view on _center_target now; true once the tree's scroll holds it.
+func _apply_center() -> bool:
+	var tech := _center_target
+	var held := false
+	var s = _tree_slots.get(tech) if _tree_for == tech else null  # a tree round another waits to be rebuilt
+	if s != null and is_instance_valid(s) and _tree_scroll.size.x > 0.0:
 		var c: Vector2 = (s as Control).position + (s as Control).size * 0.5
-		_tree_scroll.scroll_horizontal = int(c.x - _tree_scroll.size.x * 0.5)
-		_tree_scroll.scroll_vertical = int(c.y - _tree_scroll.size.y * 0.5)
+		var room := (_tree.size - _tree_scroll.size).max(Vector2.ZERO)
+		var want := (c - _tree_scroll.size * 0.5).clamp(Vector2.ZERO, room)
+		_tree_scroll.scroll_horizontal = int(want.x)
+		_tree_scroll.scroll_vertical = int(want.y)
+		held = absi(_tree_scroll.scroll_horizontal - int(want.x)) <= 1 and absi(_tree_scroll.scroll_vertical - int(want.y)) <= 1 \
+			and _tree.size.y >= _tree.custom_minimum_size.y - 1.0
 	var l = _slots.get(tech)
-	if l != null and is_instance_valid(l):
+	if l != null and is_instance_valid(l) and (l as Control).is_visible_in_tree():
 		_list_scroll.ensure_control_visible(l)
+	return held
 
 
 func refresh() -> void:
@@ -387,6 +430,7 @@ func _build_tree() -> void:
 		_tree.remove_child(child)
 		child.queue_free()
 	_tree_slots.clear()
+	_tree_for = selected
 	if model.techs.is_empty() or selected == "":
 		var l := Kit.label("The mod hasn't sent any technologies yet.")
 		l.position = Kit.pxv(16, 48)
@@ -582,13 +626,8 @@ func _matches(t: String, query: String) -> bool:
 ## A technology's name; infinite and levelled ones by the level they are at ("Mining productivity 7").
 func title_of(t: String) -> String:
 	var info: Dictionary = model.techs.get(t, {})
-	var max_level := int(info.get("max_level", 1))
-	if max_level != 1 and int(info.get("level", 1)) > 1:
-		var base := t
-		var dash := t.rfind("-")
-		if dash > 0 and t.substr(dash + 1).is_valid_int():
-			base = t.substr(0, dash)
-		return "%s %d" % [Kit.tech_name(base), int(info["level"])]
+	if int(info.get("max_level", 1)) != 1:
+		return Kit.tech_level_name(t, int(info.get("level", 1)))
 	return Kit.tech_name(t)
 
 

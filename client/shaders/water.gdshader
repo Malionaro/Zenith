@@ -9,6 +9,7 @@ shader_type spatial;
 render_mode cull_back, specular_schlick_ggx;
 
 #include "res://shaders/noise.gdshaderinc"
+#include "res://shaders/pollution.gdshaderinc"
 
 uniform vec3 sky_tint : source_color = vec3(0.50, 0.62, 0.72);
 uniform vec3 foam_color : source_color = vec3(0.86, 0.90, 0.90);
@@ -83,6 +84,15 @@ void fragment() {
 		water *= texture_brightness;
 		sky_share = tile_reflect[own];
 		wobble = 0.85 + 0.15 * (a.x * 0.6 + b.x * 0.4);
+	}
+	// Polluted chunks' lakes turn a murky algae green (scripts/world/pollution.gd, the same level that
+	// kills the trees there), reflecting less sky as the water thickens.
+	float fouled = pollution_at(p).x;
+	if (fouled > 0.0) {
+		float lum = dot(water, vec3(0.3, 0.59, 0.11));
+		vec3 algae = lum * vec3(0.8, 1.25, 0.45) + vec3(0.015, 0.04, 0.0);
+		water = mix(water, algae, 0.8 * smoothstep(0.0, 0.7, fouled));
+		sky_share *= 1.0 - 0.5 * fouled;
 	}
 	vec3 base = water * wobble;
 	// Faint bright lines along the ridges of the middle layer, like wave crests, fading in and

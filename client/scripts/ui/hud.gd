@@ -194,7 +194,7 @@ static func help_sections() -> Array:
 			{"a": ["flip_horizontal", "flip_vertical"], "w": "flip"},
 			{"a": ["pipette", "clear_cursor"], "w": "pipette, or put away what you hold"},
 			{"a": ["drop_item"], "w": "drop one"},
-			{"a": ["pick_up"], "w": "pick up from the ground"},
+			{"a": ["pick_up"], "w": "pick up from the ground and belts"},
 			{"k": "Shift+right / Shift+left", "w": "copy / paste settings"},
 			{"k": "Ctrl+left / right", "w": "fast transfer / half"},
 			{"k": "Ctrl+wheel", "w": "quality"},
@@ -215,7 +215,7 @@ static func help_sections() -> Array:
 		["Inventory and crafting", [
 			{"a": ["open_screen"], "w": "inventory, or close windows"},
 			{"a": ["focus_search"], "w": "search"},
-			{"a": quickbar, "r": true, "w": "quickbar (inventory open: pin the hovered item)"},
+			{"a": quickbar, "r": true, "w": "quickbar (again: put it back)"},
 			{"a": pages, "r": true, "w": "quickbar page"},
 			{"a": ["rotate_quickbars"], "w": "swap the quickbars"},
 			{"k": "Click a recipe", "w": "craft 1 (right: 5, Shift: all)"},

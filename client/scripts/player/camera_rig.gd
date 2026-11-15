@@ -20,9 +20,41 @@ const ORTHO_SCALE := 0.65
 ## First person: eye height of the 1.7-tile character, field of view, mouse look speed.
 const EYE_HEIGHT := 1.55
 const FIRST_PERSON_FOV := 75.0
+## First person with Settings > Camera > Projection in first person orthographic: tiles seen high.
+const FIRST_PERSON_ORTHO_SIZE := 12.0
 const LOOK_DEGREES_PER_PIXEL := 0.15
 const Settings := preload("res://scripts/menu/settings.gd")
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
+
+## Issue #17: on an add-on's hills the view's centre stayed at the flat height under the character, so
+## the character stood off the screen's centre (zoomed in at a low tilt on a 3-tile hill, off the screen)
+## and the camera went into the ground; on flat ground the centre was the feet, and the follow trailed a
+## running character by about a tile. Now the character's body is the centre at every zoom, tilt and
+## projection, on the hills too (owner: "should just always be in the middle"), the camera tilts up over
+## ground that would come between, and it is on the character as it moves. `--camera-focus=off`: the
+## camera as before.
+static var focus_fix := not ("--camera-focus=off" in OS.get_cmdline_user_args())
+## The 1.7-tile character's middle over its feet: the view's centre.
+const BODY_MID := 0.85
+## The default zoom: the up and down glide below is as tight on screen at every zoom as there.
+const DEFAULT_DISTANCE := 30.0
+## Up and down the centre glides a little (per second at the default zoom, faster zoomed in) so the
+## hills' small kinks don't jolt the view; running up a slope the character stays within about 1% of
+## the screen's height of the middle.
+const VERTICAL_RATE := 12.0
+## A goal further than this from the last frame's (tiles: another target, a jump) is glided to at
+## FOLLOW_RATE; nearer (a walk, a run, a drive) the centre stays on it.
+const JUMP := 8.0
+## The camera stays this far over the ground under it (its near plane, 0.5 out, never reaches into a
+## hill), and the line from it to the character's body this far over the ground between (tiles).
+const CLEARANCE := 1.25
+const SIGHT_CLEARANCE := 0.25
+## Where on that line the ground is looked at, from the body (0) to the camera (1).
+const SIGHT_SAMPLES := [0.2, 0.4, 0.6, 0.8]
+## How fast a lift over the ground eases off once the ground falls away (per second); it rises at once.
+const LIFT_EASE := 3.0
+## How fast the view glides over to a new target or after a jump (per second).
+const FOLLOW_RATE := 8.0
 
 ## Seeing the world through the character's eyes (F5). The mouse is captured and looks around;
 ## building and mining aim at the middle of the screen (aim_position).
@@ -50,6 +82,9 @@ var _arg_distance := 0.0
 ## `orthographic` (Settings > Camera, one for the map and one for the normal view).
 var in_remote := false
 var remote_orthographic := true
+## First person's own projection (owner's I19: each view keeps the one set in Settings, and only F7
+## changes it, in the view it is used in).
+var first_person_orthographic := false
 ## A remote view opened by zooming into the map: zooming out to this distance and once more goes
 ## back to the map (issue #4, as Factorio 2.0 does); INF otherwise. factorio_ui.gd sets it.
 var map_handoff_distance := INF
@@ -87,6 +122,16 @@ var _settle_pitch := NAN
 ## the camera was before, to put back: empty while no add-on has it.
 var _taken := {}
 var taken_focus := Vector2.INF
+## The ground's hold on the camera (focus_fix): the lowest pitch that keeps it over the hills in
+## perspective, and in an orthographic view the tiles it stands back along its axis instead (which
+## changes nothing seen, so Factorio's view keeps its angle). Both rise at once and ease off.
+var _ground_pitch := 0.0
+var _ground_back := 0.0
+## The follow (focus_fix): the last goal, its height as glided, and what is left of a glide after a jump
+## (the view's centre is the goal plus this, fading).
+var _last_goal := Vector3.INF
+var _goal_y := 0.0
+var _glide := Vector3.ZERO
 
 
 func _ready() -> void:
@@ -96,8 +141,7 @@ func _ready() -> void:
 	add_child(camera)
 	camera.make_current()
 	configure_from(OS.get_cmdline_user_args())
-	if target != null:
-		global_position = _follow(target.global_position)
+	_centre_now()
 	# --camera=factorio starts in Factorio's view (handy for screenshots).
 	if "--camera=factorio" in OS.get_cmdline_user_args():
 		toggle_factorio_view.call_deferred()
@@ -122,12 +166,14 @@ func apply_settings() -> void:
 	max_distance = maxf(clampf(float(Settings.get_value("camera", "max_zoom")), MAX_ZOOM_RANGE.x, MAX_ZOOM_RANGE.y), _arg_distance)
 	_distance_goal = minf(_distance_goal, max_distance)
 	remote_orthographic = bool(Settings.get_value("camera", "map_orthographic"))
+	first_person_orthographic = bool(Settings.get_value("camera", "first_person_orthographic"))
 	if Settings.has_arg("--camera="):
 		return
 	var ortho := bool(Settings.get_value("camera", "orthographic"))
 	if not _saved_view.is_empty():
 		_saved_view["ortho"] = ortho
-	if not in_factorio_view():
+	# First person entered from Factorio's view goes back to it: its orthographic is kept too.
+	if not in_factorio_view() and not (first_person and not _saved_view.is_empty()):
 		orthographic = ortho
 
 
@@ -144,13 +190,22 @@ func _process(delta: float) -> void:
 		camera.transform = Transform3D(look, Vector3(0.0, EYE_HEIGHT, 0.0))
 		# Set only when it differs: Camera3D's setters don't check, and each one updates the
 		# rendering server's camera and emits property_list_changed.
-		if camera.projection != Camera3D.PROJECTION_PERSPECTIVE:
+		if first_person_orthographic:
+			if camera.projection != Camera3D.PROJECTION_ORTHOGONAL:
+				camera.projection = Camera3D.PROJECTION_ORTHOGONAL
+			if not is_equal_approx(camera.size, FIRST_PERSON_ORTHO_SIZE):
+				camera.size = FIRST_PERSON_ORTHO_SIZE
+		elif camera.projection != Camera3D.PROJECTION_PERSPECTIVE:
 			camera.projection = Camera3D.PROJECTION_PERSPECTIVE
 		return
 	if target != null:
 		# A ride's camera goes up with the rocket; only the view on foot stays level.
-		var to := target.global_position if in_cinematic() else _follow(target.global_position)
-		global_position = global_position.lerp(to, 1.0 - exp(-delta * 8.0))
+		if focus_fix and not in_cinematic():
+			_follow_body(delta)
+		else:
+			var to := target.global_position if in_cinematic() else _follow(target.global_position)
+			global_position = global_position.lerp(to, 1.0 - exp(-delta * FOLLOW_RATE))
+			_last_goal = Vector3.INF  # back on the character after a ride, glided over from here
 	yaw_degrees = lerpf(yaw_degrees, _yaw_goal, 1.0 - exp(-delta * 10.0))
 	# A ride's camera moves slowly, as a film's would.
 	var rate := 1.6 if not _cine_saved.is_empty() else 10.0
@@ -162,14 +217,23 @@ func _process(delta: float) -> void:
 		if absf(pitch_degrees - _settle_pitch) < 0.05:
 			pitch_degrees = _settle_pitch
 			_settle_pitch = NAN
-	var turn := Basis(Vector3.UP, deg_to_rad(yaw_degrees)) * Basis(Vector3.RIGHT, -deg_to_rad(pitch_degrees))
-	camera.transform = Transform3D(turn, turn * Vector3(0.0, 0.0, distance))
-	if (remote_orthographic if in_remote else orthographic):
+	_hold_over_ground(delta)
+	var turn := Basis(Vector3.UP, deg_to_rad(yaw_degrees)) * Basis(Vector3.RIGHT, -deg_to_rad(shown_pitch()))
+	camera.transform = Transform3D(turn, turn * Vector3(0.0, 0.0, distance + _ground_back))
+	if view_orthographic():
 		if camera.projection != Camera3D.PROJECTION_ORTHOGONAL:
 			camera.projection = Camera3D.PROJECTION_ORTHOGONAL
 		camera.size = distance * ORTHO_SCALE
 	elif camera.projection != Camera3D.PROJECTION_PERSPECTIVE:
 		camera.projection = Camera3D.PROJECTION_PERSPECTIVE
+
+
+## Whether the view in use is drawn orthographic: first person's, the map's remote view's or the
+## angled view's setting (Factorio's view is the angled view held orthographic).
+func view_orthographic() -> bool:
+	if first_person:
+		return first_person_orthographic
+	return remote_orthographic if in_remote else orthographic
 
 
 ## In Factorio's view (toggle_factorio_view) as it was snapped to, with the view before it to go
@@ -199,8 +263,7 @@ func toggle_factorio_view() -> void:
 	var size := tiles_high * sin(deg_to_rad(FACTORIO_PITCH))
 	_snap(360.0 * roundf(_yaw_goal / 360.0), FACTORIO_PITCH, size / ORTHO_SCALE, true)
 	_factorio_snap = [_yaw_goal, pitch_degrees, _distance_goal]
-	if target != null:
-		global_position = _follow(target.global_position)
+	_centre_now()
 
 
 ## Back to the view before Factorio's, if Factorio's (as snapped to, or changed since) is on.
@@ -221,16 +284,24 @@ func _snap(yaw: float, pitch: float, dist: float, ortho: bool) -> void:
 	_distance_goal = clampf(dist, MIN_DISTANCE, max_distance)
 	distance = _distance_goal
 	orthographic = ortho
+	# A jump to a view (F6 and back): the ground's hold is worked out again for it, not eased over.
+	_ground_pitch = 0.0
+	_ground_back = 0.0
 
 
-## F7: flips the projection of the view in use, the map's remote view or the normal
-## view, and keeps it as that view's setting. Factorio's view (F6) stays orthographic: there F7
-## changes the normal view's, used on leaving it. Returns a line saying what it is now.
+## F7 (owner's H17): flips the projection of the view in use, first person, the map's remote view
+## or the normal view, and keeps it as that view's setting, so Settings shows it (I19). Factorio's
+## view (F6) stays orthographic: there F7 changes the normal view's, used on leaving it. Returns a
+## line saying what it is now.
 func toggle_projection() -> String:
-	var key := "map_orthographic" if in_remote else "orthographic"
+	var key := "first_person_orthographic" if first_person else ("map_orthographic" if in_remote else "orthographic")
 	var ortho := not bool(Settings.get_value("camera", key))
+	# The setting's listeners (apply_settings) read it back into the view, Factorio's view kept.
 	Settings.set_value("camera", key, ortho)
 	var kind := "orthographic" if ortho else "perspective"
+	if first_person:
+		first_person_orthographic = ortho
+		return "First person: " + kind
 	if in_remote:
 		remote_orthographic = ortho
 		return "Map view: " + kind
@@ -324,8 +395,7 @@ func hand_back() -> void:
 	if bool(t["crosshair"]):
 		_crosshair.visible = true
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED if first_person else Input.MOUSE_MODE_VISIBLE
-	if target != null:
-		global_position = _follow(target.global_position)
+	_centre_now()
 	_process(0.0)  # the camera in its place now, not a frame late
 
 
@@ -339,9 +409,15 @@ func own_view() -> Transform3D:
 	var at := target.global_position if target != null else global_position
 	if first_person:
 		var look := Basis(Vector3.UP, deg_to_rad(_look_yaw)) * Basis(Vector3.RIGHT, -deg_to_rad(_look_pitch))
-		return Transform3D(look, at + Vector3(0.0, EYE_HEIGHT, 0.0))
-	var turn := Basis(Vector3.UP, deg_to_rad(_yaw_goal)) * Basis(Vector3.RIGHT, -deg_to_rad(pitch_degrees))
-	return Transform3D(turn, at + turn * Vector3(0.0, 0.0, _distance_goal))
+		# On the hills, where _process puts first person's eyes.
+		return Transform3D(look, (GroundHeight.lift(at) if focus_fix else at) + Vector3(0.0, EYE_HEIGHT, 0.0))
+	if not focus_fix:
+		var flat := Basis(Vector3.UP, deg_to_rad(_yaw_goal)) * Basis(Vector3.RIGHT, -deg_to_rad(pitch_degrees))
+		return Transform3D(flat, at + flat * Vector3(0.0, 0.0, _distance_goal))
+	if target != null:
+		at = _focus_goal()
+	var turn := Basis(Vector3.UP, deg_to_rad(_yaw_goal)) * Basis(Vector3.RIGHT, -deg_to_rad(shown_pitch()))
+	return Transform3D(turn, at + turn * Vector3(0.0, 0.0, _distance_goal + _ground_back))
 
 
 ## Into the character's eyes, facing the way the camera faced, or back out to the view before.
@@ -426,13 +502,171 @@ func zoom(factor: float) -> void:
 	_distance_goal = clampf(_distance_goal * factor, MIN_DISTANCE, far)
 
 
-## Where the camera's focus sits over a point: on an add-on's hills when the player asks for it
-## (Settings > Camera > Camera follows the hills), else level at the flat world's height (owner:
-## "camera elevation on terrain off").
+## Where the camera's focus sat over a point before issue #17, and still does with --camera-focus=off
+## and for an add-on's shot (where chunks load): level at the flat world's height (owner: "camera
+## elevation on terrain off"), or on an add-on's hills with the old setting camera.follow_hills saved on.
 static func _follow(p: Vector3) -> Vector3:
 	if bool(Settings.get_value("camera", "follow_hills")):
 		return GroundHeight.lift(p)
 	return Vector3(p.x, 0.0, p.z)
+
+
+## The view's centre straight onto the target, without the glide (the start, Factorio's view, a
+## hand-back).
+func _centre_now() -> void:
+	if target == null:
+		return
+	if focus_fix and not in_cinematic():
+		global_position = _focus_goal()
+		_last_goal = global_position
+		_goal_y = global_position.y
+		_glide = Vector3.ZERO
+	else:
+		global_position = _follow(target.global_position)
+
+
+## The view's centre (focus_fix): the character's body where it is drawn, on the hills and in the air
+## (mech armour's flight), at every zoom, tilt and projection; in the map's remote view the ground there.
+func _focus_goal() -> Vector3:
+	var p := target.global_position
+	var y := p.y + GroundHeight.at(p.x, p.z)
+	if not in_remote:
+		y += BODY_MID
+		if target.has_method("drawn_lift"):
+			y += float(target.drawn_lift())
+	return Vector3(p.x, y, p.z)
+
+
+## The view's centre on the character (focus_fix). Across the ground it stays on it: the drawn walk is
+## even already (avatar.gd), and the glide it had trailed a running character by about a tile, a sixth
+## of the screen's width zoomed all the way in. Up and down it glides a little (VERTICAL_RATE). A jump
+## (another target, the remote view left, a teleport) is glided over from where the view was.
+func _follow_body(delta: float) -> void:
+	var goal := _focus_goal()
+	if _last_goal == Vector3.INF or goal.distance_to(_last_goal) > JUMP:
+		_glide = global_position - goal
+		_goal_y = goal.y
+	_last_goal = goal
+	var zoom_in := maxf(1.0, DEFAULT_DISTANCE / maxf(distance, 0.1))
+	_goal_y = lerpf(_goal_y, goal.y, 1.0 - exp(-delta * VERTICAL_RATE * zoom_in))
+	_glide *= exp(-delta * FOLLOW_RATE)
+	if _glide.length() < 0.001:
+		_glide = Vector3.ZERO
+	global_position = Vector3(goal.x, _goal_y, goal.z) + _glide
+
+
+## The pitch the view is drawn at: the player's, or higher where the ground would come between.
+func shown_pitch() -> float:
+	return maxf(pitch_degrees, _ground_pitch)
+
+
+## Keeps the camera over an add-on's hills (focus_fix): in perspective at least CLEARANCE over the
+## ground under it and the line from it to the character's body SIGHT_CLEARANCE over the ground between,
+## by tilting up as far as that needs, round the same centre, so the character stays on it (games raise
+## the camera or pull it in; pulling in at the closest zoom would put it in the character). In an
+## orthographic view it stands back along its axis instead, which changes nothing seen: Factorio's view
+## keeps its angle. Up at once, eased off as the ground falls away, so walking over hills it neither dips
+## into them nor jumps.
+func _hold_over_ground(delta: float) -> void:
+	var pitch_need := 0.0
+	var back_need := 0.0
+	if focus_fix and _cine_saved.is_empty() and GroundHeight.is_on():
+		if view_orthographic():
+			back_need = _back_needed()
+		else:
+			pitch_need = _pitch_needed(_focus_goal() if target != null else global_position)
+	var ease := 1.0 - exp(-delta * LIFT_EASE)
+	if view_orthographic():
+		_ground_pitch = 0.0  # an orthographic view keeps its angle (Factorio's view its 48 degrees)
+	elif pitch_need > pitch_degrees:
+		_ground_pitch = maxf(pitch_need, lerpf(maxf(_ground_pitch, pitch_degrees), pitch_need, ease))
+	elif _ground_pitch > pitch_degrees + 0.05:
+		_ground_pitch = lerpf(_ground_pitch, pitch_degrees, ease)
+	else:
+		_ground_pitch = 0.0  # none: the player's tilt is drawn as it is
+	_ground_back = maxf(back_need, lerpf(_ground_back, back_need, ease))
+	if _ground_back < 0.01:
+		_ground_back = 0.0
+
+
+## The lowest pitch from the player's up to MAX_PITCH that clears the hills (_clear_at), or 0 when the
+## player's own does (nearly every frame: one look at the ground under the camera and four on the way).
+func _pitch_needed(body: Vector3) -> float:
+	var lo := pitch_degrees
+	if _clear_at(body, lo):
+		return 0.0
+	var hi := lo
+	var found := false
+	while hi < MAX_PITCH:
+		hi = minf(hi + 5.0, MAX_PITCH)
+		if _clear_at(body, hi):
+			found = true
+			break
+		lo = hi
+	if not found:
+		return maxf(MAX_PITCH, pitch_degrees)
+	for i in 7:  # to 0.04 degrees
+		var mid := (lo + hi) * 0.5
+		if _clear_at(body, mid):
+			hi = mid
+		else:
+			lo = mid
+	return hi
+
+
+## Whether the perspective camera at `pitch` is CLEARANCE over the ground under it and the line from
+## it to `body` SIGHT_CLEARANCE over the ground along the way.
+func _clear_at(body: Vector3, pitch: float) -> bool:
+	var turn := Basis(Vector3.UP, deg_to_rad(yaw_degrees)) * Basis(Vector3.RIGHT, -deg_to_rad(pitch))
+	var eye := global_position + turn * Vector3(0.0, 0.0, distance)
+	if eye.y < GroundHeight.at(eye.x, eye.z) + CLEARANCE:
+		return false
+	for s: float in SIGHT_SAMPLES:
+		var q := body.lerp(eye, s)
+		if q.y < GroundHeight.at(q.x, q.z) + SIGHT_CLEARANCE:
+			return false
+	return true
+
+
+## Orthographic: how far back along its axis the camera stands so its near plane, as wide and high as
+## the view, is over the hills (0 when it is where it is).
+func _back_needed() -> float:
+	if _near_clear(0.0):
+		return 0.0
+	var lo := 0.0
+	var hi := 0.0
+	var step := 4.0
+	var found := false
+	while hi < 400.0:
+		hi += step
+		if _near_clear(hi):
+			found = true
+			break
+		lo = hi
+		step *= 1.5
+	if not found:
+		return hi
+	for i in 6:
+		var mid := (lo + hi) * 0.5
+		if _near_clear(mid):
+			hi = mid
+		else:
+			lo = mid
+	return hi
+
+
+func _near_clear(back: float) -> bool:
+	var turn := Basis(Vector3.UP, deg_to_rad(yaw_degrees)) * Basis(Vector3.RIGHT, -deg_to_rad(pitch_degrees))
+	var half_h := distance * ORTHO_SCALE * 0.5
+	var size := get_viewport().get_visible_rect().size if is_inside_tree() else Vector2(16.0, 9.0)
+	var half_w := half_h * size.x / maxf(size.y, 1.0)
+	var near := global_position + turn * Vector3(0.0, 0.0, distance + back - camera.near)
+	# Its bottom edge (left, middle, right) and the top's middle, the lowest and the furthest back.
+	for corner: Vector3 in [Vector3(-half_w, -half_h, 0.0), Vector3(0.0, -half_h, 0.0), Vector3(half_w, -half_h, 0.0), Vector3(0.0, half_h, 0.0)]:
+		var q := near + turn * corner
+		if q.y < GroundHeight.at(q.x, q.z) + SIGHT_CLEARANCE:
+			return false
+	return true
 
 
 ## Where the camera looks, on the ground (tiles).

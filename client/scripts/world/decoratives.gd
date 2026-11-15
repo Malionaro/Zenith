@@ -40,6 +40,7 @@ const ModFiles := preload("res://scripts/world/mod_files.gd")
 const ModGraphics := preload("res://scripts/world/mod_graphics.gd")
 const FrameBudget := preload("res://scripts/world/frame_budget.gd")
 const ViewPriority := preload("res://scripts/world/view_priority.gd")
+const Probing := preload("res://scripts/debug/probing.gd")
 const SHADER := preload("res://shaders/decorative.gdshader")
 const SHADER_FLAT := preload("res://shaders/decorative_flat.gdshader")
 const SHADER_GRASS := preload("res://shaders/decorative_grass.gdshader")
@@ -137,6 +138,8 @@ const MASK_BAND := 3
 class KindData:
 	var name := ""
 	var atlas: Image  # until its texture is made (_kind)
+	var kind: Kind  # made from it (_kind), on the main thread
+	var texture: ImageTexture  # made with the atlas on the worker (texture_thread), else by _kind
 	var upright := false
 	var lift := 0.02
 	## Per variant: Vector4(u start, u width, v height, 0) in the atlas, its size in tiles and its
@@ -153,6 +156,14 @@ class KindData:
 	## A carpet's clumps (_carpet_cells): a row per variant, a texel per clump, and the most in a row.
 	var carpet_cells: Image
 	var carpet_clumps := 0
+
+
+## A decorative's atlas goes on the GPU on the worker thread that read its pictures
+## (--decor-texture-thread=on, the default): made on the main thread when a chunk's clutter was put
+## in, the first chunk's twenty-odd new kinds made a 115-135 ms frame once a join at -62,-26 (an
+## atlas is up to a few MB with its mipmaps, and the renderer takes the upload on the calling thread).
+## off: made by _kind on the main thread, as before.
+static var texture_thread := not ("--decor-texture-thread=off" in OS.get_cmdline_user_args())
 
 
 ## One decorative's pictures, ready to draw (made on the main thread from its KindData).
@@ -199,8 +210,7 @@ class BuildJob:
 static var _index := {}
 static var _index_generation := -1  # ModGraphics.generation the index was merged with
 static var _retired: Array = []
-static var _kind_data := {}
-static var _kinds := {}
+static var _kind_data := {}  # name -> KindData (null: no pictures), each holding the Kind made from it
 static var _flat_order := {}  # flat decorative -> its rank in the drawing order (_flat_priority)
 static var _grass_order := {}  # raised decorative -> its rank in the drawing order (_grass_priority)
 static var _grass_meshes := {}  # grid cells a side -> the grid; minus a carpet's clumps -> its mesh
@@ -270,6 +280,9 @@ var _spills := {}  # Vector2i -> PackedInt32Array: its buildings' footprints rea
 var _edges := {}  # Vector2i -> the tufts its last build kept flat
 var _read_revs := {}  # Vector2i -> the chunk's content_rev (chunk_view.gd) its last build read
 var _restale := {}  # Vector2i -> true: build again next frame, its mask may have changed
+var _relist: Array[Vector2i] = []  # a new graphics list's rebuild, nearest first (_build_some)
+var _relist_at := 0
+const BUILDS_MIN := 4
 var _full_pending := {}  # Vector2i -> true: a build with a new list is on its way
 var _mask_focus := Vector2i.ZERO  # the focus's chunk: chunks within MASK_CHUNKS / 2 of it own their place
 var _mask_owner := {}  # Vector2i place in the texture -> the chunk whose mask is there
@@ -301,6 +314,8 @@ func reset(keep_names := false) -> void:
 	_edges.clear()
 	_read_revs.clear()
 	_restale.clear()
+	_relist = []
+	_relist_at = 0
 	_full_pending.clear()
 	_mask_owner.clear()
 	_mask_bytes.fill(0)
@@ -377,33 +392,43 @@ func handle(msg: Dictionary) -> void:
 
 
 func _process(delta: float) -> void:
+	var tp := Time.get_ticks_usec()
 	_free_some()
+	Probing.add("dc_free", tp)
+	tp = Time.get_ticks_usec()
 	if _built_generation != ModGraphics.generation:
-		# A graphics list (mod_graphics.gd): every chunk's clutter is built again from it.
+		# A graphics list (mod_graphics.gd): every chunk's clutter is built again from it, nearest
+		# the focus first, a slice a frame (_build_some): all at once was a 92 ms frame (client-cpu.md 5).
 		_built_generation = ModGraphics.generation
 		index()
-		for c in _lists.keys():
-			_build(c)
+		_relist = _near_first(_lists.keys())
+		_relist_at = 0
 	_watch_world()
 	if _refresh_rules():
 		for c in _lists.keys():
 			_restale[c] = true
-	if not _restale.is_empty():
-		for c: Vector2i in _restale:
-			if _lists.has(c):
-				_build(c, true)
-		_restale.clear()
-	if _jobs.is_empty():
+	Probing.add("dc_build", tp)
+	var t0 := Time.get_ticks_usec()
+	if _jobs.is_empty() and _restale.is_empty() and _relist_at >= _relist.size():
 		FrameBudget.waiting(&"decoratives", 0)
 	else:
-		var t0 := Time.get_ticks_usec()
 		var allow := FrameBudget.grant(&"decoratives")
-		if allow > 0:
-			_finish_jobs(allow)
-		FrameBudget.spent(&"decoratives", Time.get_ticks_usec() - t0, _jobs.size())
+		_build_some(t0, allow)
+		Probing.add("dc_build", t0)
+		var tf := Time.get_ticks_usec()
+		if allow > 0 and not _jobs.is_empty():
+			_finish_jobs(maxi(allow - (tf - t0), 0))
+		FrameBudget.spent(&"decoratives", Time.get_ticks_usec() - t0, _jobs.size() + _restale.size() + _relist.size() - _relist_at)
+		Probing.add("dc_finish", tf)
+	tp = Time.get_ticks_usec()
 	_cull()
+	Probing.add("dc_cull", tp)
+	tp = Time.get_ticks_usec()
 	_upload_mask()
+	Probing.add("dc_mask", tp)
+	tp = Time.get_ticks_usec()
 	_make_grass_some()
+	Probing.add("dc_grass", tp)
 	_print_grass_stats(delta)
 	_sweep += delta
 	if _sweep < 2.0 or world == null:
@@ -412,6 +437,52 @@ func _process(delta: float) -> void:
 	for c in _lists.keys():
 		if not world.chunks.has(c):
 			_drop(c)
+
+
+## Chunks to build again, a slice a frame (at least BUILDS_MIN, else half the decoratives' slice):
+## those whose mask may have changed (_restale), then a graphics list's rebuild (_relist).
+func _build_some(t0: int, allow: int) -> void:
+	var built := 0
+	for c: Vector2i in _restale.keys():
+		if built >= BUILDS_MIN and Time.get_ticks_usec() - t0 > allow / 2:
+			return
+		_restale.erase(c)
+		if _lists.has(c):
+			_build(c, true)
+			built += 1
+	while _relist_at < _relist.size():
+		if built >= BUILDS_MIN and Time.get_ticks_usec() - t0 > allow / 2:
+			return
+		var c := _relist[_relist_at]
+		_relist_at += 1
+		if _lists.has(c):
+			_build(c)
+			built += 1
+	_relist = []
+	_relist_at = 0
+
+
+## Chunks nearest the camera's target first: bucketed by distance, not sorted with a GDScript
+## comparison (thousands of chunks at a long view).
+func _near_first(list: Array) -> Array[Vector2i]:
+	var out: Array[Vector2i] = []
+	var focus: Node3D = rig.get("target") if rig != null and is_instance_valid(rig) else null
+	if focus == null or not is_instance_valid(focus) or list.size() < 2:
+		out.assign(list)
+		return out
+	var at := Vector2i(floori(focus.global_position.x / 32.0), floori(focus.global_position.z / 32.0))
+	var buckets := {}
+	for c: Vector2i in list:
+		var d := (c - at).length_squared()
+		if not buckets.has(d):
+			buckets[d] = []
+		(buckets[d] as Array).append(c)
+	var distances: Array = buckets.keys()
+	distances.sort()
+	for d in distances:
+		for c: Vector2i in buckets[d]:
+			out.append(c)
+	return out
 
 
 ## Listens to world.gd's changes (once it is set; tests stand in a world without them).
@@ -555,7 +626,7 @@ func _free_some() -> void:
 ## How many of a left world's nodes are still to be freed (tests).
 ## Nothing being built: no chunk's clutter on a worker, no raised grass still to make or fading in.
 func settled() -> bool:
-	return _jobs.is_empty() and _grass_queue.is_empty() and _grass_fade >= 1.0 and _restale.is_empty()
+	return _jobs.is_empty() and _grass_queue.is_empty() and _grass_fade >= 1.0 and _restale.is_empty() and _relist_at >= _relist.size()
 
 
 ## settled() for a screenshot of what `in_view` sees (a Callable(Vector2i) -> bool; full_detail.gd):
@@ -568,6 +639,9 @@ func pending_in(in_view: Callable) -> int:
 			n += 1
 	for c: Vector2i in _restale:
 		if _lists.has(c) and in_view.call(c):
+			n += 1
+	for i in range(_relist_at, _relist.size()):
+		if _lists.has(_relist[i]) and in_view.call(_relist[i]):
 			n += 1
 	for c: Vector2i in _grass_queue:
 		if in_view.call(c):
@@ -1005,9 +1079,12 @@ func _node_for(job: BuildJob) -> Node3D:
 	var node := Node3D.new()
 	node.name = "Decor %d,%d" % [job.chunk.x, job.chunk.y]
 	for g: Array in job.groups:
+		var tk := Time.get_ticks_usec()
 		var kind := _kind(str(g[0]), g[3])
+		Probing.add("dc_kinds", tk)
 		if kind == null:
 			continue
+		tk = Time.get_ticks_usec()
 		var mm := MultiMesh.new()
 		mm.transform_format = MultiMesh.TRANSFORM_3D
 		mm.use_custom_data = true
@@ -1019,6 +1096,7 @@ func _node_for(job: BuildJob) -> Node3D:
 		inst.material_override = kind.material
 		inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		node.add_child(inst)
+		Probing.add("dc_multimeshes", tk)
 		var rising := int(g[4])
 		if rising > 0 and kind.grass_mesh != null:
 			raised.append([kind, (g[1] as PackedFloat32Array).slice(0, rising * STRIDE), rising])
@@ -1218,22 +1296,34 @@ static func _tuft_blocked(job: BuildJob, x: int, y: int, data: KindData) -> bool
 	return false
 
 
-## The decorative ready to draw, made from its pictures (read by the job), or null.
+## The decorative ready to draw, made from its pictures (read by the job), or null. Made once per
+## KindData and kept on it: a job started before a new graphics list (mod_graphics.gd) finishes with the
+## old list's KindData, whose atlas went into its first Kind. A cache by name, which the new list
+## empties, made a second Kind from the spent atlas ("Invalid image: null", six of them in a cold join)
+## and kept that one, without a picture, for the session.
 static func _kind(name: String, data: KindData) -> Kind:
-	if name == "":
+	if name == "" or data == null:
 		return null
-	if _kinds.has(name):
-		return _kinds[name]
+	if data.kind != null:
+		return data.kind
 	var kind: Kind = null
-	if data != null:
+	if data.atlas != null:
 		kind = Kind.new()
 		kind.name = name
 		kind.upright = data.upright
+		var t0 := Time.get_ticks_usec()
 		kind.material = ShaderMaterial.new()
 		kind.material.shader = SHADER if kind.upright else SHADER_FLAT
-		var texture := ImageTexture.create_from_image(data.atlas)
+		Probing.add("dc_k_material", t0)
+		t0 = Time.get_ticks_usec()
+		var texture: ImageTexture = data.texture if data.texture != null else ImageTexture.create_from_image(data.atlas)
+		Probing.add("dc_k_texture", t0)
+		t0 = Time.get_ticks_usec()
 		kind.material.set_shader_parameter("atlas", texture)
+		Probing.add("dc_k_param", t0)
 		data.atlas = null  # the texture has it now; jobs only read the regions
+		data.texture = null
+		t0 = Time.get_ticks_usec()
 		if data.grass_height > 0.0:
 			kind.grass_triangles = data.grass_triangles
 			kind.grass_material = ShaderMaterial.new()
@@ -1253,10 +1343,14 @@ static func _kind(name: String, data: KindData) -> Kind:
 				kind.grass_material.set_shader_parameter("mass_lod", data.grass_lod)
 				kind.grass_material.set_shader_parameter("tuft", data.grass_tuft)
 			kind.grass_material.render_priority = _grass_priority(name)
+		Probing.add("dc_k_grass", t0)
+		t0 = Time.get_ticks_usec()
 		if kind.upright:
 			kind.material.set_shader_parameter("upright", true)
 		else:
 			kind.material.render_priority = _flat_priority(name)
+		Probing.add("dc_k_priority", t0)
+		t0 = Time.get_ticks_usec()
 		if kind.upright:
 			var quad := QuadMesh.new()
 			quad.size = Vector2.ONE
@@ -1266,7 +1360,8 @@ static func _kind(name: String, data: KindData) -> Kind:
 			var plane := PlaneMesh.new()
 			plane.size = Vector2.ONE
 			kind.mesh = plane
-	_kinds[name] = kind
+		Probing.add("dc_k_mesh", t0)
+	data.kind = kind
 	return kind
 
 
@@ -1320,6 +1415,8 @@ static func _make_kind_data(name: String, entry: Dictionary, images: Array[Image
 		atlas.fix_alpha_edges()  # blended (decorative_flat.gdshader): mipmaps without dark rims
 	atlas.generate_mipmaps()
 	kind.atlas = atlas
+	if texture_thread:
+		kind.texture = ImageTexture.create_from_image(atlas)
 	return kind
 
 
@@ -1551,7 +1648,7 @@ static func _region(pic: Array, files: Dictionary) -> Image:
 ## mod's decoratives) over it; empty without either. A new list drops the pictures read for names
 ## it has, and those found missing, so they are read again from it. Made again on the main thread
 ## only (_process, _build): workers (_kind_data_for, under the mutex) read the one there is, as the
-## main thread's _kind and _flat_priority read _kinds and _flat_order without it.
+## main thread's _kind and _flat_priority read their KindData's Kind and _flat_order without it.
 static func index() -> Dictionary:
 	if _index_generation != ModGraphics.generation and OS.get_thread_caller_id() == OS.get_main_thread_id():
 		_kind_mutex.lock()  # recursive: _kind_data_for asks while holding it
@@ -1562,13 +1659,12 @@ static func index() -> Dictionary:
 			if parsed is Dictionary:
 				merged = parsed
 		merged.merge(ModGraphics.decor, true)
-		# The pictures read before stay alive (_retired) until the chunks drawn with them are built
-		# again: a freed texture would draw white meanwhile.
-		_retired = [_kind_data.duplicate(), _kinds.duplicate()]
+		# The pictures read before (each KindData with its Kind) stay alive (_retired) until the chunks
+		# drawn with them are built again: a freed texture would draw white meanwhile.
+		_retired = [_kind_data.duplicate()]
 		for name in _kind_data.keys():
 			if _kind_data[name] == null or ModGraphics.decor.has(name):
 				_kind_data.erase(name)
-				_kinds.erase(name)
 		_flat_order = {}
 		_grass_order = {}
 		_index = merged

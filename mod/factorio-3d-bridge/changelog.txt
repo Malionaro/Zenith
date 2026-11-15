@@ -1,4 +1,42 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.2.1
+Date: 2026-11-14
+  Features:
+    - What the character mines by hand is sent the tick the game mines it, with what it gave, so the client can fly the items to the character.
+    - The character stands while it mines, and mining follows the client's cursor, so a sweep across belts mines each one in turn.
+    - Turrets out of ammo, machines out of fuel or unplugged, and drills with nothing left to mine near the client are reported within a second, and again right after building or moving items; a depleted drill gets Factorio's No minable resources icon.
+    - Chests near the client send what they hold most of for Alt-mode, read only while Alt-mode is on.
+    - Machines with module slots and labs near the client send their modules and science packs for Alt-mode, with each prototype's icon layout.
+    - A lit lamp's colour (from the circuit network, or its own) is sent with its state.
+    - Lamps set to always on say so with their state, so the client lights them by day.
+    - A finished research is reported at once (once a tick, however many finish), for the client's chime and notice.
+    - Repairs with a held repair pack: the client's repair command mends a damaged building of the character's force within reach, from the pack's durability, and each prototype's repair sound is listed.
+    - An idle furnace reports the last recipe it made.
+    - Turning one end of an underground pair sends both ends, as the game turns both.
+    - The right button picks up an item lying on the ground.
+    - Picking up (F) takes the items on belts in reach too, nearest first, and says at once what it took and from where.
+    - Hovering a machine sends its contents and an assembler's inputs and outputs per second.
+    - A belt the character puts items on or takes them off is read again in the next belt update.
+    - Inserter hands are sent as events, with the item a hand puts on a belt, for the client's belt simulation.
+    - Chunks are sent in the view's direction first, and chunks the client kept are confirmed without being sent again.
+    - Sends each chunk's pollution near the client, for dying trees, green lakes and smog.
+    - Lists each entity's mining sound and each prototype's tile rules (the offshore pump's preview).
+    - Sorts the character's inventory when the client asks.
+    - A demolisher territory whose demolisher is dead is left out.
+  Optimizations:
+    - The bridge does less each tick on a big base, the first minute after joining most: chunks written as text under the work budget, lightning looked for only on planets that have it, wires watched in strips, machine states far away read less often, unchanged minimap charts answered without being sent again, decoratives only within the client's distance, one search for every kind of moving thing, the alerts pass skipping empty chunks, a cheaper belt lane check.
+    - Belt lanes far away slow down only at the last update-rate level, so belts are the last thing slowed.
+  Bugfixes:
+    - A wire changed within about 4 seconds of building its pole (by a script, a blueprint or another player) was never sent.
+    - An asteroid collector counted a chunk its filters reject as caught.
+    - A new drill's or inserter's belt wasn't watched until it first moved an item, so items on it were drawn late or not at all.
+    - The belts past a drill's drop belt are read too when it puts something out, so its items are drawn as they land.
+    - A built, turned, replaced or removed belt is read and sent the next tick, not at the next scan of the square (seconds later on a big view).
+    - The character's own mining of a belt tells the belt listeners, so its lanes are dropped at once.
+    - Each belt lane says which lane it leads on to as the game connects them (a splitter's outputs by their own half, an underground's tunnel by its exit), and says it again when that belt loads or leaves the client's square, so items at the end of what is sent no longer jump.
+    - A splitter built over belts replaces the belts under its whole footprint.
+    - A client that restarted within the bridge's timeout takes back its own character instead of getting a new one at the spawn.
+---------------------------------------------------------------------------------------------------
 Version: 0.2.0
 Date: 2026-11-12
   Features:

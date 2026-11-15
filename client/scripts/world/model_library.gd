@@ -253,10 +253,12 @@ const ModelTextures := preload("res://scripts/world/model_textures.gd")
 const ModelSkin := preload("res://scripts/world/model_skin.gd")
 const ModelRig := preload("res://scripts/world/model_rig.gd")
 const ContactShade := preload("res://scripts/world/contact_shade.gd")
+const BeltReturn := preload("res://scripts/world/belt_return.gd")
 ## Folders under res://assets/models/ looked in first, in order: models brought in from elsewhere
 ## under their own licence (fue5/: the FUE5 fan project's, CC BY-NC-SA 3.0) replace ours there.
 const MODEL_SUBDIRS := ["fue5/"]
 const CreatureModels := preload("res://scripts/world/creature_models.gd")
+const NatureLooks := preload("res://scripts/world/nature_looks.gd")
 const FactorioShader := preload("res://shaders/factorio_material.gdshader")
 const FactorioAlphaShader := preload("res://shaders/factorio_material_alpha.gdshader")
 ## Cut-out materials (Blender's Alpha Clip, glTF MASK): see factorio_material_clip.gdshader.
@@ -880,6 +882,7 @@ static func _make(name: String) -> Mesh:
 		parts = _parts.get(_tier_base(name), [])
 	if mesh != null:
 		_setup_belt(mesh as ArrayMesh, name)
+		NatureLooks.prepare(mesh, name)
 		for i in mesh.get_surface_count():
 			var material := mesh.surface_get_material(i) as ShaderMaterial
 			if material != null and material.get_shader_parameter("activity_glow"):
@@ -940,6 +943,8 @@ static func _setup_belt(mesh: ArrayMesh, name: String) -> void:
 ## scrolls the texture the way the modeller laid it out. Zero without a textured belt surface.
 ## Only the part facing up is fitted: a surface that wraps round under the belt runs back the other
 ## way underneath, and fitting both cancelled to nothing (the belt stood still).
+## The fit is of the CPU arrays, which leave the return run drawn under the belt out (BeltReturn): its
+## inner side looks up and runs the other way too.
 static func _belt_uv_scroll(mesh: ArrayMesh, shape: int, runs_east := false) -> Vector2:
 	var all: Array = mesh.get_meta(ModelLods.ARRAYS_META, [])
 	for i in mesh.get_surface_count():
@@ -948,45 +953,9 @@ static func _belt_uv_scroll(mesh: ArrayMesh, shape: int, runs_east := false) -> 
 			continue
 		if i >= all.size():
 			continue
-		var a: Array = all[i]
-		var verts: PackedVector3Array = a[Mesh.ARRAY_VERTEX]
-		var uvs: Variant = a[Mesh.ARRAY_TEX_UV]
-		if not uvs is PackedVector2Array or verts.is_empty():
-			continue
-		var normals: Variant = a[Mesh.ARRAY_NORMAL]
-		var top: Array[int] = []
-		if normals is PackedVector3Array and (normals as PackedVector3Array).size() == verts.size():
-			for v in verts.size():
-				if (normals as PackedVector3Array)[v].y > 0.5:
-					top.append(v)
-		if top.size() < 3:
-			top.clear()
-			for v in verts.size():
-				top.append(v)
-		var n := float(top.size())
-		var ms := 0.0
-		var mu := Vector2.ZERO
-		var ss: Array[float] = []
-		for v in top:
-			var p := verts[v]
-			var along := p.x if runs_east else -p.z
-			if shape > 0:
-				var side := 1.0 if shape == 1 else -1.0
-				var d := Vector2(p.x, p.z) - Vector2(-0.5 * side, -0.5)
-				along = atan2(-d.y, d.x * side) / (PI * 0.5) + 0.5
-			ss.append(along)
-			ms += along
-			mu += (uvs as PackedVector2Array)[v]
-		ms /= n
-		mu /= n
-		var var_s := 0.0
-		var cov := Vector2.ZERO
-		for k in top.size():
-			var ds := ss[k] - ms
-			var_s += ds * ds
-			cov += ds * ((uvs as PackedVector2Array)[top[k]] - mu)
-		if var_s > 1e-6:
-			return _clean_scroll(cov / var_s)
+		var fit := BeltReturn.uv_fit(all[i], shape, runs_east)
+		if fit != Vector2.ZERO:
+			return _clean_scroll(fit)
 	return Vector2.ZERO
 
 
@@ -1057,17 +1026,23 @@ static func _tinted(base: ArrayMesh, color: Color) -> ArrayMesh:
 
 
 ## A copy of a model with the same surfaces and materials, made from its arrays on the CPU
-## (ModelLods.arrays_of): Resource.duplicate() reads an ArrayMesh's surfaces back from the GPU.
+## (ModelLods.arrays_of): Resource.duplicate() reads an ArrayMesh's surfaces back from the GPU. A belt's
+## return run (BeltReturn), which the CPU arrays leave out, is drawn on the copy too.
 static func _copy(base: ArrayMesh) -> ArrayMesh:
 	var out := ArrayMesh.new()
 	var kept: Array = []
+	var returns: Array = base.get_meta(BeltReturn.META, [])
 	for i in base.get_surface_count():
 		var arrays := ModelLods.arrays_of(base, i)
-		out.add_surface_from_arrays(base.surface_get_primitive_type(i), arrays, [], {}, base.surface_get_format(i) & ModelLods.CUSTOM_FORMATS)
+		var ret: Variant = returns[i] if i < returns.size() else null
+		out.add_surface_from_arrays(base.surface_get_primitive_type(i), BeltReturn.joined(arrays, ret) if ret != null else arrays, [], {},
+			base.surface_get_format(i) & ModelLods.CUSTOM_FORMATS)
 		out.surface_set_material(i, base.surface_get_material(i))
 		out.surface_set_name(i, base.surface_get_name(i))
 		kept.append(arrays)
 	out.set_meta(ModelLods.ARRAYS_META, kept)
+	if not returns.is_empty():
+		out.set_meta(BeltReturn.META, returns)
 	if base.has_meta(ContactShade.META):
 		out.set_meta(ContactShade.META, base.get_meta(ContactShade.META))
 	return out
@@ -1085,6 +1060,8 @@ const GLTF_SOURCE := "gltf:"
 const SCENE_SOURCE := "scene:"
 ## Models parsed at once (terrain meshing and LODs share the worker pool).
 const LOAD_JOBS := 3
+## Raised while the join's loading screen is up (world.gd set_joining): nothing else is drawn then.
+static var load_jobs := LOAD_JOBS
 const FrameBudget := preload("res://scripts/world/frame_budget.gd")
 static var _sources := {}  # name -> GLTF_SOURCE + path, SCENE_SOURCE + path, or ""
 static var _jobs := {}  # name -> [task id (-1 while queued), Load]
@@ -1124,6 +1101,10 @@ class Load:
 	var _rig_cut := []  # [split(), the skinned node's transform, its key]
 	## Its feet on the ground (contact_shade.gd feet_of(), for the rim round them).
 	var contact: Array = []
+	## A belt model's shape for its return run (BeltReturn.shape_for; -1: none wanted), and per group the
+	## return drawn after it (null: none; empty when no group has one).
+	var belt_shape := -1
+	var returns: Array = []
 
 	func run() -> void:
 		var doc := GLTFDocument.new()
@@ -1151,6 +1132,7 @@ class Load:
 					p[1] = yaw * (p[1] as Transform3D)
 					for g: Array in p[2]:
 						_turn_arrays(g[1], yaw.basis)
+			returns = BeltReturn.for_groups(groups, belt_shape)
 			contact = ContactShade.feet_of(groups)
 			ok = true
 
@@ -1427,13 +1409,19 @@ class Load:
 				out.append(_joined(members.slice(k, k + MaterialRows.MAX_ROWS)))
 		return out
 
+	## Whether a material is drawn with the leaves' shader (_factorio()): leaf cards, a crown's dark
+	## cores and solid leaves. Merged into one surface, each vertex's UV tells them apart.
+	static func is_leaf_name(material_name: String) -> bool:
+		return material_name.begins_with("leafcard") or material_name.begins_with("leaf-shadow") \
+			or material_name.begins_with("leaf-0")
+
 	## The shader a key's material is drawn with, as _factorio() picks it: 0 solid, 1 see-through,
-	## 2 leaf cards, 3 cut out (Alpha Clip).
+	## 2 the leaves' (cards, cores, solid leaves), 3 cut out (Alpha Clip).
 	static func variant(material: Material) -> int:
 		var base := material as BaseMaterial3D
 		if base == null:
 			return 0
-		if base.resource_name.begins_with("leafcard"):
+		if is_leaf_name(base.resource_name):
 			return 2
 		if base.transparency == BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR or base.transparency == BaseMaterial3D.TRANSPARENCY_ALPHA_HASH:
 			return 3
@@ -1566,6 +1554,7 @@ static func ready(name: String) -> bool:
 			load.combine = merge_materials
 			load.modeller = external_dir != "" and load.path.begins_with(external_dir)
 			load.rig_wanted = rig_name(name)
+			load.belt_shape = BeltReturn.shape_for(name)
 			_jobs[name] = [-1, load]
 			_job_order.append(name)
 		return false
@@ -1590,6 +1579,11 @@ static func entity_ready(proto_name: String, proto_type: String, extra: Dictiona
 	return ready(proto_name)
 
 
+## How many models are being read or wait to be (the join's loading screen counts them).
+static func pending_count() -> int:
+	return _jobs.size()
+
+
 ## Models still being read on worker threads or waiting to be made (full_detail.gd's settle check).
 static func busy() -> bool:
 	return not _jobs.is_empty() or not _remnant_jobs.is_empty()
@@ -1598,13 +1592,14 @@ static func busy() -> bool:
 ## Starts waiting jobs and makes the models whose jobs are done, within its slice. True when
 ## some became ready (`generation` went up).
 static func poll() -> bool:
+	NatureLooks.poll()
 	var running := 0
 	for name in _job_order:
 		var entry: Array = _jobs[name]
 		if int(entry[0]) >= 0:
 			running += 1
 	for name in _job_order:
-		if running >= LOAD_JOBS:
+		if running >= load_jobs:
 			break
 		var entry: Array = _jobs[name]
 		if int(entry[0]) < 0:
@@ -1661,6 +1656,7 @@ static func _built(name: String) -> Load:
 		load.combine = merge_materials
 		load.modeller = external_dir != "" and load.path.begins_with(external_dir)
 		load.rig_wanted = rig_name(name)
+		load.belt_shape = BeltReturn.shape_for(name)
 		_parsed_here = true
 		load.run()
 	return load
@@ -1668,7 +1664,7 @@ static func _built(name: String) -> Load:
 
 ## The model's mesh and moving parts (into `parts`) from its Load, on the main thread.
 static func _commit_load(load: Load, parts: Array) -> Mesh:
-	var mesh := _commit_groups(load.groups)
+	var mesh := _commit_groups(load.groups, load.returns)
 	if mesh != null:
 		mesh.set_meta(ContactShade.META, load.contact)
 	for p: Array in load.parts:
@@ -1687,20 +1683,25 @@ static func _commit_load(load: Load, parts: Array) -> Mesh:
 
 ## An ArrayMesh of merged surfaces ([keys, arrays, custom formats]), keeping its arrays on the CPU
 ## (ModelLods.arrays_of) so nothing reads them back from the GPU later. A surface of several keys
-## gets one material with a row for each (material_rows.gd).
-static func _commit_groups(groups: Array) -> ArrayMesh:
+## gets one material with a row for each (material_rows.gd). `returns`: per group a belt's return run
+## (BeltReturn), drawn after the group's own triangles but left out of the CPU arrays.
+static func _commit_groups(groups: Array, returns: Array = []) -> ArrayMesh:
 	if groups.is_empty():
 		return null
 	var out := ArrayMesh.new()
 	var kept: Array = []
-	for g: Array in groups:
+	for i in groups.size():
+		var g: Array = groups[i]
 		var rows: Array = []
 		for key: Array in g[0]:
 			rows.append(_factorio(key[0], key[1], key[2], key[3], key[4], key[5]))
-		out.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, g[1], [], {}, int(g[2]))
+		var ret: Variant = returns[i] if i < returns.size() else null
+		out.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, BeltReturn.joined(g[1], ret) if ret != null else g[1], [], {}, int(g[2]))
 		out.surface_set_material(out.get_surface_count() - 1, rows[0] if rows.size() == 1 else MaterialRows.make(rows))
 		kept.append(g[1])
 	out.set_meta(ModelLods.ARRAYS_META, kept)
+	if not returns.is_empty():
+		out.set_meta(BeltReturn.META, returns)
 	return out
 
 
@@ -1878,6 +1879,17 @@ static func _factorio(material: Material, has_color: bool, has_uv2: bool, has_vi
 	if clip:
 		out.set_shader_parameter("alpha_clip", base.alpha_scissor_threshold)
 	if name.begins_with("leafcard"):
+		out.shader = FactorioLeafShader
+	elif name.begins_with("leaf-shadow"):
+		# A crown's dark inside: with the leaves' shader so it goes as pollution takes them
+		# (factorio_material.gdshaderinc `leaf_core`), not cut into leaves itself. Merged with the
+		# cards (a model's one material), the core's own UV (-1) says so instead: leaf_core stays
+		# this row's (material_rows.gd).
+		out.shader = FactorioLeafShader
+		out.set_shader_parameter("leaf_core", true)
+	elif name.begins_with("leaf-0"):
+		# Solid leaves (tree-06's hanging strands): with the leaves' shader so they fall with
+		# pollution too (UV -2: tools/models/nature/plain_geo.py), not cut into leaves.
 		out.shader = FactorioLeafShader
 	# Cliffs' rock sits on the low ground when there are hills (ground_height.gd).
 	if name.begins_with("cliff-"):

@@ -10,6 +10,7 @@ local transport = require("scripts.transport")
 local world = require("scripts.world")
 local map = require("scripts.map")
 local rate = require("scripts.rate")
+local movers = require("scripts.movers")
 
 local M = {}
 
@@ -66,12 +67,62 @@ local function gap(e, t)
   return math.sqrt(dx * dx + dy * dy)
 end
 
+-- one_search (perf.lua): the units come from the movers' search (movers.found), and worms, which don't
+-- move, from a search of their own every WORM_EVERY ticks (or when the surface, the radius or the focus by
+-- WORM_MOVE tiles changed), kept module-local (worm_lists, by client state) with its count in storage
+-- (s.en_worms), so the learnt cost (rate.read) is the same on every peer. A peer that loaded since
+-- searches for its own list, uncharged.
+local WORM_EVERY = 300
+local WORM_MOVE = 32
+local worm_lists = setmetatable({}, { __mode = "k" })
+
+local function worms(surface, s, f, r)
+  local w = s.en_worms
+  local t = game.tick
+  local box = { { f.x - r, f.y - r }, { f.x + r, f.y + r } }
+  if not w or t - w.tick >= WORM_EVERY or w.si ~= surface.index or w.r ~= r
+      or math.max(math.abs(w.x - f.x), math.abs(w.y - f.y)) >= WORM_MOVE then
+    local list = surface.find_entities_filtered({ area = box, type = "turret" })
+    s.en_worms = { tick = t, n = #list, si = surface.index, x = f.x, y = f.y, r = r }
+    worm_lists[s] = { tick = t, list = list }
+    return list, #list
+  end
+  local kept = worm_lists[s]
+  if not (kept and kept.tick == w.tick) then
+    kept = { tick = w.tick, list = surface.find_entities_filtered({ area = box, type = "turret" }) }
+    worm_lists[s] = kept
+  end
+  local live = {}
+  for _, e in pairs(kept.list) do
+    if e.valid then
+      live[#live + 1] = e
+    end
+  end
+  return live, w.n
+end
+
 local function collect(surface, f, r)
   local flat, n = {}, 0
-  local all = surface.find_entities_filtered({
-    area = { { f.x - r, f.y - r }, { f.x + r, f.y + r } },
-    type = { "unit", "turret" },
-  })
+  local all, read
+  local units, nu = movers.found("en", surface)
+  if nu then
+    local s = storage.f3d
+    if not units then
+      units = surface.find_entities_filtered({ area = { { f.x - r, f.y - r }, { f.x + r, f.y + r } }, type = "unit" })
+    end
+    local w, nw = worms(surface, s, f, r)
+    all = units
+    for _, e in ipairs(w) do
+      all[#all + 1] = e
+    end
+    read = nu + nw
+  else
+    all = surface.find_entities_filtered({
+      area = { { f.x - r, f.y - r }, { f.x + r, f.y + r } },
+      type = { "unit", "turret" },
+    })
+    read = #all
+  end
   -- What was read is counted before the remote view's filter: the count goes into storage (the
   -- learnt cost, rate.read), and the filter's radar coverage is a cache that can differ between peers.
   local found = map.view_only(all)
@@ -97,7 +148,7 @@ local function collect(surface, f, r)
       end
     end
   end
-  return flat, #all
+  return flat, read
 end
 
 function M.tick()

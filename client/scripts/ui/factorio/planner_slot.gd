@@ -5,6 +5,7 @@ extends "res://scripts/ui/factorio/slot.gd"
 ## index, "from": the owner's id}, and dropping calls `on_record_drop(from_index, owner_id)`.
 
 const BpString := preload("res://scripts/ui/factorio/bp_string.gd")
+const BlueprintPicture := preload("res://scripts/ui/factorio/blueprint_picture.gd")
 
 ## [[type, name], ...] drawn over the item.
 var icons: Array = []
@@ -19,28 +20,45 @@ var marked := false
 ## The list views' big picture: the item and its icons fill the slot (Factorio's book and library
 ## rows), the active one framed green.
 var big := false
+## The record shown (set_record), for its tooltip's picture.
+var record := {}
 
 
-func set_record(record: Dictionary) -> void:
-	set_stack(BpString.item_of(record), -1)
-	icons = BpString.icons(record)
+func set_record(r: Dictionary) -> void:
+	record = r
+	set_stack(BpString.item_of(r), -1)
+	icons = BpString.icons(r)
 	var lines: Array = []
-	var d := BpString.description(record)
+	var d := BpString.description(r)
 	if d != "":
 		lines.append([d])
-	match BpString.kind(record):
+	match BpString.kind(r):
 		"blueprint":
 			var n := 0
-			for c in BpString.components(record):
+			for c in BpString.components(r):
 				n += int(c[1])
 			lines.append(["%d entities and tiles" % n, "", Kit.DISABLED_TEXT])
 		"blueprint_book":
-			lines.append(["%d blueprints" % BpString.pages(record).size(), "", Kit.DISABLED_TEXT])
-	set_tip(BpString.title(record), lines)
+			lines.append(["%d blueprints" % BpString.pages(r).size(), "", Kit.DISABLED_TEXT])
+	set_tip(BpString.title(r), lines)
 	queue_redraw()
 
 
+## The record's own picture: a blueprint's, a book's active page's (K11).
+func _tip_picture() -> Control:
+	if record.is_empty():
+		return null
+	var page := BlueprintPicture.page_of(record)
+	if BpString.kind(page) != "blueprint" or BpString._list(BpString.body(page).get("entities")).is_empty() 			and BpString._list(BpString.body(page).get("tiles")).is_empty():
+		return null
+	var picture := BlueprintPicture.new()
+	picture.record = page
+	picture.protos = picture_protos.call() if picture_protos.is_valid() else null
+	return picture
+
+
 func set_listed(item_name: String, label: String, list_icons: Array) -> void:
+	record = {}
 	set_stack(item_name, -1)
 	icons = list_icons
 	set_tip(label if label != "" else "Untitled")

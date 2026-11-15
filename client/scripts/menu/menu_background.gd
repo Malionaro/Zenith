@@ -6,6 +6,7 @@ extends Node3D
 ## updates (moving things, items on belts, inserter hands) are replayed in a loop. No server.
 
 const WorldMirror := preload("res://scripts/world/world.gd")
+const PipelineWarm := preload("res://scripts/world/pipeline_warm.gd")
 const MoverLayer := preload("res://scripts/world/movers.gd")
 const BeltItemLayer := preload("res://scripts/world/belt_items.gd")
 const GroundItemLayer := preload("res://scripts/world/ground_items.gd")
@@ -52,6 +53,7 @@ func _ready() -> void:
 	_arms = InserterArmLayer.new()
 	_arms.protos = world.protos
 	_arms.world = world
+	_arms.belts = _belt_items
 	add_child(_arms)
 	_ground_items = GroundItemLayer.new()
 	_ground_items.protos = world.protos
@@ -108,7 +110,10 @@ func _factory_center(fallback: Vector2) -> Vector2:
 func _process(delta: float) -> void:
 	# Models are made on worker threads and a chunk leaves one out until it is ready; world.gd draws
 	# them again only while a game runs, so the menu does it here (its buildings were missing).
-	if ModelLibrary.poll():
+	var made := ModelLibrary.poll()
+	if PipelineWarm.poll():
+		made = true  # models whose pipelines were compiling (pipeline_warm.gd)
+	if made:
 		for c in world.chunks:
 			if world.chunks[c].waiting_models:
 				world._dirty[c] = true

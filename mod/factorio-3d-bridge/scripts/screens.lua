@@ -172,8 +172,34 @@ local function close(s, why)
   transport.send_now({ t = "gui", u = sc.unit, closed = true })
 end
 
+-- K13: a tool's (a repair pack's, a science pack's) durability left on its top item, in thousandths
+-- of its full durability at its quality, or nil when it is whole or isn't a tool. Factorio draws it
+-- as a green bar under the slot. Which items are tools: a module-local cache from prototypes alone.
+local TOOL_TYPES = { tool = true, ["repair-tool"] = true }
+local is_tool = {}
+
+local function wear(stack)
+  local name = stack.name
+  local tool = is_tool[name]
+  if tool == nil then
+    local item = prototypes.item[name]
+    tool = item ~= nil and TOOL_TYPES[item.type] == true
+    is_tool[name] = tool
+  end
+  if not tool then
+    return nil
+  end
+  local ok, left, full = pcall(function() return stack.durability, stack.prototype.get_durability(stack.quality) end)
+  left, full = ok and tonumber(left), ok and tonumber(full)
+  if not (left and full and full > 0) or left >= full then
+    return nil
+  end
+  return math.max(0, math.min(999, math.floor(left / full * 1000)))
+end
+
 -- [[item, count] or [item, count, quality] or, for a spoiling item, [item, count, quality,
--- freshness (thousandths)], or 0 for an empty slot, ...] for every slot.
+-- freshness (thousandths)], or for a worn tool [item, count, quality, freshness or -1, durability
+-- (thousandths)], or 0 for an empty slot, ...] for every slot.
 function M.slot_list(inventory)
   local list = {}
   for i = 1, #inventory do
@@ -181,7 +207,10 @@ function M.slot_list(inventory)
     if stack.valid_for_read then
       local ok, q = pcall(function() return stack.quality.name end)
       local fresh = spoilage.freshness(stack)
-      if fresh then
+      local worn = wear(stack)
+      if worn then
+        list[i] = { stack.name, stack.count, ok and q or "normal", fresh or -1, worn }
+      elseif fresh then
         list[i] = { stack.name, stack.count, ok and q or "normal", fresh }
       else
         list[i] = (not ok or q == "normal") and { stack.name, stack.count } or { stack.name, stack.count, q }
@@ -291,6 +320,11 @@ local function send_state(c, e, sc)
   entity_ui.fill(msg, e, kind, list)
   space.fill(msg, e, kind)
   machine_info.fill(msg, e, kind, space, sc.sent % RECIPE_LIST_EVERY == 0)
+  -- How fast the craft goes, so the client draws the bar on between states (I26).
+  if msg.pr then
+    local okr, rate = pcall(modules.progress_rate, e)
+    msg.ps = okr and rate or nil
+  end
   if kind == "crafter" and sc.sent % RECIPE_LIST_EVERY == 0 then
     msg.rl = recipe_names(c, e)
     -- The chooser's item group tabs: [group, group order, subgroup key, order] by recipe.

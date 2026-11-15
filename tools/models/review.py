@@ -182,6 +182,11 @@ def serve(name, port, daytime, direction, mover=None, row=1, gap=5.0):
         for dy in range(-7, 8):
             for dx in range(-7, 8):
                 game.tile_overrides[(int(x) + dx, int(y) + dy)] = "water"
+    if etype == "tree":
+        # The starter base's pollution (the mock's `pol` round the start) would strip the leaves
+        # (pollution.gd): a tree is reviewed healthy.
+        send = game.send_now
+        game.send_now = lambda msg, *a, **k: None if msg.get("t") == "pol" else send(msg, *a, **k)
     if daytime is not None:
         game.daytime = lambda: daytime
     # The mock's train runs on its line far to the north; it has to stay (tick_trains).

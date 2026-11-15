@@ -101,6 +101,9 @@ class Loop:
 	## Seconds (Factorio's fade_in_ticks 8 and fade_out_ticks 20 by default).
 	var fade_in := 8.0 / 60.0
 	var fade_out := 20.0 / 60.0
+	## sound_accents: [SoundDef, frame] each, played as the working animation passes that frame
+	## (the rocket silo's welding and turning while it builds a rocket).
+	var accents: Array = []
 
 
 ## A Lua file's text with its braces matched, to find the table round any point.
@@ -658,6 +661,14 @@ static func _parse_working(lt: LuaText, at: int) -> Loop:
 				loop.activate = _sound_value(wl, child[0])
 			"deactivate_sound":
 				loop.deactivate = _sound_value(wl, child[0])
+			"sound_accents":
+				for entry: Array in wl.children(child[0]):
+					var frame := int(_num(wl.top_level(entry[0]), "frame", -1.0))
+					for c: Array in wl.children(entry[0]):
+						if c[1] == "sound" and frame >= 0:
+							var accent := _sound_value(wl, c[0])
+							if accent != null and not accent.files.is_empty():
+								loop.accents.append([accent, frame])
 			"main_sounds":
 				var first: Array = wl.children(child[0])
 				if first.size() > 0:
