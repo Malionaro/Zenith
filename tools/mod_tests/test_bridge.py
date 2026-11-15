@@ -1477,6 +1477,21 @@ check(near_belt.get_transport_line(1).get_item_count() == 0 and near_belt.get_tr
 check(far_belt.get_transport_line(1).get_item_count() == 1, "but not off a belt further away")
 check([inv.get_item_count(n) - before[n] for n in ("copper-plate", "iron-gear-wheel")] == [2, 1],
       "items picked up from a belt go to the inventory")
+# The very item in reach comes off, not one of that name further back (remove_item takes from the
+# back of the line, so the item by the character stayed and the belt looked untouched).
+long_belt = spawn("transport-belt", pp.x + 0.5, pp.y + 1.5, force="player", direction=0)  # north edge (position 0) by the character
+F.put_on_belt(long_belt, 1, "iron-ore", 0.95, 7201)  # the back end (south), out of reach
+F.put_on_belt(long_belt, 1, "iron-ore", 0.05, 7202)  # the front end (north), by the character
+ore_before = inv.get_item_count("iron-ore")
+send({"t": "hello", "v": 1, "sid": "s1", "w": 1})  # keep-alive (the checks after count on the session)
+send({"t": "pickup"})
+tick(1)
+left_ids = [int(it.unique_id) for it in long_belt.get_transport_line(1).get_detailed_contents().values()]
+check(left_ids == [7201] and inv.get_item_count("iron-ore") == ore_before + 1,
+      f"pickup takes the item in reach off the belt, not one of that name further back: {left_ids}")
+tick(59)  # (60 ticks in all: the periodic messages the checks after look at keep their beat)
+long_belt.destroy()
+inv.remove(lua.table_from({"name": "iron-ore", "count": 1}))
 resent = sorted(set(lua.eval("F_resent").values()))
 nu = int(near_belt.unit_number)
 check(resent == [nu * 8 + 1, nu * 8 + 2], f"the lanes it took from are sent again to a client that simulates belts: {resent}")
