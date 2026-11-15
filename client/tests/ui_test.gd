@@ -3663,6 +3663,7 @@ func _performance() -> void:
 	ModelLibrary.external_dir = saved_dir
 	ModelLibrary._sources.erase("iron-chest")
 	DirAccess.remove_absolute(outside.path_join("iron-chest.glb"))
+	_check_model_packs()
 	# A model's stand-in and its own LODs, made on a worker thread.
 	var mesh := ModelLibrary.mesh_for("assembling-machine-1")
 	var surfaces := mesh.get_surface_count()
@@ -12505,3 +12506,65 @@ func _pose_finite(pose) -> bool:
 		if not (is_finite(r.x) and is_finite(r.y) and is_finite(r.z) and is_finite(r.w)):
 			return false
 	return true
+
+
+## Model packs (model_packs.gd): a folder pack fills in a modded entity's model, a zipped pack with
+## "replace" replaces Zenith's own, a broken pack is left out, and the mod checks say what doesn't fit.
+func _check_model_packs() -> void:
+	var ModelPacks = load("res://scripts/world/model_packs.gd")
+	var root := OS.get_user_data_dir().path_join("test-model-packs")
+	var chest := ProjectSettings.globalize_path("res://assets/models/wooden-chest.glb")
+	# A folder pack for a mod, its models in a subfolder.
+	var fill := root.path_join("crates")
+	DirAccess.make_dir_recursive_absolute(fill.path_join("models"))
+	DirAccess.copy_absolute(chest, fill.path_join("models/test-mod-crate.glb"))
+	var f := FileAccess.open(fill.path_join("pack.json"), FileAccess.WRITE)
+	f.store_string(JSON.stringify({"id": "test-crates", "name": "Test crates", "version": "1.0.0", "mod": "test-mod",
+		"mod_version": ">=2.0.0", "models": "models"}))
+	f.close()
+	# A zipped pack (pack.json one folder down) that replaces iron-chest.
+	var zip_path := root.path_join("better-chests_1.2.0.zip")
+	var zip := ZIPPacker.new()
+	zip.open(zip_path)
+	zip.start_file("better-chests/pack.json")
+	zip.write_file(JSON.stringify({"id": "better-chests", "version": "1.2.0", "replace": true}).to_utf8_buffer())
+	zip.close_file()
+	zip.start_file("better-chests/iron-chest.glb")
+	zip.write_file(FileAccess.get_file_as_bytes(chest))
+	zip.close_file()
+	zip.close()
+	# A broken one: no version.
+	var broken := root.path_join("broken")
+	DirAccess.make_dir_recursive_absolute(broken)
+	f = FileAccess.open(broken.path_join("pack.json"), FileAccess.WRITE)
+	f.store_string(JSON.stringify({"id": "broken"}))
+	f.close()
+	var saved_cache: String = ModelPacks.cache_root
+	ModelPacks.cache_root = "user://test-model-packs-cache"
+	ModelLibrary.load_packs([[root, "test"]])
+	var ids: Array = ModelLibrary.packs.map(func(m: Dictionary) -> String: return str(m["id"]))
+	ids.sort()
+	check(ids == ["better-chests", "test-crates"], "model packs: a folder and a zip are loaded, a pack without a version isn't: %s" % [ids])
+	check(ModelLibrary._source("test-mod-crate") == ModelLibrary.GLTF_SOURCE + fill.path_join("models/test-mod-crate.glb"),
+		"a model pack fills in an entity without a model, from its models folder")
+	var iron := ModelLibrary._source("iron-chest")
+	check(iron.begins_with(ModelLibrary.GLTF_SOURCE) and iron.contains("test-model-packs-cache") and iron.ends_with("iron-chest.glb"),
+		"a zipped pack with \"replace\" is unpacked and replaces Zenith's own model: %s" % iron)
+	check(ModelLibrary._source("wooden-chest").contains("res://"), "models a pack doesn't have stay Zenith's own")
+	var notes: Array = ModelPacks.check_mods(ModelLibrary.packs, {"base": "2.1.23"})
+	check(notes.size() == 1 and str(notes[0]).contains("test-mod"), "a pack for a mod the game doesn't run is said: %s" % [notes])
+	notes = ModelPacks.check_mods(ModelLibrary.packs, {"test-mod": "1.5.0"})
+	check(notes.size() == 1 and str(notes[0]).contains("1.5.0"), "and one for another version of it: %s" % [notes])
+	check(ModelPacks.check_mods(ModelLibrary.packs, {"test-mod": "2.0.1"}).is_empty(), "a pack whose mod runs in a matching version is fine")
+	check(ModelPacks.version_matches("1.2.3", "1.2.3") and ModelPacks.version_matches("1.10.0", ">=1.9")
+		and not ModelPacks.version_matches("2.0.0", "<2") and ModelPacks.version_matches("0.9", "<1"),
+		"pack.json's mod_version: a version, or >=, >, <=, < and = one")
+	# Switched off in the settings, a pack isn't loaded.
+	ModelPacks.set_enabled("better-chests", false)
+	ModelLibrary.load_packs([[root, "test"]])
+	check(not ModelLibrary._source("iron-chest").contains("test-model-packs-cache"), "a model pack switched off isn't used")
+	ModelPacks.set_enabled("better-chests", true)
+	# Back to none.
+	ModelLibrary.load_packs([[root.path_join("none"), "test"]])
+	ModelPacks.cache_root = saved_cache
+	check(ModelLibrary.packs.is_empty() and ModelLibrary._source("iron-chest").contains("res://"), "without packs, Zenith's own models")
