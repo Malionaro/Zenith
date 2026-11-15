@@ -69,6 +69,9 @@ const DEFAULTS := {
 		# before. Read at start-up from ENGINE_OVERRIDES, so it applies after a restart.
 		"render_thread": false,  # Godot calls it experimental; no gain measured, rare hangs on quitting
 		"view_radius": 10,  # chunks around the camera that are drawn (owner's B1: doubled from 5)
+		# Tilted low towards the horizon, the view is drawn this far (tiles from the camera) and fades into
+		# haze before it (horizon_reach.gd); 0 Automatic (from the view distance), -1 off (to the loaded edge)
+		"horizon_distance": 0,
 		"entity_radius": 192,  # tiles around the camera where moving things and machine states are shown (doubled from 96)
 		# Items on belts are drawn out to belt_distance (0 off): moving, from the character outwards, as
 		# far as belt_updates allows (the most items and lanes the server reads an update), and past
