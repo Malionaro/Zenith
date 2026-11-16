@@ -403,7 +403,7 @@ func _graphics() -> void:
 		"how far shadows reach|The furthest shadows reach from the camera. Automatic: as the Shadows quality sets it, 80 to 200 tiles. Further shows them when zoomed out, softer and costing more.")
 	_dropdown(grid, "Horizon distance", "graphics", "horizon_distance",
 		[["Automatic", 0], ["160 tiles", 160], ["224 tiles", 224], ["320 tiles", 320], ["480 tiles", 480], ["Off", -1]],
-		"how far a low view reaches|Tilted low towards the horizon, the view is drawn this far from the camera and fades into haze before it, instead of drawing every chunk out to the view distance (much cheaper there). Automatic: from the view distance, 160 to 320 tiles. Off: to the edge of the loaded chunks. Steeper views never reach it.")
+		"how far a low view reaches|Tilted low towards the horizon, the view is drawn this far past your character and fades into the sky's haze before it, instead of drawing every chunk out to the view distance (much cheaper there). Automatic: from the view distance, 160 to 320 tiles. Off: to the edge of the loaded chunks. Steeper views never reach it.")
 	_dropdown(grid, "Level of detail", "graphics", "lod_quality", [["Low", "low"], ["Medium", "medium"], ["High", "high"]],
 		"simpler models far away|How soon models far away, and their shadows, are drawn simpler. Those near you stay whole.")
 	_check(grid, "Merge far buildings", "graphics", "merge_far",

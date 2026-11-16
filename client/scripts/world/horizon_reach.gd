@@ -12,7 +12,7 @@ extends Node
 ## script work), and a depth fog in the sky's own colour (aerial perspective) fades the ground into
 ## the horizon before the cut, so there is no hard edge: the view ends in haze instead of at the
 ## loaded chunks' ragged border. The area drawn grows with the square of the depth: at the High
-## preset's 10 chunks a low tilt drew ground out to about 330 tiles, now 224 (under half the
+## preset's 10 chunks a low tilt drew ground out to about 330 tiles, now 192 past the character (under half the
 ## chunks).
 ##
 ## Nothing changes while the ground in view ends nearer than `reach` (the default tilt and steeper
@@ -25,8 +25,11 @@ const ModelLods := preload("res://scripts/world/model_lods.gd")
 
 ## The camera rig's own far plane (camera_rig.gd), put back when the reach lets go.
 const FULL_FAR := 2000.0
-## Automatic reach: this share of the view distance (tiles), within REACH_RANGE.
-const AUTO_SHARE := 0.7
+## Automatic reach: this share of the view distance (tiles), within REACH_RANGE. The reach is
+## counted from the focus (the character), the camera's own distance to it added: counted from the
+## camera, a view zoomed far out (the camera 150 tiles and more from the ground) put nearly all of
+## its ground in the fog.
+const AUTO_SHARE := 0.6
 const REACH_RANGE := Vector2(160.0, 320.0)
 ## Tiles past the ground's furthest point in view that tall things (trees, chimneys) still need.
 const TALL_MARGIN := 24.0
@@ -45,6 +48,8 @@ var env: Environment
 ## Whether the reach holds the view in now, and how far (for the debug line).
 var active := false
 var reach := 0.0
+## The far plane while it holds: the camera's distance to the focus plus the reach.
+var far_plane := 0.0
 ## The ground's furthest depth in view as the rig sees it now (INF: the horizon).
 var view_depth := 0.0
 var _owns_fog := false
@@ -69,14 +74,17 @@ func _process(_delta: float) -> void:
 	reach = reach_tiles()
 	var hold := cam != null and reach > 0.0 and _may_hold()
 	view_depth = ground_depth(cam, rig.global_position.y if rig != null else 0.0) if cam != null else 0.0
-	hold = hold and view_depth + TALL_MARGIN > reach
+	# The camera's distance to the focus (it looks at it), then the reach on from there.
+	var near: float = float(rig.distance) if rig != null else 0.0
+	far_plane = near + reach
+	hold = hold and view_depth + TALL_MARGIN > far_plane
 	if hold:
-		if not is_equal_approx(cam.far, reach):
-			cam.far = reach
+		if not is_equal_approx(cam.far, far_plane):
+			cam.far = far_plane
 		_set_far = true
 		# 0 just past the line, 1 once the ground in view reaches half the reach again beyond it.
-		var past := 1.0 if view_depth == INF else clampf((view_depth + TALL_MARGIN - reach) / (reach * 0.5), 0.0, 1.0)
-		_fog(true, reach * lerpf(FOG_BEGIN.x, FOG_BEGIN.y, past), reach)
+		var past := 1.0 if view_depth == INF else clampf((view_depth + TALL_MARGIN - far_plane) / (reach * 0.5), 0.0, 1.0)
+		_fog(true, near + reach * lerpf(FOG_BEGIN.x, FOG_BEGIN.y, past), far_plane, past)
 	else:
 		_let_go(cam)
 	active = hold
@@ -93,10 +101,10 @@ func _may_hold() -> bool:
 
 func _let_go(cam: Camera3D) -> void:
 	if _set_far and cam != null and is_instance_valid(cam) and not rig.taken():
-		if is_equal_approx(cam.far, reach) or cam.far < FULL_FAR:
+		if is_equal_approx(cam.far, far_plane) or cam.far < FULL_FAR:
 			cam.far = FULL_FAR
 	_set_far = false
-	_fog(false, 0.0, 0.0)
+	_fog(false, 0.0, 0.0, 0.0)
 
 
 ## The depth (along the view) of the furthest ground at the top of the screen, from a camera
@@ -114,26 +122,35 @@ static func ground_depth(cam: Camera3D, focus_height: float) -> float:
 	return height / sin(top) * cos(half)
 
 
-## Zenith's depth fog for the reach: on from `begin` to `end` tiles, the sky's colour; off again.
+## Zenith's depth fog for the reach: on from `begin` to `end` tiles, off again. Its colour is the
+## sky's haze colour (planet_sky.gdshader haze_color), and the sky's own horizon haze rises with it
+## (`past`, 0-1): the fog's colour taken from the sky's radiance (aerial perspective) had none of
+## the low clouds the sky draws over the cut, which showed as a grey wall under a dark band.
 ## Left alone while a look has fog of its own on.
-func _fog(on: bool, begin: float, end: float) -> void:
+func _fog(on: bool, begin: float, end: float, past: float) -> void:
 	if env == null:
 		return
+	var sky_mat := _sky_material()
 	if on:
 		if not _owns_fog:
 			if env.fog_enabled:
 				return  # a look's own fog
 			_owns_fog = true
 			env.fog_mode = Environment.FOG_MODE_DEPTH
-			env.fog_light_color = Color(0.7, 0.75, 0.8)
 			env.fog_light_energy = 1.0
 			env.fog_sun_scatter = 0.0
 			env.fog_density = 1.0
-			env.fog_aerial_perspective = 1.0  # the sky's own colour in that direction
+			env.fog_aerial_perspective = 0.0 if sky_mat != null else 1.0
 			env.fog_sky_affect = 0.0
 			env.fog_height_density = 0.0
-			env.fog_depth_curve = 1.0
+			# Clear for longer, then closing in: the near ground keeps its colours.
+			env.fog_depth_curve = 1.6
 			env.fog_enabled = true
+		if sky_mat != null:
+			var haze = sky_mat.get_shader_parameter("haze_color")
+			if haze is Color and not env.fog_light_color.is_equal_approx(haze):
+				env.fog_light_color = haze
+			sky_mat.set_shader_parameter("horizon_haze", smoothstep(0.0, 1.0, past))
 		if absf(env.fog_depth_begin - begin) > 0.5 or absf(env.fog_depth_end - end) > 0.5:
 			env.fog_depth_begin = begin
 			env.fog_depth_end = end
@@ -141,6 +158,18 @@ func _fog(on: bool, begin: float, end: float) -> void:
 		_owns_fog = false
 		env.fog_enabled = false
 		env.fog_mode = Environment.FOG_MODE_EXPONENTIAL
+		if sky_mat != null:
+			sky_mat.set_shader_parameter("horizon_haze", 0.0)
+
+
+## The planet sky's material (planet_sky.gdshader), or null (space, a look's own sky).
+func _sky_material() -> ShaderMaterial:
+	if env == null or env.sky == null:
+		return null
+	var mat := env.sky.sky_material as ShaderMaterial
+	if mat == null or mat.shader == null or mat.shader.resource_path != "res://shaders/planet_sky.gdshader":
+		return null
+	return mat
 
 
 ## One line for the debug line (F4).
@@ -149,5 +178,5 @@ func status() -> String:
 		return "horizon reach off"
 	if not active:
 		return "horizon reach %d tiles (not needed: ground in view ends at %s)" % [int(reach), "horizon" if view_depth == INF else "%d" % int(view_depth)]
-	return "horizon reach %d tiles holds the view (ground would reach %s)%s" % [int(reach), "the horizon" if view_depth == INF else "%d tiles" % int(view_depth),
+	return "horizon reach %d tiles (far %d) holds the view (ground would reach %s)%s" % [int(reach), int(far_plane), "the horizon" if view_depth == INF else "%d tiles" % int(view_depth),
 		"" if _owns_fog else ", a look's own fog"]

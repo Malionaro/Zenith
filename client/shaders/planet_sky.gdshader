@@ -27,6 +27,10 @@ uniform float cloud_alpha = 0.85;
 uniform float cloud_height = 70.0;
 uniform vec3 haze_color : source_color = vec3(0.8, 0.85, 0.9);
 uniform float haze = 0.0;
+// The horizon distance's haze (horizon_reach.gd, 0-1): the low sky, clouds included, fades into
+// haze_color, the colour the ground's depth fog fades to, so the view's cut-off end meets the sky
+// with no seam.
+uniform float horizon_haze = 0.0;
 uniform float flash = 0.0;
 
 float hash13(vec3 p) {
@@ -89,6 +93,7 @@ void sky() {
 		}
 	}
 	col = mix(col, haze_color, haze * exp(-max(up, 0.0) * 7.0));
+	col = mix(col, haze_color, clamp(horizon_haze * exp(-max(up, 0.0) * 14.0), 0.0, 1.0));
 	col += vec3(0.75, 0.8, 1.0) * flash * (0.4 + 0.6 * smoothstep(-0.1, 0.5, up));
 	COLOR = col;
 }

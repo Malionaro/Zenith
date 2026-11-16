@@ -5757,7 +5757,7 @@ func _sun_shadows(cam: Camera3D, sun: DirectionalLight3D) -> void:
 	reach_node.setting = -1.0
 	var off_reach: float = reach_node.reach_tiles()
 	reach_node.setting = 320.0
-	check(horizon_depth == INF and steep_depth > 10.0 and steep_depth + HorizonReach.TALL_MARGIN < auto_reach and auto_reach == 224.0
+	check(horizon_depth == INF and steep_depth > 10.0 and steep_depth + HorizonReach.TALL_MARGIN < auto_reach and auto_reach == 192.0
 		and off_reach <= 0.0 and reach_node.reach_tiles() == 320.0,
 		"the horizon reach holds a low view in (Automatic %d tiles at view distance 10) and never the default one (ground ends at %.0f)" % [int(auto_reach), steep_depth])
 	reach_node.free()
